@@ -1,6 +1,6 @@
 //
 //  SettingsView.swift
-//  设置面板
+//  设置面板 - 带后台服务控制
 //
 
 import SwiftUI
@@ -21,6 +21,12 @@ struct SettingsView: View {
             .tabItem {
                 Label("通用", systemImage: "gear")
             }
+            
+            // 服务管理
+            ServiceManagementView()
+                .tabItem {
+                    Label("服务", systemImage: "server.rack")
+                }
             
             // 快捷键设置
             ShortcutSettingsView()
@@ -54,10 +60,6 @@ struct GeneralSettingsView: View {
                     TextField("http://127.0.0.1:8765", text: $backendURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
-                
-                Button("测试连接") {
-                    testConnection()
-                }
             }
             
             Section(header: Text("启动选项")) {
@@ -73,9 +75,183 @@ struct GeneralSettingsView: View {
             }
         }
     }
+}
+
+// MARK: - 服务管理
+
+struct ServiceManagementView: View {
+    @State private var isServiceRunning = false
+    @State private var isLoading = false
+    @State private var logContent = ""
     
-    func testConnection() {
-        // 测试连接逻辑
+    var body: some View {
+        VStack(spacing: 16) {
+            // 服务状态
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("后台服务")
+                        .font(.headline)
+                    Text(isServiceRunning ? "运行中" : "已停止")
+                        .font(.caption)
+                        .foregroundColor(isServiceRunning ? .green : .red)
+                }
+                
+                Spacer()
+                
+                // 状态指示灯
+                Circle()
+                    .fill(isServiceRunning ? Color.green : Color.red)
+                    .frame(width: 10, height: 10)
+            }
+            
+            Divider()
+            
+            // 控制按钮
+            HStack(spacing: 12) {
+                Button(action: startService) {
+                    Label("启动", systemImage: "play.fill")
+                }
+                .disabled(isServiceRunning || isLoading)
+                
+                Button(action: stopService) {
+                    Label("停止", systemImage: "stop.fill")
+                }
+                .disabled(!isServiceRunning || isLoading)
+                .buttonStyle(BorderlessButtonStyle())
+                
+                Button(action: restartService) {
+                    Label("重启", systemImage: "arrow.clockwise")
+                }
+                .disabled(isLoading)
+                .buttonStyle(BorderlessButtonStyle())
+                
+                Spacer()
+                
+                Button(action: checkStatus) {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                }
+                .disabled(isLoading)
+                .buttonStyle(LinkButtonStyle())
+            }
+            
+            Divider()
+            
+            // 日志预览
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("服务日志")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    Spacer()
+                    
+                    Button("查看完整日志") {
+                        openLogsInFinder()
+                    }
+                    .font(.caption)
+                    .buttonStyle(LinkButtonStyle())
+                }
+                
+                ScrollView {
+                    Text(logContent.isEmpty ? "暂无日志" : logContent)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 100)
+                .padding(8)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(6)
+            }
+            
+            Spacer()
+        }
+        .padding()
+        .onAppear {
+            checkStatus()
+        }
+    }
+    
+    func checkStatus() {
+        // 检查服务状态
+        let task = Process()
+        task.launchPath = "/bin/bash"
+        task.arguments = ["-c", "cd $HOME/code/mac-assistant/daemon && ./service-manager.sh status"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.launch()
+        task.waitUntilExit()
+        
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        
+        isServiceRunning = output.contains("运行中") || output.contains("PID")
+        
+        // 读取日志
+        readLogs()
+    }
+    
+    func startService() {
+        isLoading = true
+        DispatchQueue.global().async {
+            let task = Process()
+            task.launchPath = "/bin/bash"
+            task.arguments = ["-c", "cd $HOME/code/mac-assistant/daemon && ./service-manager.sh start"]
+            task.launch()
+            task.waitUntilExit()
+            
+            DispatchQueue.main.async {
+                isLoading = false
+                checkStatus()
+            }
+        }
+    }
+    
+    func stopService() {
+        isLoading = true
+        DispatchQueue.global().async {
+            let task = Process()
+            task.launchPath = "/bin/bash"
+            task.arguments = ["-c", "cd $HOME/code/mac-assistant/daemon && ./service-manager.sh stop"]
+            task.launch()
+            task.waitUntilExit()
+            
+            DispatchQueue.main.async {
+                isLoading = false
+                checkStatus()
+            }
+        }
+    }
+    
+    func restartService() {
+        isLoading = true
+        DispatchQueue.global().async {
+            let task = Process()
+            task.launchPath = "/bin/bash"
+            task.arguments = ["-c", "cd $HOME/code/mac-assistant/daemon && ./service-manager.sh restart"]
+            task.launch()
+            task.waitUntilExit()
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                isLoading = false
+                checkStatus()
+            }
+        }
+    }
+    
+    func readLogs() {
+        let logPath = "\(NSHomeDirectory())/code/mac-assistant/daemon/backend.log"
+        if let content = try? String(contentsOfFile: logPath, encoding: .utf8) {
+            // 只显示最后 20 行
+            let lines = content.components(separatedBy: "\n").suffix(20)
+            logContent = lines.joined(separator: "\n")
+        }
+    }
+    
+    func openLogsInFinder() {
+        let logPath = "\(NSHomeDirectory())/code/mac-assistant/daemon"
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: logPath)
     }
 }
 
@@ -101,9 +277,11 @@ struct ShortcutSettingsView: View {
                 )
             }
             
-            Text("快捷键可以在系统偏好设置中修改")
-                .font(.caption)
-                .foregroundColor(.secondary)
+            Section(header: Text("说明")) {
+                Text("快捷键可以在系统偏好设置 > 键盘 > 快捷键中修改")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
     }
 }
@@ -143,7 +321,7 @@ struct AboutView: View {
                 .font(.subheadline)
                 .foregroundColor(.secondary)
             
-            Text("基于 OpenClaw + Kimi CLI 的 Mac 智能助手")
+            Text("基于 OpenClaw + Kimi CLI 的 Mac 智能助手\n本地运行，安全可靠")
                 .font(.body)
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -151,8 +329,8 @@ struct AboutView: View {
             Divider()
             
             HStack(spacing: 20) {
-                Link("GitHub", destination: URL(string: "https://github.com/superkonka")!)
-                Link("文档", destination: URL(string: "https://github.com/superkonka/mac-assistant")!)
+                Link("GitHub", destination: URL(string: "https://github.com/superkonka/mac-assistant")!)
+                Link("文档", destination: URL(string: "https://github.com/superkonka/mac-assistant/blob/main/README.md")!)
             }
         }
         .padding()
