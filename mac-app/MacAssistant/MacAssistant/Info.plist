@@ -29,5 +29,11 @@
         <key>NSAllowsLocalNetworking</key>
         <true/>
     </dict>
+    
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Mac Assistant 需要麦克风权限来进行语音输入</string>
+    
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Mac Assistant 需要语音识别权限来将您的语音转换为文字</string>
 </dict>
 </plist>

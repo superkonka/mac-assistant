@@ -1,14 +1,17 @@
 //
 //  ContentView.swift
-//  主界面 - 带连接状态显示
+//  主界面 - 集成语音输入
 //
 
 import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject var backend: BackendService
+    @StateObject private var speechRecognizer = SpeechRecognizer()
+    
     @State private var messageText = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
+    @State private var showRecordingPanel = false
     @FocusState private var isInputFocused: Bool
     
     var body: some View {
@@ -28,6 +31,28 @@ struct ContentView: View {
             
             Divider()
             
+            // 录音状态面板
+            if showRecordingPanel {
+                RecordingIndicator(
+                    transcript: speechRecognizer.transcript,
+                    onCancel: {
+                        speechRecognizer.stopRecording()
+                        showRecordingPanel = false
+                    },
+                    onConfirm: {
+                        speechRecognizer.stopRecording()
+                        if !speechRecognizer.transcript.isEmpty {
+                            messageText = speechRecognizer.transcript
+                            sendMessage()
+                        }
+                        showRecordingPanel = false
+                    }
+                )
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            
             // 输入区域
             inputArea
         }
@@ -35,6 +60,16 @@ struct ContentView: View {
         .onAppear {
             backend.loadHistory()
             isInputFocused = true
+            
+            // 设置语音识别回调
+            speechRecognizer.onResult = { text in
+                messageText = text
+            }
+        }
+        .onChange(of: speechRecognizer.isRecording) { isRecording in
+            withAnimation {
+                showRecordingPanel = isRecording
+            }
         }
     }
     
@@ -47,13 +82,6 @@ struct ContentView: View {
                 Circle()
                     .fill(backend.isConnected ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
-                    .overlay(
-                        Circle()
-                            .stroke(backend.isConnected ? Color.green.opacity(0.3) : Color.red.opacity(0.3), lineWidth: 2)
-                            .scaleEffect(backend.isConnected ? 1.5 : 1.0)
-                            .opacity(backend.isConnected ? 0 : 1)
-                    )
-                    .animation(.easeInOut(duration: 1).repeatForever(autoreverses: true), value: backend.isConnected)
                 
                 Text(backend.isConnected ? "已连接" : "未连接")
                     .font(.caption)
@@ -164,11 +192,22 @@ struct ContentView: View {
                 .font(.title2)
                 .bold()
             
-            Text("快捷键：\n⌘⇧Space 打开面板\n⌘⇧1 截图询问\n⌘⇧V 剪贴板询问")
-                .font(.callout)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .lineSpacing(4)
+            VStack(spacing: 8) {
+                Text("快捷键")
+                    .font(.headline)
+                    .foregroundColor(.secondary)
+                
+                HStack(spacing: 16) {
+                    ShortcutBadge(key: "⌘⇧Space", desc: "打开")
+                    ShortcutBadge(key: "⌘⇧1", desc: "截图")
+                    ShortcutBadge(key: "⌘⇧V", desc: "剪贴板")
+                }
+                
+                Text("🎙️ 点击麦克风按钮使用语音输入")
+                    .font(.callout)
+                    .foregroundColor(.blue)
+                    .padding(.top, 8)
+            }
         }
         .frame(maxWidth: .infinity, minHeight: 300)
         .padding()
@@ -197,7 +236,7 @@ struct ContentView: View {
                 }
             }
             
-            // 输入框
+            // 输入框 + 语音按钮
             HStack(spacing: 8) {
                 TextEditor(text: $messageText)
                     .font(.body)
@@ -205,8 +244,8 @@ struct ContentView: View {
                     .focused($isInputFocused)
                     .overlay(
                         Group {
-                            if messageText.isEmpty {
-                                Text("输入消息...")
+                            if messageText.isEmpty && !showRecordingPanel {
+                                Text("输入消息或点击麦克风...")
                                     .foregroundColor(.gray)
                                     .padding(.leading, 5)
                                     .allowsHitTesting(false)
@@ -215,7 +254,19 @@ struct ContentView: View {
                         alignment: .leading
                     )
                 
-                VStack(spacing: 4) {
+                VStack(spacing: 8) {
+                    // 语音输入按钮
+                    VoiceInputButton(speechRecognizer: speechRecognizer) { text in
+                        messageText = text
+                        // 自动发送
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            if !messageText.isEmpty {
+                                sendMessage()
+                            }
+                        }
+                    }
+                    
+                    // 发送按钮
                     Button(action: sendMessage) {
                         Image(systemName: "arrow.up.circle.fill")
                             .font(.title2)
@@ -224,6 +275,7 @@ struct ContentView: View {
                     .disabled(!canSend)
                     .buttonStyle(PlainButtonStyle())
                     
+                    // 截图按钮
                     Button(action: { backend.takeScreenshotAndAsk() }) {
                         Image(systemName: "camera.fill")
                             .font(.caption)
@@ -239,13 +291,14 @@ struct ContentView: View {
     }
     
     var canSend: Bool {
-        !messageText.isEmpty && backend.isConnected && !backend.isLoading
+        !messageText.isEmpty && backend.isConnected && !backend.isLoading && !speechRecognizer.isRecording
     }
     
     func sendMessage() {
         guard canSend else { return }
         let text = messageText
         messageText = ""
+        isInputFocused = true
         
         Task {
             await backend.sendMessage(text)
@@ -258,7 +311,30 @@ struct ContentView: View {
     }
 }
 
-// MARK: - Message Bubble
+// MARK: - Shortcut Badge
+
+struct ShortcutBadge: View {
+    let key: String
+    let desc: String
+    
+    var body: some View {
+        VStack(spacing: 4) {
+            Text(key)
+                .font(.system(.caption, design: .monospaced))
+                .fontWeight(.semibold)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.gray.opacity(0.15))
+                .cornerRadius(6)
+            
+            Text(desc)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+// MARK: - Message Bubble (保持不变)
 
 struct MessageBubble: View {
     let message: ChatMessage
@@ -301,7 +377,7 @@ struct MessageBubble: View {
     }
 }
 
-// MARK: - Loading Indicator
+// MARK: - Loading Indicator (保持不变)
 
 struct LoadingIndicator: View {
     @State private var isAnimating = false
@@ -335,7 +411,7 @@ struct LoadingIndicator: View {
     }
 }
 
-// MARK: - Quick Action Button
+// MARK: - Quick Action Button (保持不变)
 
 struct QuickActionButton: View {
     let icon: String
