@@ -148,20 +148,29 @@ ln -s /Applications "$DMG_TEMP/Applications"
 # cp "$BUILD_DIR/dmg_background.png" "$DMG_TEMP/.background/" 2>/dev/null || true
 
 # 创建 README
-# cat > "$DMG_TEMP/README.txt" << 'EOF'
-# Mac Assistant 安装说明
-# 
-# 1. 将 MacAssistant.app 拖到 Applications 文件夹
-# 2. 从启动台或应用程序文件夹打开 MacAssistant
-# 3. 首次打开会自动配置环境
-#
-# 快捷键:
-# ⌘⇧Space - 打开/关闭面板
-# ⌘⇧1     - 截图询问 AI
-# ⌘⇧V     - 询问剪贴板内容
-#
-# 需要帮助? 查看菜单栏中的"帮助"菜单
-# EOF
+cat > "$DMG_TEMP/使用说明-请先读我.txt" << 'EOF'
+Mac Assistant 安装说明
+========================
+
+1. 将 MacAssistant.app 拖到 Applications 文件夹
+
+2. 首次打开如果遇到"已损坏"提示，在终端执行：
+   
+   xattr -cr /Applications/MacAssistant.app
+   
+   然后重新打开应用即可。
+
+3. 配置 AI：
+   - 打开应用后配置你的 Moonshot 或 OpenAI API Key
+   - 或安装 Kimi CLI 使用本地模型
+
+快捷键：
+- ⌘⇧Space - 打开/关闭面板
+- ⌘⇧1     - 截图询问 AI
+- ⌘⇧V     - 询问剪贴板内容
+
+需要帮助? 查看菜单栏中的"帮助"菜单
+EOF
 
 # 创建 DMG
 hdiutil create \
