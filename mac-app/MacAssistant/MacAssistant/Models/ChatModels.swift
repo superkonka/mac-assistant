@@ -18,6 +18,8 @@ enum MessageRole: String, Codable, Equatable {
 enum TaskSessionStatus: String, Codable, Equatable {
     case queued
     case running
+    case partial
+    case waitingUser
     case completed
     case failed
 
@@ -25,6 +27,8 @@ enum TaskSessionStatus: String, Codable, Equatable {
         switch self {
         case .queued: return "排队中"
         case .running: return "执行中"
+        case .partial: return "部分恢复"
+        case .waitingUser: return "等待继续"
         case .completed: return "已完成"
         case .failed: return "失败"
         }
@@ -34,6 +38,8 @@ enum TaskSessionStatus: String, Codable, Equatable {
         switch self {
         case .queued: return "clock"
         case .running: return "hourglass"
+        case .partial: return "arrow.trianglehead.clockwise"
+        case .waitingUser: return "pause.circle.fill"
         case .completed: return "checkmark.circle.fill"
         case .failed: return "exclamationmark.triangle.fill"
         }
@@ -43,6 +49,8 @@ enum TaskSessionStatus: String, Codable, Equatable {
         switch self {
         case .queued: return "gray"
         case .running: return "blue"
+        case .partial: return "teal"
+        case .waitingUser: return "yellow"
         case .completed: return "green"
         case .failed: return "orange"
         }
@@ -80,6 +88,7 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
     var status: TaskSessionStatus
     var statusSummary: String
     var mainAgentName: String?
+    var delegateAgentID: String?
     var delegateAgentName: String?
     var intentName: String
     var isExpanded: Bool
@@ -87,6 +96,14 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
     var resultSummary: String?
     var errorMessage: String?
     var linkedMainMessageID: UUID?
+    var inputImages: [String]?
+    var gatewaySessionKey: String?
+    var gatewayRunID: String?
+    var gatewayConversationSessionID: String?
+    var requestStartedAt: Date?
+    var latestAssistantText: String?
+    var canResume: Bool
+    var lastReconciledAt: Date?
 
     init(
         id: String = "task-\(UUID().uuidString.prefix(8))",
@@ -97,13 +114,22 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         status: TaskSessionStatus = .queued,
         statusSummary: String,
         mainAgentName: String? = nil,
+        delegateAgentID: String? = nil,
         delegateAgentName: String? = nil,
         intentName: String,
         isExpanded: Bool = true,
         messages: [TaskSessionMessage] = [],
         resultSummary: String? = nil,
         errorMessage: String? = nil,
-        linkedMainMessageID: UUID? = nil
+        linkedMainMessageID: UUID? = nil,
+        inputImages: [String]? = nil,
+        gatewaySessionKey: String? = nil,
+        gatewayRunID: String? = nil,
+        gatewayConversationSessionID: String? = nil,
+        requestStartedAt: Date? = nil,
+        latestAssistantText: String? = nil,
+        canResume: Bool = false,
+        lastReconciledAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -113,6 +139,7 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         self.status = status
         self.statusSummary = statusSummary
         self.mainAgentName = mainAgentName
+        self.delegateAgentID = delegateAgentID
         self.delegateAgentName = delegateAgentName
         self.intentName = intentName
         self.isExpanded = isExpanded
@@ -120,6 +147,14 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         self.resultSummary = resultSummary
         self.errorMessage = errorMessage
         self.linkedMainMessageID = linkedMainMessageID
+        self.inputImages = inputImages
+        self.gatewaySessionKey = gatewaySessionKey
+        self.gatewayRunID = gatewayRunID
+        self.gatewayConversationSessionID = gatewayConversationSessionID
+        self.requestStartedAt = requestStartedAt
+        self.latestAssistantText = latestAssistantText
+        self.canResume = canResume
+        self.lastReconciledAt = lastReconciledAt
     }
 }
 

@@ -406,6 +406,7 @@ class AgentStore: ObservableObject {
     
     func validateLocalCodingRuntime() async -> Bool {
         await Task.detached(priority: .utility) {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
             let task = Process()
             let pipe = Pipe()
 
@@ -415,7 +416,17 @@ class AgentStore: ObservableObject {
             task.standardError = pipe
 
             var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/Users/konka/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+            env["PATH"] = [
+                "\(home)/.local/bin",
+                "\(home)/.cargo/bin",
+                "\(home)/.pyenv/shims",
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+                "/sbin",
+                "/usr/sbin"
+            ].joined(separator: ":")
             task.environment = env
 
             do {

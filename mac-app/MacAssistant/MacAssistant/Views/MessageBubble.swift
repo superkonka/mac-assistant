@@ -12,6 +12,7 @@ struct MessageBubble: View, Equatable {
     var availableWidth: CGFloat? = nil
     var taskSession: AgentTaskSession? = nil
     var onToggleTaskSession: (() -> Void)? = nil
+    var onResumeTaskSession: (() -> Void)? = nil
     @State private var showCopied = false
 
     private static let timeFormatter: DateFormatter = {
@@ -124,7 +125,8 @@ struct MessageBubble: View, Equatable {
             if let taskSession {
                 TaskSessionCardView(
                     session: taskSession,
-                    onToggle: onToggleTaskSession
+                    onToggle: onToggleTaskSession,
+                    onResume: onResumeTaskSession
                 )
                 .padding(8)
             } else {

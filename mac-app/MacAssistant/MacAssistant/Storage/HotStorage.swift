@@ -10,7 +10,7 @@ class HotStorage {
     private let defaults = UserDefaults.standard
     private let messagesKey = "hot_messages"
     private let activeSkillsKey = "hot_active_skills"
-    private let maxMessages = 20
+    private let maxMessages = 80
     
     // MARK: - 消息存储
     
@@ -32,6 +32,16 @@ class HotStorage {
             return []
         }
         return messages
+    }
+
+    func replaceMessages(_ messages: [ChatMessage]) {
+        let trimmedMessages: [ChatMessage]
+        if messages.count > maxMessages {
+            trimmedMessages = Array(messages.suffix(maxMessages))
+        } else {
+            trimmedMessages = messages
+        }
+        saveMessages(trimmedMessages)
     }
     
     func trimTo(limit: Int) {

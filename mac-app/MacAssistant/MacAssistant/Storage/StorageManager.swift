@@ -107,6 +107,10 @@ class StorageManager {
         
         return hotMessages + warmMessages
     }
+
+    func replaceRecentMessages(_ messages: [ChatMessage]) {
+        hotStorage.replaceMessages(messages)
+    }
     
     func searchMessages(query: String) -> [ChatMessage] {
         // 并行搜索各层

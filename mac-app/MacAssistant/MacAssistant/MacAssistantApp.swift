@@ -13,10 +13,18 @@ struct MacAssistantApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            ContentView()
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 600, height: 700)
+        
+        // 首次启动引导窗口
+        Window("欢迎使用", id: "onboarding") {
+            OnboardingView()
+        }
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 600, height: 500)
+        .windowResizability(.contentSize)
     }
 }
 
@@ -34,13 +42,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusBar()
         setupMainWindow()
 
+        // 检查是否需要首次启动引导
         Task {
-            do {
-                try await OpenClawGatewayClient.shared.prepareGateway()
-                LogInfo("🦞 OpenClaw gateway wrapper 已就绪")
-            } catch {
-                LogError("OpenClaw gateway wrapper 启动失败", error: error)
-            }
+            await checkFirstLaunch()
         }
         
         // 启动 AutoAgent 分析
@@ -49,7 +53,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         LogInfo("✅ 应用启动完成")
     }
     
+    /// 检查首次启动并显示引导
+    private func checkFirstLaunch() async {
+        let dependencyManager = DependencyManager.shared
+        let agentStore = AgentStore.shared
+        
+        // 检查是否需要引导：没有可用 Agent 或 OpenClaw 未安装
+        let needsSetup = await dependencyManager.needsFirstTimeSetup || 
+                         await dependencyManager.currentStatus == .notInstalled
+        
+        if needsSetup {
+            LogInfo("🆕 首次启动，显示引导界面")
+            
+            await MainActor.run {
+                // 显示引导窗口
+                if let onboardingWindow = NSApp.windows.first(where: { $0.title == "欢迎使用" }) {
+                    onboardingWindow.makeKeyAndOrderFront(nil)
+                    onboardingWindow.center()
+                }
+                
+                // 隐藏主窗口直到配置完成
+                window?.orderOut(nil)
+            }
+        } else {
+            // 正常启动 Gateway
+            do {
+                _ = try await OpenClawGatewayClient.shared.prepareGateway()
+                LogInfo("🦞 OpenClaw gateway wrapper 已就绪")
+            } catch {
+                LogError("OpenClaw gateway wrapper 启动失败", error: error)
+            }
+        }
+    }
+    
     func setupMainWindow() {
+        // 监听引导完成通知
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(onboardingDidComplete),
+            name: NSNotification.Name("OnboardingDidComplete"),
+            object: nil
+        )
+        
         let contentView = ChatView()
         
         window = NSWindow(
@@ -150,6 +195,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func quit() {
         LogInfo("👋 应用退出")
         NSApp.terminate(nil)
+    }
+    
+    /// 引导完成，启动 Gateway 和显示主窗口
+    @objc func onboardingDidComplete() {
+        LogInfo("🎉 引导完成，启动主功能")
+        
+        Task {
+            do {
+                _ = try await OpenClawGatewayClient.shared.prepareGateway()
+                LogInfo("🦞 OpenClaw gateway wrapper 已就绪")
+            } catch {
+                LogError("OpenClaw gateway wrapper 启动失败", error: error)
+            }
+        }
+        
+        // 显示主窗口
+        showWindow()
     }
 
     private func preferCurrentBundleInLaunchServices() {

@@ -156,6 +156,11 @@ struct ChatView: View {
                                     if let taskSessionID = message.linkedTaskSessionID {
                                         commandRunner.toggleTaskSessionExpansion(taskSessionID)
                                     }
+                                },
+                                onResumeTaskSession: {
+                                    if let taskSessionID = message.linkedTaskSessionID {
+                                        commandRunner.resumeTaskSession(taskSessionID)
+                                    }
                                 }
                             )
                             .equatable()

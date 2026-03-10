@@ -8,12 +8,16 @@ import SwiftUI
 struct TaskSessionCardView: View {
     let session: AgentTaskSession
     var onToggle: (() -> Void)?
+    var onResume: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             summary
             metadata
+            if session.canResume {
+                actions
+            }
 
             if session.isExpanded {
                 Divider()
@@ -69,6 +73,27 @@ struct TaskSessionCardView: View {
             .fixedSize(horizontal: false, vertical: true)
     }
 
+    private var actions: some View {
+        HStack(spacing: 8) {
+            Button(action: { onResume?() }) {
+                Text(session.status == .waitingUser ? "重新检查" : "继续处理")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+
+            if let lastReconciledAt = session.lastReconciledAt {
+                Text("上次检查 \(lastReconciledAt, style: .time)")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            } else {
+                Text("本地已保留上下文，可继续回查")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
     private var metadata: some View {
         HStack(spacing: 6) {
             if let mainAgentName = session.mainAgentName, !mainAgentName.isEmpty {
@@ -80,6 +105,10 @@ struct TaskSessionCardView: View {
             }
 
             TaskSessionTag(label: "任务", value: session.intentName)
+
+            if session.canResume {
+                TaskSessionTag(label: "恢复", value: "可继续")
+            }
         }
     }
 
@@ -101,11 +130,11 @@ struct TaskSessionCardView: View {
 
             if let errorMessage = session.errorMessage,
                !errorMessage.isEmpty,
-               session.status == .failed {
+               (session.status == .failed || session.status == .partial || session.status == .waitingUser) {
                 TaskSessionResultRow(
-                    title: "失败原因",
+                    title: session.status == .failed ? "失败原因" : "当前状态",
                     content: errorMessage,
-                    accent: .orange
+                    accent: session.status == .waitingUser ? .yellow : .orange
                 )
             }
         }
@@ -117,6 +146,10 @@ struct TaskSessionCardView: View {
             return .secondary
         case .running:
             return .blue
+        case .partial:
+            return .teal
+        case .waitingUser:
+            return .yellow
         case .completed:
             return .green
         case .failed:
@@ -130,6 +163,10 @@ struct TaskSessionCardView: View {
             return Color.gray.opacity(0.06)
         case .running:
             return Color.blue.opacity(0.06)
+        case .partial:
+            return Color.teal.opacity(0.07)
+        case .waitingUser:
+            return Color.yellow.opacity(0.08)
         case .completed:
             return Color.green.opacity(0.06)
         case .failed:
@@ -143,6 +180,10 @@ struct TaskSessionCardView: View {
             return Color.gray.opacity(0.2)
         case .running:
             return Color.blue.opacity(0.25)
+        case .partial:
+            return Color.teal.opacity(0.28)
+        case .waitingUser:
+            return Color.yellow.opacity(0.3)
         case .completed:
             return Color.green.opacity(0.22)
         case .failed:

@@ -204,7 +204,15 @@ class AgentStore: ObservableObject {
     @MainActor
     @discardableResult
     func launchKimiLogin() -> Bool {
-        let command = #"export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"; kimi login"#
+        let command = """
+        export PATH="\(commandSearchPath())";
+        kimi login;
+        status=$?;
+        echo;
+        if [ "$status" -eq 0 ]; then
+            echo "[MacAssistant] 如果你在 'logged in successfully' 之后看到类似 'pyenv: command not found' 的 shell 启动警告，登录通常已经成功，可以直接回到应用重新测试。";
+        fi
+        """
         let script = """
         tell application "Terminal"
             activate
@@ -508,7 +516,7 @@ class AgentStore: ObservableObject {
             task.standardError = outputPipe
 
             var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/Users/konka/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+            env["PATH"] = self.commandSearchPath()
             env["KIMI_NO_COLOR"] = "1"
             task.environment = env
 
@@ -530,8 +538,9 @@ class AgentStore: ObservableObject {
                 timeoutWorkItem.cancel()
 
                 let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: outputData, encoding: .utf8)?
+                let rawOutput = String(data: outputData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let output = self.sanitizedLocalRuntimeOutput(rawOutput)
 
                 if didTimeout {
                     return .invalid("Kimi CLI 响应超时，请先在终端完成 `kimi login` 或检查网络后再试。")
@@ -541,13 +550,17 @@ class AgentStore: ObservableObject {
                     NSError(
                         domain: "AgentStore.KimiCLIValidation",
                         code: Int(task.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: output]
+                        userInfo: [NSLocalizedDescriptionKey: rawOutput]
                     )
-                ) || output.lowercased().contains("invalid_authentication_error") {
+                ) || rawOutput.lowercased().contains("invalid_authentication_error") {
                     return .invalid("Kimi CLI 尚未完成认证。请先在终端执行 `kimi login`，或按 CLI 引导完成 provider 选择与 API Key / OAuth 配置。")
                 }
 
                 if task.terminationStatus == 0, !output.isEmpty {
+                    return .valid
+                }
+
+                if rawOutput.lowercased().contains("logged in successfully") {
                     return .valid
                 }
 
@@ -559,6 +572,10 @@ class AgentStore: ObservableObject {
                     return .invalid("Kimi CLI 当前不可用：\(output)")
                 }
 
+                if !rawOutput.isEmpty, self.containsOnlyShellNoise(rawOutput) {
+                    return .invalid("Kimi CLI 已经执行，但你的 shell 启动里还有额外警告（例如 pyenv 配置异常）。请先修复 shell 环境，或忽略该警告后重新测试。")
+                }
+
                 return .invalid("Kimi CLI 没有返回可用结果，请先完成登录/初始化后再试。")
             } catch {
                 timeoutWorkItem.cancel()
@@ -568,6 +585,10 @@ class AgentStore: ObservableObject {
     }
 
     private func resolveKimiExecutablePath() -> String? {
+        for candidate in self.kimiExecutableCandidates() where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+
         let task = Process()
         let pipe = Pipe()
 
@@ -577,7 +598,7 @@ class AgentStore: ObservableObject {
         task.standardError = pipe
 
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/Users/konka/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+        env["PATH"] = self.commandSearchPath()
         task.environment = env
 
         do {
@@ -595,6 +616,64 @@ class AgentStore: ObservableObject {
         } catch {
             return nil
         }
+    }
+
+    private func kimiExecutableCandidates() -> [String] {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return [
+            "\(home)/.local/bin/kimi",
+            "\(home)/.cargo/bin/kimi",
+            "\(home)/.pyenv/shims/kimi",
+            "/opt/homebrew/bin/kimi",
+            "/usr/local/bin/kimi",
+            "/usr/bin/kimi"
+        ]
+    }
+
+    private func commandSearchPath() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let entries = [
+            "\(home)/.local/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.pyenv/shims",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/sbin",
+            "/usr/sbin"
+        ]
+
+        var seen = Set<String>()
+        return entries.filter { seen.insert($0).inserted }.joined(separator: ":")
+    }
+
+    private func sanitizedLocalRuntimeOutput(_ output: String) -> String {
+        output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !isBenignShellNoiseLine($0) }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func containsOnlyShellNoise(_ output: String) -> Bool {
+        let lines = output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+        guard !lines.isEmpty else { return false }
+        return lines.allSatisfy { isBenignShellNoiseLine($0) }
+    }
+
+    private func isBenignShellNoiseLine(_ line: String) -> Bool {
+        let normalized = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return false }
+        return normalized.contains("command not found: pyenv") ||
+            normalized.contains("pyenv:") && normalized.contains("command not found") ||
+            normalized.contains("compdef: command not found") ||
+            normalized.contains("zsh compinit:")
     }
     
     // MARK: - 能力判定

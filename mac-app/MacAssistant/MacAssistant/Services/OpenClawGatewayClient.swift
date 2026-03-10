@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import OpenClawChatUI
 import OpenClawKit
 import OpenClawProtocol
@@ -267,6 +268,18 @@ actor OpenClawGatewayClient {
         return try self.decoder.decode(OpenClawSkillsStatusReport.self, from: data)
     }
 
+    func recoverInterruptedTaskOutput(
+        sessionKey: String,
+        requestStartedAt: Date,
+        latestAssistantText: String
+    ) async -> OpenClawRecoveredOutput? {
+        await self.recoverAssistantText(
+            sessionKey: Self.canonicalSessionKey(sessionKey),
+            requestStartedAtMs: requestStartedAt.timeIntervalSince1970 * 1000,
+            latestAssistantText: latestAssistantText
+        )
+    }
+
     private func patchSession(
         key: String,
         modelRef: String,
@@ -296,11 +309,16 @@ actor OpenClawGatewayClient {
         message: String,
         attachments: [OpenClawChatAttachmentPayload]
     ) async throws -> OpenClawChatSendResponse {
+        let idempotencyKey = self.deterministicIdempotencyKey(
+            sessionKey: sessionKey,
+            message: message,
+            attachments: attachments
+        )
         var params: [String: AnyCodable] = [
             "sessionKey": AnyCodable(sessionKey),
             "message": AnyCodable(message),
             "thinking": AnyCodable("off"),
-            "idempotencyKey": AnyCodable(UUID().uuidString),
+            "idempotencyKey": AnyCodable(idempotencyKey),
             "timeoutMs": AnyCodable(120000),
         ]
 
@@ -317,6 +335,20 @@ actor OpenClawGatewayClient {
 
         let data = try await self.request(method: "chat.send", params: params, timeoutMs: 120000)
         return try self.decoder.decode(OpenClawChatSendResponse.self, from: data)
+    }
+
+    private func deterministicIdempotencyKey(
+        sessionKey: String,
+        message: String,
+        attachments: [OpenClawChatAttachmentPayload]
+    ) -> String {
+        let attachmentFingerprint = attachments
+            .map { "\($0.fileName)|\($0.mimeType)|\($0.content.prefix(64))" }
+            .joined(separator: "||")
+        let payload = "\(sessionKey)\n\(message)\n\(attachmentFingerprint)"
+        let digest = SHA256.hash(data: Data(payload.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "macassistant-\(hex)"
     }
 
     private func buildAttachments(from imagePaths: [String]) throws -> [OpenClawChatAttachmentPayload] {
@@ -395,23 +427,23 @@ actor OpenClawGatewayClient {
         sessionKey: String,
         requestStartedAtMs: Double,
         latestAssistantText: String
-    ) async -> (text: String, sessionID: String?)? {
+    ) async -> OpenClawRecoveredOutput? {
         if let history = try? await self.chatHistory(sessionKey: sessionKey) {
             let sessionID = self.normalizedSessionID(history.sessionId)
             if let recoveredText = self.extractLatestAssistantText(
                 from: history,
                 newerThan: requestStartedAtMs
             ) {
-                return (recoveredText, sessionID)
+                return OpenClawRecoveredOutput(text: recoveredText, sessionID: sessionID, source: .history)
             }
             if let bufferedText = self.normalizedNonEmptyText(latestAssistantText) {
-                return (bufferedText, sessionID)
+                return OpenClawRecoveredOutput(text: bufferedText, sessionID: sessionID, source: .buffer)
             }
             return nil
         }
 
         if let bufferedText = self.normalizedNonEmptyText(latestAssistantText) {
-            return (bufferedText, nil)
+            return OpenClawRecoveredOutput(text: bufferedText, sessionID: nil, source: .buffer)
         }
 
         return nil
@@ -584,6 +616,17 @@ struct OpenClawSkillsStatusReport: Codable {
     let workspaceDir: String
     let managedSkillsDir: String
     let skills: [OpenClawSkillStatus]
+}
+
+struct OpenClawRecoveredOutput {
+    enum Source {
+        case history
+        case buffer
+    }
+
+    let text: String
+    let sessionID: String?
+    let source: Source
 }
 
 struct OpenClawSkillStatus: Codable {

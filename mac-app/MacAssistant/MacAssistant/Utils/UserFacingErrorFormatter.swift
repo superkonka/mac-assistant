@@ -12,6 +12,10 @@ enum UserFacingErrorFormatter {
         classify(error: error).kind == .authentication
     }
 
+    static func isStreamInterruptedError(_ error: Error) -> Bool {
+        classify(error: error).kind == .streamInterrupted
+    }
+
     static func chatMessage(for error: Error, agentName: String, providerName: String) -> String {
         let context = classify(error: error)
 
@@ -63,7 +67,7 @@ enum UserFacingErrorFormatter {
             return """
             我已经把这次请求交给 \(agentName) 和 OpenClaw 继续处理了，但最后没有等到完整的收尾事件。
 
-            像部署服务、打开授权页、启动本地进程这类长任务，有时任务本身已经执行到一半甚至已经完成，只是结果没有顺利回传到主会话。你可以先看一下刚才创建的文件、服务或登录状态；如果你愿意，也可以把当前状态继续发给我，我会接着帮你收尾。
+            我已经把这次任务的上下文和最近输出保存在本地了，稍后会自动回查；你也可以直接在任务卡片里点“继续处理”。像部署服务、打开授权页、启动本地进程这类长任务，有时任务本身已经执行到一半甚至已经完成，只是结果没有顺利回传到主会话。
             """
         case .unknown:
             if context.detail.isEmpty {
@@ -176,7 +180,7 @@ enum UserFacingErrorFormatter {
         case .invalidPrompt:
             return "这次没有拿到有效输入，所以服务没有真正开始处理请求。你可以把问题重新发一次。"
         case .streamInterrupted:
-            return "这次任务没有等到 OpenClaw 的完整收尾事件，但任务本身可能已经执行了一部分。你可以先检查刚才创建的文件、服务或授权状态。"
+            return "这次任务没有等到 OpenClaw 的完整收尾事件，但现场已经保存在本地。你可以先检查刚才创建的文件、服务或授权状态，也可以直接继续处理。"
         case .unknown:
             if context.detail.isEmpty {
                 return "这次请求没有顺利完成。你可以先再试一次；如果连续出现，重新配置这个 Agent 往往更快。"
@@ -218,7 +222,7 @@ enum UserFacingErrorFormatter {
         case .invalidPrompt:
             return "这次没有拿到有效输入，所以服务没有真正开始处理请求。你可以把问题重新发一次。"
         case .streamInterrupted:
-            return "这次任务没有等到完整的收尾事件，但刚才那次操作可能已经执行了一部分。你可以先检查本地状态，再决定是否继续。"
+            return "这次任务没有等到完整的收尾事件，但现场已经保存在本地。你可以先检查本地状态，再决定是否继续。"
         case .unknown:
             if detail.isEmpty {
                 return "这次请求没有顺利完成。你可以先再试一次。"

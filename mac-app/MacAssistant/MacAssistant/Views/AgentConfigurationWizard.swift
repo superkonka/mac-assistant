@@ -321,7 +321,8 @@ struct APIKeyInputStep: View {
                             Text("1. 已安装 `kimi` 命令")
                             Text("2. 如果首次使用会要求选择 provider、登录或输入 API Key，请先在终端完成 `kimi login`")
                             Text("3. 如需手动修改凭证，可编辑 `~/.kimi/config.toml`")
-                            Text("4. 返回这里点击\"开始测试\"验证 CLI 是否真的能跑通")
+                            Text("4. 如果终端里已经出现 `logged in successfully`，即使后面还有 shell 警告，也可以先回来点“开始测试”")
+                            Text("5. 返回这里点击\"开始测试\"验证 CLI 是否真的能跑通")
                         }
                         .font(.caption)
                         .foregroundColor(.secondary)

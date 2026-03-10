@@ -23,8 +23,18 @@ class CommandRunner: ObservableObject {
         case workflowDesign
     }
 
-    @Published var messages: [ChatMessage] = []
-    @Published var taskSessions: [AgentTaskSession] = []
+    @Published var messages: [ChatMessage] = [] {
+        didSet {
+            guard !isRestoringPersistedState else { return }
+            StorageManager.shared.replaceRecentMessages(messages)
+        }
+    }
+    @Published var taskSessions: [AgentTaskSession] = [] {
+        didSet {
+            guard !isRestoringPersistedState else { return }
+            executionJournal.saveTaskSessions(taskSessions)
+        }
+    }
     @Published var currentExecutionTrace: ExecutionTrace?
     @Published var isProcessing = false
     
@@ -41,6 +51,7 @@ class CommandRunner: ObservableObject {
     private let gatewayClient = OpenClawGatewayClient.shared
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
+    private let executionJournal = ExecutionJournalStore.shared
     private let initialSetupPromptKey = "initial_setup_prompt"
     private let screenRecordingSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     
@@ -50,11 +61,16 @@ class CommandRunner: ObservableObject {
     private var isWaitingForKimiCLILogin = false
     private var pendingKimiCLILoginAgentID: String?
     private var traceDismissTask: Task<Void, Never>?
+    private var isRestoringPersistedState = false
     
     static let shared = CommandRunner()
     
     init() {
+        restorePersistedState()
         setupNotifications()
+        Task {
+            await reconcileInterruptedTaskSessions(trigger: "launch")
+        }
     }
 
     var isLoading: Bool { isProcessing }
@@ -75,6 +91,7 @@ class CommandRunner: ObservableObject {
                 Task { @MainActor [weak self] in
                     self?.resumePendingScreenRecordingFlowIfNeeded()
                     await self?.resumePendingKimiCLILoginFlowIfNeeded()
+                    await self?.reconcileInterruptedTaskSessions(trigger: "foreground")
                 }
             }
             .store(in: &cancellables)
@@ -101,6 +118,10 @@ class CommandRunner: ObservableObject {
         // 1. 检查是否在 Agent 创建流程中
         if creationSkill.isInCreationFlow {
             await creationSkill.handleInput(text, runner: self)
+            return
+        }
+
+        if await handleResumeRequestIfNeeded(text) {
             return
         }
 
@@ -1620,6 +1641,7 @@ class CommandRunner: ObservableObject {
                 mainAgent: mainAgent,
                 delegateAgent: agent,
                 request: text,
+                images: images,
                 intent: intent,
                 reason: reason
             )
@@ -1660,10 +1682,18 @@ class CommandRunner: ObservableObject {
     }
 
     @MainActor
+    func resumeTaskSession(_ id: String) {
+        Task {
+            await resumeTaskSessionIfPossible(id)
+        }
+    }
+
+    @MainActor
     private func createTaskSession(
         mainAgent: Agent?,
         delegateAgent: Agent,
         request: String,
+        images: [String],
         intent: Intent,
         reason: String
     ) -> String {
@@ -1673,10 +1703,14 @@ class CommandRunner: ObservableObject {
             status: .queued,
             statusSummary: "等待 \(delegateAgent.displayName) 接手",
             mainAgentName: mainAgent?.name,
+            delegateAgentID: delegateAgent.id,
             delegateAgentName: delegateAgent.name,
             intentName: intent.displayName,
-            isExpanded: true
+            isExpanded: true,
+            inputImages: images,
+            canResume: false
         )
+        session.gatewaySessionKey = gatewaySessionKey(forTaskSessionID: session.id)
 
         let taskCardMessage = ChatMessage(
             id: UUID(),
@@ -1713,6 +1747,9 @@ class CommandRunner: ObservableObject {
         }
         taskSessions[index].messages.append(message)
         taskSessions[index].updatedAt = Date()
+        if role == .assistant {
+            taskSessions[index].latestAssistantText = content
+        }
         return message.id
     }
 
@@ -1733,6 +1770,9 @@ class CommandRunner: ObservableObject {
 
         taskSessions[sessionIndex].messages[messageIndex].content = content
         taskSessions[sessionIndex].updatedAt = Date()
+        if taskSessions[sessionIndex].messages[messageIndex].role == .assistant {
+            taskSessions[sessionIndex].latestAssistantText = content
+        }
     }
 
     @MainActor
@@ -1763,14 +1803,80 @@ class CommandRunner: ObservableObject {
         if let resultSummary, taskSessions[index].resultSummary != resultSummary {
             taskSessions[index].resultSummary = resultSummary
             didChange = true
+        } else if resultSummary == nil,
+                  status != .completed,
+                  taskSessions[index].resultSummary != nil {
+            taskSessions[index].resultSummary = nil
+            didChange = true
         }
         if let errorMessage, taskSessions[index].errorMessage != errorMessage {
             taskSessions[index].errorMessage = errorMessage
+            didChange = true
+        } else if errorMessage == nil,
+                  status != .failed,
+                  status != .partial,
+                  status != .waitingUser,
+                  taskSessions[index].errorMessage != nil {
+            taskSessions[index].errorMessage = nil
             didChange = true
         }
 
         guard didChange else { return }
         taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    private func updateTaskSessionDelegateAgent(
+        sessionID: String,
+        agent: Agent
+    ) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        taskSessions[index].delegateAgentID = agent.id
+        taskSessions[index].delegateAgentName = agent.name
+        taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    private func updateTaskSessionRecoveryContext(
+        sessionID: String,
+        gatewaySessionKey: String? = nil,
+        gatewayRunID: String? = nil,
+        gatewayConversationSessionID: String? = nil,
+        requestStartedAt: Date? = nil,
+        latestAssistantText: String? = nil,
+        canResume: Bool? = nil,
+        lastReconciledAt: Date? = nil
+    ) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
+
+        if let gatewaySessionKey {
+            taskSessions[index].gatewaySessionKey = gatewaySessionKey
+        }
+        if let gatewayRunID {
+            taskSessions[index].gatewayRunID = gatewayRunID
+        }
+        if let gatewayConversationSessionID {
+            taskSessions[index].gatewayConversationSessionID = gatewayConversationSessionID
+        }
+        if let requestStartedAt {
+            taskSessions[index].requestStartedAt = requestStartedAt
+        }
+        if let latestAssistantText {
+            taskSessions[index].latestAssistantText = latestAssistantText
+        }
+        if let canResume {
+            taskSessions[index].canResume = canResume
+        }
+        if let lastReconciledAt {
+            taskSessions[index].lastReconciledAt = lastReconciledAt
+        }
+        taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    private func latestAssistantMessageID(forTaskSessionID sessionID: String) -> UUID? {
+        guard let session = taskSessions.first(where: { $0.id == sessionID }) else { return nil }
+        return session.messages.last(where: { $0.role == .assistant })?.id
     }
 
     private func summarizeTaskResult(_ content: String) -> String {
@@ -1780,18 +1886,268 @@ class CommandRunner: ObservableObject {
         return "\(prefix)…"
     }
 
+    private func shouldTreatAsResumeCommand(_ text: String) -> Bool {
+        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let candidates: Set<String> = [
+            "继续",
+            "继续处理",
+            "继续刚才任务",
+            "继续刚才中断的任务",
+            "恢复刚才任务",
+            "恢复处理",
+            "继续上次任务"
+        ]
+        return candidates.contains(normalized)
+    }
+
+    private func handleResumeRequestIfNeeded(_ text: String) async -> Bool {
+        guard shouldTreatAsResumeCommand(text) else {
+            return false
+        }
+
+        let sessionID = await MainActor.run {
+            taskSessions
+                .reversed()
+                .first(where: { $0.canResume || $0.status == .partial || $0.status == .waitingUser })?
+                .id
+        }
+        guard let sessionID else {
+            return false
+        }
+
+        await resumeTaskSessionIfPossible(sessionID)
+        return true
+    }
+
+    private func resumeTaskSessionIfPossible(_ sessionID: String) async {
+        let recovered = await reconcileTaskSession(sessionID, manualTrigger: true, allowRetry: true)
+        guard !recovered else { return }
+
+        await MainActor.run {
+            appendSystemMessage("我已经重新检查了刚才中断的任务，但暂时还没有拿到新的结果。你可以先完成授权或检查本地状态，再继续一次。")
+        }
+    }
+
+    private func reconcileInterruptedTaskSessions(trigger: String) async {
+        let candidateIDs = await MainActor.run { () -> [String] in
+            taskSessions
+                .filter {
+                    ($0.canResume || $0.status == .running || $0.status == .partial || $0.status == .waitingUser) &&
+                    $0.gatewaySessionKey != nil &&
+                    $0.requestStartedAt != nil
+                }
+                .sorted { $0.updatedAt < $1.updatedAt }
+                .map(\.id)
+        }
+
+        for sessionID in candidateIDs {
+            _ = await reconcileTaskSession(sessionID, manualTrigger: false, allowRetry: false)
+        }
+
+        if !candidateIDs.isEmpty {
+            LogInfo("已完成中断任务回查，trigger=\(trigger)，任务数=\(candidateIDs.count)")
+        }
+    }
+
+    private func reconcileTaskSession(
+        _ sessionID: String,
+        manualTrigger: Bool,
+        allowRetry: Bool
+    ) async -> Bool {
+        let snapshot = await MainActor.run { taskSession(for: sessionID) }
+        guard let snapshot,
+              let sessionKey = snapshot.gatewaySessionKey,
+              let requestStartedAt = snapshot.requestStartedAt else {
+            return false
+        }
+
+        if let recovery = await gatewayClient.recoverInterruptedTaskOutput(
+            sessionKey: sessionKey,
+            requestStartedAt: requestStartedAt,
+            latestAssistantText: snapshot.latestAssistantText ?? ""
+        ) {
+            let summary = recovery.source == .history
+                ? "已通过本地账本回查恢复结果"
+                : "已恢复最近输出，但还没拿到完整收尾"
+
+            await MainActor.run {
+                if let assistantMessageID = latestAssistantMessageID(forTaskSessionID: sessionID) {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: recovery.text
+                    )
+                }
+
+                updateTaskSessionRecoveryContext(
+                    sessionID: sessionID,
+                    gatewayConversationSessionID: recovery.sessionID,
+                    latestAssistantText: recovery.text,
+                    canResume: recovery.source == .buffer,
+                    lastReconciledAt: Date()
+                )
+
+                if recovery.source == .history {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .completed,
+                        summary: summary,
+                        isExpanded: manualTrigger,
+                        resultSummary: summarizeTaskResult(recovery.text),
+                        errorMessage: nil
+                    )
+                } else {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .partial,
+                        summary: summary,
+                        isExpanded: true,
+                        errorMessage: snapshot.errorMessage
+                    )
+                }
+
+                if manualTrigger {
+                    let notice = recovery.source == .history
+                        ? "我已经回查到刚才中断任务的结果：\n\n\(recovery.text)"
+                        : "我已经恢复到刚才中断任务的最近输出，完整收尾还没回来。你可以继续观察任务卡片，或者再点一次继续处理。"
+                    appendAssistantConversationMessage(notice)
+                }
+            }
+            return true
+        }
+
+        guard manualTrigger,
+              allowRetry,
+              snapshot.canResume,
+              let delegateAgentID = snapshot.delegateAgentID,
+              let agent = agentStore.agent(withId: delegateAgentID),
+              agentStore.canUse(agent) else {
+            await MainActor.run {
+                updateTaskSessionRecoveryContext(
+                    sessionID: sessionID,
+                    lastReconciledAt: Date()
+                )
+            }
+            return false
+        }
+
+        let assistantMessageID = await MainActor.run { () -> UUID in
+            if let existingID = latestAssistantMessageID(forTaskSessionID: sessionID) {
+                return existingID
+            }
+            return appendTaskSessionMessage(
+                sessionID: sessionID,
+                role: .assistant,
+                content: "⏳ \(agent.name) 正在继续处理...",
+                agentName: agent.name
+            )
+        }
+
+        await MainActor.run {
+            isProcessing = true
+            updateTaskSessionDelegateAgent(sessionID: sessionID, agent: agent)
+            updateTaskSessionStatus(
+                sessionID: sessionID,
+                status: .running,
+                summary: "正在继续处理上次中断的任务",
+                isExpanded: true,
+                errorMessage: nil
+            )
+            updateTaskSessionRecoveryContext(
+                sessionID: sessionID,
+                requestStartedAt: Date(),
+                canResume: false
+            )
+        }
+
+        do {
+            let continuedContent = try await sendViaGateway(
+                agent: agent,
+                sessionKey: sessionKey,
+                sessionLabel: snapshot.title,
+                text: snapshot.originalRequest,
+                images: snapshot.inputImages ?? [],
+                taskSessionID: sessionID,
+                assistantMessageID: assistantMessageID
+            )
+
+            await MainActor.run {
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .completed,
+                    summary: "\(agent.displayName) 已继续完成刚才的任务",
+                    isExpanded: false,
+                    resultSummary: summarizeTaskResult(continuedContent),
+                    errorMessage: nil
+                )
+                updateTaskSessionRecoveryContext(
+                    sessionID: sessionID,
+                    latestAssistantText: continuedContent,
+                    canResume: false,
+                    lastReconciledAt: Date()
+                )
+                appendAssistantConversationMessage("我已经继续完成了刚才中断的任务：\n\n\(continuedContent)")
+                isProcessing = false
+            }
+            return true
+        } catch {
+            let message = UserFacingErrorFormatter.chatMessage(
+                for: error,
+                agentName: agent.displayName,
+                providerName: agent.provider.displayName
+            )
+            await MainActor.run {
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: UserFacingErrorFormatter.isStreamInterruptedError(error) ? .partial : .failed,
+                    summary: UserFacingErrorFormatter.isStreamInterruptedError(error)
+                        ? "继续处理中再次中断，已保留现场"
+                        : "\(agent.displayName) 继续处理失败",
+                    isExpanded: true,
+                    errorMessage: message
+                )
+                updateTaskSessionRecoveryContext(
+                    sessionID: sessionID,
+                    canResume: UserFacingErrorFormatter.isStreamInterruptedError(error),
+                    lastReconciledAt: Date()
+                )
+                if let latestAssistantText = snapshot.latestAssistantText,
+                   UserFacingErrorFormatter.isStreamInterruptedError(error),
+                   let assistantMessageID = latestAssistantMessageID(forTaskSessionID: sessionID) {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: latestAssistantText
+                    )
+                }
+                appendSystemMessage(message)
+                isProcessing = false
+            }
+            return false
+        }
+    }
+
     private func runTaskSession(
         sessionID: String,
         agent: Agent,
         text: String,
         images: [String]
     ) async -> TaskExecutionResult {
+        let sessionKey = gatewaySessionKey(forTaskSessionID: sessionID)
+        let requestStartedAt = Date()
         await MainActor.run {
             updateTaskSessionStatus(
                 sessionID: sessionID,
                 status: .running,
                 summary: "\(agent.displayName) 正在处理这个任务",
                 isExpanded: true
+            )
+            updateTaskSessionDelegateAgent(sessionID: sessionID, agent: agent)
+            updateTaskSessionRecoveryContext(
+                sessionID: sessionID,
+                gatewaySessionKey: sessionKey,
+                requestStartedAt: requestStartedAt,
+                canResume: false
             )
         }
 
@@ -1807,7 +2163,7 @@ class CommandRunner: ObservableObject {
         do {
             let content = try await sendViaGateway(
                 agent: agent,
-                sessionKey: gatewaySessionKey(forTaskSessionID: sessionID),
+                sessionKey: sessionKey,
                 sessionLabel: taskSession(for: sessionID)?.title,
                 text: text,
                 images: images,
@@ -1821,7 +2177,14 @@ class CommandRunner: ObservableObject {
                     status: .completed,
                     summary: "\(agent.displayName) 已完成，结果已回流到主会话",
                     isExpanded: false,
-                    resultSummary: summarizeTaskResult(content)
+                    resultSummary: summarizeTaskResult(content),
+                    errorMessage: nil
+                )
+                updateTaskSessionRecoveryContext(
+                    sessionID: sessionID,
+                    latestAssistantText: content,
+                    canResume: false,
+                    lastReconciledAt: Date()
                 )
             }
 
@@ -1853,6 +2216,7 @@ class CommandRunner: ObservableObject {
                         summary: "\(agent.displayName) 不可用，已切换到 \(fallbackAgent.displayName)",
                         isExpanded: true
                     )
+                    updateTaskSessionDelegateAgent(sessionID: sessionID, agent: fallbackAgent)
                     updateTaskSessionMessage(
                         sessionID: sessionID,
                         messageID: assistantMessageID,
@@ -1864,7 +2228,7 @@ class CommandRunner: ObservableObject {
                     terminalAgent = fallbackAgent
                     let fallbackContent = try await sendViaGateway(
                         agent: fallbackAgent,
-                        sessionKey: gatewaySessionKey(forTaskSessionID: sessionID),
+                        sessionKey: sessionKey,
                         sessionLabel: taskSession(for: sessionID)?.title,
                         text: text,
                         images: images,
@@ -1878,7 +2242,14 @@ class CommandRunner: ObservableObject {
                             status: .completed,
                             summary: "\(fallbackAgent.displayName) 已完成，结果已回流到主会话",
                             isExpanded: false,
-                            resultSummary: summarizeTaskResult(fallbackContent)
+                            resultSummary: summarizeTaskResult(fallbackContent),
+                            errorMessage: nil
+                        )
+                        updateTaskSessionRecoveryContext(
+                            sessionID: sessionID,
+                            latestAssistantText: fallbackContent,
+                            canResume: false,
+                            lastReconciledAt: Date()
                         )
                     }
 
@@ -1906,20 +2277,73 @@ class CommandRunner: ObservableObject {
                 providerName: terminalAgent.provider.displayName
             )
             let terminalAgentName = terminalAgent.displayName
+            let isStreamInterrupted = UserFacingErrorFormatter.isStreamInterruptedError(terminalError)
+            let isKimiLoginFailure = isKimiCLIAuthenticationFailure(terminalError, agent: terminalAgent)
+            let initialStreamingPlaceholder = "⏳ \(terminalAgent.name) 正在通过 OpenClaw 处理..."
+            let preservedAssistantText = await MainActor.run {
+                taskSession(for: sessionID)?.latestAssistantText?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
 
             await MainActor.run {
-                updateTaskSessionMessage(
-                    sessionID: sessionID,
-                    messageID: assistantMessageID,
-                    content: userFacingMessage
-                )
-                updateTaskSessionStatus(
-                    sessionID: sessionID,
-                    status: .failed,
-                    summary: "\(terminalAgentName) 执行失败",
-                    isExpanded: true,
-                    errorMessage: userFacingMessage
-                )
+                if isStreamInterrupted {
+                    let shouldPreservePartialOutput =
+                        !(preservedAssistantText ?? "").isEmpty &&
+                        preservedAssistantText != initialStreamingPlaceholder
+                    if !shouldPreservePartialOutput {
+                        updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: userFacingMessage
+                        )
+                    }
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .partial,
+                        summary: "结果回传中断，已保留现场并等待回查",
+                        isExpanded: true,
+                        errorMessage: userFacingMessage
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        latestAssistantText: shouldPreservePartialOutput ? preservedAssistantText : userFacingMessage,
+                        canResume: true
+                    )
+                } else if isKimiLoginFailure {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: userFacingMessage
+                    )
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .waitingUser,
+                        summary: "等待完成 Kimi CLI 登录后继续",
+                        isExpanded: true,
+                        errorMessage: userFacingMessage
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        canResume: true
+                    )
+                } else {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: userFacingMessage
+                    )
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .failed,
+                        summary: "\(terminalAgentName) 执行失败",
+                        isExpanded: true,
+                        errorMessage: userFacingMessage
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        canResume: false
+                    )
+                }
             }
 
             return TaskExecutionResult(agent: terminalAgent, content: userFacingMessage, failed: true)
@@ -2825,6 +3249,7 @@ class CommandRunner: ObservableObject {
         appendSystemMessage(
             "✅ 已检测到 \(agent.displayName) 的 Kimi CLI 登录恢复成功。你现在可以继续提问了。"
         )
+        await reconcileInterruptedTaskSessions(trigger: "kimi-login-restored")
     }
 
     @MainActor
@@ -2913,6 +3338,47 @@ class CommandRunner: ObservableObject {
         messages.append(systemMessage)
     }
 
+    @MainActor
+    private func appendAssistantConversationMessage(_ content: String) {
+        let assistantMessage = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: content,
+            timestamp: Date()
+        )
+        messages.append(assistantMessage)
+    }
+
+    private func restorePersistedState() {
+        isRestoringPersistedState = true
+        defer { isRestoringPersistedState = false }
+
+        messages = StorageManager.shared.getRecentMessages(limit: 50)
+        taskSessions = normalizeRestoredTaskSessions(executionJournal.loadTaskSessions())
+        StorageManager.shared.replaceRecentMessages(messages)
+        executionJournal.saveTaskSessions(taskSessions)
+    }
+
+    private func normalizeRestoredTaskSessions(_ sessions: [AgentTaskSession]) -> [AgentTaskSession] {
+        let restoredAt = Date()
+        return sessions.map { session in
+            var normalized = session
+            switch normalized.status {
+            case .queued, .running:
+                normalized.status = .partial
+                normalized.statusSummary = "应用重新打开，正在回查上次中断的结果"
+                normalized.canResume = true
+                normalized.isExpanded = true
+                normalized.updatedAt = restoredAt
+            case .partial, .waitingUser:
+                normalized.canResume = true
+            case .completed, .failed:
+                break
+            }
+            return normalized
+        }
+    }
+
     /// 保存截图到桌面
     private func saveScreenshotToDesktop() -> String? {
         let dateFormatter = DateFormatter()
@@ -2957,12 +3423,14 @@ class CommandRunner: ObservableObject {
     }
 
     func loadHistory() {
-        messages = StorageManager.shared.getRecentMessages(limit: 50)
+        restorePersistedState()
     }
 
     func clearHistory() {
         messages.removeAll()
+        taskSessions.removeAll()
         StorageManager.shared.clearHistory()
+        executionJournal.clear()
     }
 
     func screenshotAndAsk() {

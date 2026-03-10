@@ -12,6 +12,15 @@ actor OpenClawGatewayRuntimeManager {
         let modelRefsByAgentID: [String: String]
         let primaryModelRef: String?
     }
+    
+    /// Gateway 准备状态
+    enum GatewayReadiness: Equatable {
+        case notStarted
+        case installingDependencies
+        case starting
+        case ready(endpoint: Endpoint)
+        case failed(String)
+    }
 
     static let shared = OpenClawGatewayRuntimeManager()
 
@@ -19,6 +28,7 @@ actor OpenClawGatewayRuntimeManager {
     private let gatewayHost = "127.0.0.1"
     private let gatewayPort = 18889
     private let agentStore = AgentStore.shared
+    private let dependencyManager = DependencyManager.shared
 
     private var gatewayProcess: Process?
     private var managedState = ManagedState(
@@ -30,9 +40,39 @@ actor OpenClawGatewayRuntimeManager {
     private var lastGatewayHealthCheckAt = Date.distantPast
     private var lastGatewayHealthWasOK = false
     private let gatewayHealthCheckCacheWindow: TimeInterval = 2
+    private var openclawExecutablePath: String?
+    
+    /// 当前 Gateway 状态（用于 UI 展示）
+    @Published private(set) var readiness: GatewayReadiness = .notStarted
 
     func prepareGateway() async throws {
         _ = try await ensureGatewayReady()
+    }
+    
+    /// 准备 Gateway（带依赖安装）
+    func prepareGatewayWithDependencies() async throws -> ManagedState {
+        // 1. 确保 OpenClaw CLI 可用
+        await MainActor.run {
+            self.readiness = .installingDependencies
+        }
+        
+        let openclawPath = try await dependencyManager.ensureOpenClawAvailable()
+        self.openclawExecutablePath = openclawPath
+        
+        LogInfo("🦞 使用 OpenClaw: \(openclawPath)")
+        
+        // 2. 启动 Gateway
+        await MainActor.run {
+            self.readiness = .starting
+        }
+        
+        let state = try await ensureGatewayReady()
+        
+        await MainActor.run {
+            self.readiness = .ready(endpoint: state.endpoint)
+        }
+        
+        return state
     }
 
     func ensureGatewayReady() async throws -> ManagedState {
@@ -389,17 +429,40 @@ actor OpenClawGatewayRuntimeManager {
         logFileHandle = handle
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            "openclaw",
-            "--profile", self.profileName,
-            "gateway",
-            "run",
-            "--allow-unconfigured",
-            "--bind", "loopback",
-            "--port", "\(self.gatewayPort)",
-            "--auth", "none",
-        ]
+        
+        // 使用已安装的 OpenClaw 路径，或回退到系统 PATH
+        let executablePath = self.openclawExecutablePath ?? resolveExecutable(named: "openclaw") ?? "/usr/bin/env"
+        
+        // 如果直接指向 openclaw 可执行文件，就不需要 env wrapper
+        let isDirectExecutable = executablePath.hasSuffix("/openclaw") && 
+            FileManager.default.isExecutableFile(atPath: executablePath)
+        
+        if isDirectExecutable {
+            process.executableURL = URL(fileURLWithPath: executablePath)
+            process.arguments = [
+                "--profile", self.profileName,
+                "gateway",
+                "run",
+                "--allow-unconfigured",
+                "--bind", "loopback",
+                "--port", "\(self.gatewayPort)",
+                "--auth", "none",
+            ]
+        } else {
+            // 使用 env wrapper
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [
+                "openclaw",
+                "--profile", self.profileName,
+                "gateway",
+                "run",
+                "--allow-unconfigured",
+                "--bind", "loopback",
+                "--port", "\(self.gatewayPort)",
+                "--auth", "none",
+            ]
+        }
+        
         process.environment = self.processEnvironment()
         process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
         process.standardOutput = logFileHandle
@@ -456,8 +519,18 @@ actor OpenClawGatewayRuntimeManager {
 
     private func runOpenClaw(arguments: [String]) -> (status: Int32, output: String) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = ["openclaw"] + arguments
+        
+        // 优先使用已安装的路径
+        let executablePath = self.openclawExecutablePath ?? resolveExecutable(named: "openclaw")
+        
+        if let path = executablePath, path.hasSuffix("/openclaw") {
+            process.executableURL = URL(fileURLWithPath: path)
+            process.arguments = arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = ["openclaw"] + arguments
+        }
+        
         process.environment = self.processEnvironment()
 
         let pipe = Pipe()
