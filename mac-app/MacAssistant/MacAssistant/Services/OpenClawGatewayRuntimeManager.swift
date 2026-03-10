@@ -85,6 +85,14 @@ actor OpenClawGatewayRuntimeManager {
         try await ensureGatewayReady().primaryModelRef
     }
 
+    func workspaceDirectory() -> URL {
+        self.profileDirectory().appendingPathComponent("workspace", isDirectory: true)
+    }
+
+    func managedSkillsDirectory() -> URL {
+        self.workspaceDirectory().appendingPathComponent("skills", isDirectory: true)
+    }
+
     private struct ManagedConfigSnapshot {
         let data: Data
         let fingerprint: String

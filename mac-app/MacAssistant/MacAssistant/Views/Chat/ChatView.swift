@@ -83,7 +83,7 @@ struct ChatView: View {
         }
         .popover(isPresented: $showSkills, attachmentAnchor: .point(.top), arrowEdge: .top) {
             SkillsListView()
-                .frame(width: 500, height: 400)
+                .frame(width: 760, height: 540)
         }
     }
     
@@ -264,6 +264,14 @@ struct ChatView: View {
         ) { _ in
             currentGap = nil
             showWizard = true
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("ShowSkillsBrowser"),
+            object: nil,
+            queue: .main
+        ) { _ in
+            showSkills = true
         }
     }
     

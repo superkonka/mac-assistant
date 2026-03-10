@@ -306,6 +306,10 @@ class CommandRunner: ObservableObject {
         )
 
         await MainActor.run {
+            NotificationCenter.default.post(
+                name: NSNotification.Name("ShowSkillsBrowser"),
+                object: nil
+            )
             messages.append(message)
             isProcessing = false
         }
@@ -328,33 +332,34 @@ class CommandRunner: ObservableObject {
     }
 
     private func projectSkillOverviewMessage() -> String {
-        let builtinLines = skillRegistry.skills.map { skill -> String in
-            let status = skillRegistry.isAvailable(skill) ? "可直接用" : "需要对应 Agent/能力"
-            return "\(skill.emoji) `\(skill.name)` (`/\(skill.rawValue)`): \(skill.description) - \(status)"
-        }
-        .joined(separator: "\n")
-
-        let toolLines = toolSkillRegistry.formattedSkillOverview()
         let currentAgent = orchestrator.currentAgent?.displayName ?? "当前 Agent"
+        let builtinSummary = builtInSkillAudienceSummary()
+        let toolCommands = toolSkillRegistry
+            .allSkillNames()
+            .map { "`/\($0)`" }
+            .joined(separator: "、")
 
         return """
-        当前项目里有两类可用能力：
+        我已经把 Skills 面板打开了。
 
-        1. 会话内置 Skills
-        这些技能已经接到当前主会话里，既可以通过自然语言触发，也可以直接输入 `/skill_id`：
-        \(builtinLines)
+        现在你能直接调用的能力，可以先这样理解：
 
-        2. 工具型 / OpenClaw 风格 Skills
-        这些更偏系统和开发操作，建议直接用斜杠命令触发：
-        \(toolLines)
+        1. 对话内置能力
+        \(builtinSummary)
+
+        2. 命令型工具
+        • 当前内置命令包括 \(toolCommands)
+        • 更适合系统、文件、App、Git、Futu 这类明确操作
+
+        3. 外部市场
+        • 你可以在 Skills 面板的“市场”页安装或卸载更多 ClawHub Skills
+        • 安装后，OpenClaw runtime 会自动刷新新能力
 
         你现在正在使用 \(currentAgent)。
-        如果你想直接调用，可以试这些例子：
-        `/screenshot`
-        `/code_review 请帮我审查这段代码`
-        `/git`
-        `/system`
-        `/file`
+        直接告诉我目标就行，例如：
+        • “帮我审查这个 PR”
+        • “打开 Safari”
+        • “查一下上海未来三天天气”
         """
     }
 
@@ -363,34 +368,192 @@ class CommandRunner: ObservableObject {
             let report = try await gatewayClient.skillsStatus()
             let eligibleSkills = report.skills.filter { $0.eligible && !$0.disabled }
             let unavailableSkills = report.skills.filter { !$0.eligible || $0.disabled }
-
-            let eligibleLines = eligibleSkills.prefix(12).map { skill in
-                "• `\(skill.name)`: \(skill.description)"
-            }
-            let unavailableLines = unavailableSkills.prefix(6).map { skill in
-                let missing = (skill.missing.bins + skill.missing.env + skill.missing.config)
-                    .joined(separator: ", ")
-                if missing.isEmpty {
-                    return "• `\(skill.name)`: 当前未启用"
-                }
-                return "• `\(skill.name)`: 还缺 \(missing)"
-            }
-
             var sections: [String] = [
-                "OpenClaw runtime 当前可见的 Skills 如下：",
-                eligibleLines.isEmpty ? "• 当前还没有可直接运行的 Skill。" : eligibleLines.joined(separator: "\n"),
+                "我已经把 Skills 面板打开了。",
+                "你现在能直接用的能力，重点看这三层：",
+                "1. 对话内置能力\n\(builtInSkillAudienceSummary())"
             ]
 
-            if !unavailableLines.isEmpty {
-                sections.append("下面这些 Skill 还没满足运行条件：")
-                sections.append(unavailableLines.joined(separator: "\n"))
+            if eligibleSkills.isEmpty {
+                sections.append("2. 已就绪的扩展 Skills\n• 当前还没有可直接运行的外部 Skill。")
+            } else {
+                sections.append(
+                    "2. 已就绪的扩展 Skills（\(eligibleSkills.count) 个）\n\(groupedOpenClawSkillSummary(for: eligibleSkills))"
+                )
             }
 
-            sections.append("如果你想直接调用某个能力，可以继续用自然语言描述任务，我会优先走 OpenClaw runtime。")
+            if !unavailableSkills.isEmpty {
+                sections.append(
+                    "3. 还没就绪的扩展 Skills（\(unavailableSkills.count) 个）\n\(unavailableOpenClawSkillSummary(for: unavailableSkills))"
+                )
+            } else {
+                sections.append("3. 环境状态\n• 当前已检测到的扩展 Skills 都满足运行条件。")
+            }
+
+            sections.append(
+                """
+                如果这批能力还不够，你可以直接在 Skills 面板的“市场”页继续安装更多 Skills。
+                也可以直接说目标，我会自己选最合适的能力，比如：
+                • 帮我审查这个 PR
+                • 检查这台 Mac 的安全配置
+                • 查下上海未来三天天气
+                """
+            )
             return sections.joined(separator: "\n\n")
         } catch {
             return projectSkillOverviewMessage()
         }
+    }
+
+    private func builtInSkillAudienceSummary() -> String {
+        let availableSkills = skillRegistry.skills.filter(skillRegistry.isAvailable)
+        let grouped = Dictionary(grouping: availableSkills, by: builtInSkillAudienceGroupTitle(for:))
+        let orderedTitles = ["视觉与截图", "文本与代码", "联网与检索"]
+
+        let lines = orderedTitles.compactMap { title -> String? in
+            guard let skills = grouped[title], !skills.isEmpty else { return nil }
+            let names = skills.map(\.name).joined(separator: "、")
+            return "• \(title)：\(names)"
+        }
+
+        if lines.isEmpty {
+            return "• 当前没有已就绪的内置 Skill。"
+        }
+
+        let unavailableCount = skillRegistry.skills.count - availableSkills.count
+        if unavailableCount > 0 {
+            return lines.joined(separator: "\n") + "\n• 另有 \(unavailableCount) 个内置 Skill 会在你切换到对应 Agent 后自动可用"
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func builtInSkillAudienceGroupTitle(for skill: AISkill) -> String {
+        switch skill {
+        case .screenshot, .createVisionAgent, .analyzeImage:
+            return "视觉与截图"
+        case .codeReview, .explainSelection, .translateText, .summarizeText:
+            return "文本与代码"
+        case .webSearch:
+            return "联网与检索"
+        }
+    }
+
+    private func groupedOpenClawSkillSummary(for skills: [OpenClawSkillStatus]) -> String {
+        let grouped = Dictionary(grouping: skills, by: openClawSkillGroupTitle(for:))
+        let orderedTitles = ["开发与仓库", "系统与运维", "内容与平台", "信息查询", "扩展工具"]
+
+        return orderedTitles.compactMap { title -> String? in
+            guard let groupSkills = grouped[title], !groupSkills.isEmpty else { return nil }
+            let lines = groupSkills
+                .sorted(by: { $0.name < $1.name })
+                .map { "• `\($0.name)`: \(friendlyOpenClawSummary(for: $0))" }
+                .joined(separator: "\n")
+            return "\(title)\n\(lines)"
+        }
+        .joined(separator: "\n\n")
+    }
+
+    private func unavailableOpenClawSkillSummary(for skills: [OpenClawSkillStatus]) -> String {
+        let missingDependencies = Array(
+            Set(
+                skills.flatMap { skill in
+                    skill.missing.bins + skill.missing.env + skill.missing.config
+                }
+            )
+        )
+        .sorted()
+
+        let dependencyLine: String
+        if missingDependencies.isEmpty {
+            dependencyLine = "• 这些 Skill 当前主要是未启用状态。"
+        } else {
+            let preview = missingDependencies.prefix(6).map { "`\($0)`" }.joined(separator: "、")
+            dependencyLine = "• 当前主要缺少这些依赖：\(preview)"
+        }
+
+        let detailLines = skills
+            .prefix(4)
+            .map { skill -> String in
+                let missing = skill.missing.bins + skill.missing.env + skill.missing.config
+                if missing.isEmpty {
+                    return "• `\(skill.name)`: 当前未启用"
+                }
+                return "• `\(skill.name)`: 缺少 \(missing.joined(separator: ", "))"
+            }
+            .joined(separator: "\n")
+
+        if detailLines.isEmpty {
+            return dependencyLine
+        }
+
+        return """
+        \(dependencyLine)
+        \(detailLines)
+        需要的话，我可以继续带你补环境，或者去市场安装替代 Skill。
+        """
+    }
+
+    private func openClawSkillGroupTitle(for skill: OpenClawSkillStatus) -> String {
+        let haystack = "\(skill.name) \(skill.description)".lowercased()
+
+        if haystack.contains("weather") || haystack.contains("forecast") || haystack.contains("temperature") {
+            return "信息查询"
+        }
+
+        if haystack.contains("xiaohongshu") || haystack.contains("小红书") || haystack.contains("comment") || haystack.contains("favorite") || haystack.contains("post") {
+            return "内容与平台"
+        }
+
+        if haystack.contains("health") || haystack.contains("security") || haystack.contains("firewall") || haystack.contains("ssh") || haystack.contains("risk") || haystack.contains("host") {
+            return "系统与运维"
+        }
+
+        if haystack.contains("coding") || haystack.contains("code") || haystack.contains("git") || haystack.contains("github") || haystack.contains("repo") || haystack.contains("pr") || haystack.contains("session") {
+            return "开发与仓库"
+        }
+
+        return "扩展工具"
+    }
+
+    private func friendlyOpenClawSummary(for skill: OpenClawSkillStatus) -> String {
+        switch skill.name {
+        case "coding-agent":
+            return "复杂编码任务、重构和 PR 处理"
+        case "git-github-manager":
+            return "Git / GitHub、PR、Issue、Release 管理"
+        case "healthcheck":
+            return "主机安全巡检、SSH / 防火墙 / 更新风险检查"
+        case "session-logs":
+            return "搜索和分析历史会话日志"
+        case "weather":
+            return "查询天气和短期预报"
+        case "xiaohongshu-manager":
+            return "管理小红书内容、互动和账号状态"
+        default:
+            return compactSkillDescription(skill.description)
+        }
+    }
+
+    private func compactSkillDescription(_ description: String) -> String {
+        let separators = [
+            "Use when:",
+            "NOT for:",
+            "Requires ",
+            "Requires:",
+            " This skill",
+            "\n"
+        ]
+
+        for separator in separators {
+            if let range = description.range(of: separator) {
+                let trimmed = description[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+
+        return description.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func handleSkillEvolutionOverviewIfNeeded(_ text: String) async -> Bool {
