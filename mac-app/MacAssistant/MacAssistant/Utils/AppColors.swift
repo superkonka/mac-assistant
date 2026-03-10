@@ -58,12 +58,12 @@ enum AppColors {
     
     /// 主文字颜色
     static var primaryText: Color {
-        Color(NSColor.label)
+        Color.primary
     }
     
     /// 次要文字颜色
     static var secondaryText: Color {
-        Color(NSColor.secondaryLabelColor)
+        Color.secondary
     }
     
     /// 高对比度文字（确保可读性）
