@@ -1,7 +1,8 @@
 import CryptoKit
 import Foundation
 
-actor OpenClawGatewayRuntimeManager {
+@MainActor
+class OpenClawGatewayRuntimeManager {
     struct Endpoint: Sendable {
         let url: URL
         let generation: Int
@@ -43,7 +44,7 @@ actor OpenClawGatewayRuntimeManager {
     private var openclawExecutablePath: String?
     
     /// 当前 Gateway 状态（用于 UI 展示）
-    @Published private(set) var readiness: GatewayReadiness = .notStarted
+    @Published var readiness: GatewayReadiness = .notStarted
 
     func prepareGateway() async throws {
         _ = try await ensureGatewayReady()

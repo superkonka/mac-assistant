@@ -18,7 +18,8 @@ enum DependencyStatus: Equatable {
 }
 
 /// 依赖管理器 - 确保 OpenClaw CLI 可用
-actor DependencyManager: ObservableObject {
+@MainActor
+class DependencyManager: ObservableObject {
     static let shared = DependencyManager()
     
     @Published private(set) var openclawStatus: DependencyStatus = .notInstalled
@@ -86,9 +87,7 @@ actor DependencyManager: ObservableObject {
     
     /// 获取安装进度状态
     var currentStatus: DependencyStatus {
-        get async {
-            return openclawStatus
-        }
+        return openclawStatus
     }
     
     // MARK: - 私有方法

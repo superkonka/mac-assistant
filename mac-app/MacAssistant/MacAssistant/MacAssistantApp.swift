@@ -13,7 +13,7 @@ struct MacAssistantApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ChatView()
         }
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 600, height: 700)
@@ -59,8 +59,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let agentStore = AgentStore.shared
         
         // 检查是否需要引导：没有可用 Agent 或 OpenClaw 未安装
-        let needsSetup = await dependencyManager.needsFirstTimeSetup || 
-                         await dependencyManager.currentStatus == .notInstalled
+        let needsSetup = await dependencyManager.needsFirstTimeSetup
         
         if needsSetup {
             LogInfo("🆕 首次启动，显示引导界面")
