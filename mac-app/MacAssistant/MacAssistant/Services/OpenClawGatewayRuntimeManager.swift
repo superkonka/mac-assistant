@@ -15,7 +15,7 @@ class OpenClawGatewayRuntimeManager {
     }
     
     /// Gateway 准备状态
-    enum GatewayReadiness: Equatable {
+    enum GatewayReadiness {
         case notStarted
         case installingDependencies
         case starting
