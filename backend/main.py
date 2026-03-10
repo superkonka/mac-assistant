@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Mac Assistant Backend Service
-FastAPI + OpenClaw + Kimi CLI Integration
+FastAPI + OpenClaw + Kimi (CLI/API) Integration
 """
 
 import asyncio
@@ -16,9 +16,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
+from kimi_provider import kimi_provider, KimiConfig
+
 # 配置
 APP_NAME = "Mac Assistant"
-VERSION = "1.0.0"
+VERSION = "1.1.0"  # 更新版本
 PORT = 8765
 
 # 全局状态
@@ -28,7 +30,8 @@ class AppState:
         self.conversation_history: List[Dict[str, Any]] = []
         self.current_task: Optional[asyncio.Task] = None
         self.openclaw_available = False
-        self.kimi_available = False
+        self.kimi_cli_available = False
+        self.kimi_api_available = False
 
 state = AppState()
 
@@ -48,6 +51,12 @@ class CommandRequest(BaseModel):
 class SystemAction(BaseModel):
     action: str  # "screenshot", "clipboard", "notify", "open_app", etc.
     params: Optional[Dict[str, Any]] = None
+
+class KimiConfigRequest(BaseModel):
+    provider: str  # "cli" 或 "api"
+    api_key: Optional[str] = None
+    api_base: Optional[str] = None
+    model: Optional[str] = None
 
 # 生命周期管理
 @asynccontextmanager
@@ -83,7 +92,7 @@ app.add_middleware(
 # ============== 依赖检查 ==============
 
 async def check_dependencies():
-    """检查 OpenClaw 和 Kimi CLI 是否可用"""
+    """检查 OpenClaw 和 Kimi 是否可用"""
     # 检查 OpenClaw
     try:
         result = subprocess.run(
@@ -99,18 +108,16 @@ async def check_dependencies():
         state.openclaw_available = False
     
     # 检查 Kimi CLI
-    try:
-        result = subprocess.run(
-            ["kimi", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        state.kimi_available = result.returncode == 0
-        print(f"✅ Kimi CLI: {'可用' if state.kimi_available else '不可用'}")
-    except Exception as e:
-        print(f"⚠️ Kimi CLI 检查失败: {e}")
-        state.kimi_available = False
+    state.kimi_cli_available = await kimi_provider.check_cli_available()
+    print(f"✅ Kimi CLI: {'可用' if state.kimi_cli_available else '不可用'}")
+    
+    # 检查 Kimi API
+    state.kimi_api_available = await kimi_provider.check_api_available()
+    print(f"✅ Kimi API: {'可用' if state.kimi_api_available else '不可用'}")
+    
+    # 显示当前配置
+    providers = await kimi_provider.get_available_providers()
+    print(f"📊 当前 Kimi 提供者: {providers.get('current', '无')}")
 
 # ============== OpenClaw 封装 ==============
 
@@ -144,34 +151,11 @@ Task: {prompt}
     except Exception as e:
         return f"❌ OpenClaw 调用失败: {str(e)}"
 
-# ============== Kimi CLI 封装 ==============
+# ============== Kimi 封装（使用提供者）=============
 
 async def call_kimi(prompt: str, files: List[str] = None) -> str:
-    """调用 Kimi CLI"""
-    if not state.kimi_available:
-        return "❌ Kimi CLI 不可用"
-    
-    try:
-        cmd = ["kimi", "-p", prompt]
-        if files:
-            for f in files:
-                cmd.extend(["-f", f])
-        
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        
-        if proc.returncode == 0:
-            return stdout.decode().strip()
-        else:
-            return f"⚠️ Kimi 错误: {stderr.decode()}"
-    except asyncio.TimeoutError:
-        return "⏱️ Kimi 请求超时"
-    except Exception as e:
-        return f"❌ Kimi 调用失败: {str(e)}"
+    """调用 Kimi（自动选择 CLI 或 API）"""
+    return await kimi_provider.chat(prompt, files)
 
 # ============== 系统操作 ==============
 
@@ -248,21 +232,118 @@ async def execute_system_action(action: SystemAction) -> Dict[str, Any]:
 
 @app.get("/")
 async def root():
+    providers = await kimi_provider.get_available_providers()
     return {
         "app": APP_NAME,
         "version": VERSION,
         "openclaw": state.openclaw_available,
-        "kimi": state.kimi_available
+        "kimi": {
+            "cli": state.kimi_cli_available,
+            "api": state.kimi_api_available,
+            "current_provider": providers.get("current"),
+            "configured": kimi_provider.config.provider
+        }
     }
 
 @app.get("/health")
 async def health():
+    providers = await kimi_provider.get_available_providers()
     return {
         "status": "ok",
         "openclaw": state.openclaw_available,
-        "kimi": state.kimi_available,
+        "kimi": {
+            "cli": state.kimi_cli_available,
+            "api": state.kimi_api_available,
+            "current_provider": providers.get("current")
+        },
         "connections": len(state.active_connections)
     }
+
+# ============== Kimi 配置 API ==============
+
+@app.get("/kimi/config")
+async def get_kimi_config():
+    """获取 Kimi 配置（隐藏 API Key）"""
+    config = kimi_provider.config
+    return {
+        "provider": config.provider,
+        "api_base": config.api_base,
+        "model": config.model,
+        "has_api_key": bool(config.api_key),
+        "api_key_preview": config.api_key[:8] + "..." if config.api_key else None
+    }
+
+@app.get("/kimi/providers")
+async def get_kimi_providers():
+    """获取可用的 Kimi 提供者"""
+    providers = await kimi_provider.get_available_providers()
+    return providers
+
+@app.post("/kimi/config")
+async def update_kimi_config(request: KimiConfigRequest):
+    """更新 Kimi 配置"""
+    # 更新配置
+    kimi_provider.config.provider = request.provider
+    
+    if request.api_key is not None:
+        # 如果提供的是空字符串，表示清空 API Key
+        if request.api_key == "":
+            kimi_provider.config.api_key = ""
+        # 如果提供的是新 key（不以 ... 结尾），则更新
+        elif not request.api_key.endswith("..."):
+            kimi_provider.config.api_key = request.api_key
+    
+    if request.api_base:
+        kimi_provider.config.api_base = request.api_base
+    
+    if request.model:
+        kimi_provider.config.model = request.model
+    
+    # 保存配置
+    if kimi_provider.save_config():
+        # 重新检查可用性
+        state.kimi_cli_available = await kimi_provider.check_cli_available()
+        state.kimi_api_available = await kimi_provider.check_api_available()
+        
+        providers = await kimi_provider.get_available_providers()
+        return {
+            "success": True,
+            "config": {
+                "provider": kimi_provider.config.provider,
+                "api_base": kimi_provider.config.api_base,
+                "model": kimi_provider.config.model,
+                "has_api_key": bool(kimi_provider.config.api_key)
+            },
+            "providers": providers
+        }
+    else:
+        raise HTTPException(status_code=500, detail="保存配置失败")
+
+@app.post("/kimi/test")
+async def test_kimi_config():
+    """测试当前 Kimi 配置"""
+    providers = await kimi_provider.get_available_providers()
+    current = providers.get("current")
+    
+    if not current:
+        return {
+            "success": False,
+            "message": "没有可用的 Kimi 提供者。请配置 CLI 或 API Key。"
+        }
+    
+    # 发送测试消息
+    test_response = await kimi_provider.chat("你好，这是一个测试。请回复：Kimi 服务正常")
+    
+    success = not test_response.startswith("❌") and not test_response.startswith("⚠️")
+    
+    return {
+        "success": success,
+        "provider": current,
+        "response": test_response if success else None,
+        "error": test_response if not success else None
+    }
+
+# ============== 聊天 API ==============
 
 @app.post("/chat")
 async def chat(message: ChatMessage):
@@ -277,10 +358,9 @@ async def chat(message: ChatMessage):
     if state.openclaw_available:
         context = "\n".join([f"{m['role']}: {m['content']}" for m in state.conversation_history[-5:]])
         response_text = await call_openclaw(message.content, context)
-    elif state.kimi_available:
-        response_text = await call_kimi(message.content)
     else:
-        response_text = "❌ 没有可用的 AI 服务"
+        # 使用 Kimi
+        response_text = await call_kimi(message.content)
     
     # 保存响应
     response = ChatMessage(
@@ -301,7 +381,7 @@ async def execute_command(request: CommandRequest):
         result = await call_openclaw(request.command, request.context or "")
         results.append({"source": "openclaw", "content": result})
     
-    if request.use_kimi and state.kimi_available:
+    if request.use_kimi and (state.kimi_cli_available or state.kimi_api_available):
         result = await call_kimi(request.command)
         results.append({"source": "kimi", "content": result})
     
@@ -347,10 +427,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 调用 AI
                 if state.openclaw_available:
                     response = await call_openclaw(prompt)
-                elif state.kimi_available:
-                    response = await call_kimi(prompt)
                 else:
-                    response = "❌ 服务不可用"
+                    response = await call_kimi(prompt)
                 
                 await websocket.send_json({
                     "type": "response",

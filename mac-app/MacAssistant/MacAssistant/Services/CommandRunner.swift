@@ -1,0 +1,2855 @@
+//
+//  CommandRunner.swift
+//  MacAssistant
+//
+//  主命令处理器，集成 OpenClaw 和 Agent 系统
+//
+
+import Foundation
+import SwiftUI
+import Combine
+import AppKit
+import CoreGraphics
+
+class CommandRunner: ObservableObject {
+    private struct TaskExecutionResult {
+        let agent: Agent
+        let content: String
+        let failed: Bool
+    }
+
+    private enum AgentCreationRequestKind {
+        case runtimeSetup
+        case workflowDesign
+    }
+
+    @Published var messages: [ChatMessage] = []
+    @Published var taskSessions: [AgentTaskSession] = []
+    @Published var currentExecutionTrace: ExecutionTrace?
+    @Published var isProcessing = false
+    
+    /// 截图路径（最近一张）
+    @Published var lastScreenshotPath: String?
+    
+    private let agentStore = AgentStore.shared
+    private let orchestrator = AgentOrchestrator.shared
+    private let creationSkill = AgentCreationSkill.shared
+    private let intelligence = ConversationIntelligence.shared
+    private let skillRegistry = AISkillRegistry.shared
+    private let toolSkillRegistry = SkillRegistry.shared
+    private let skillEvolutionAdvisor = SkillEvolutionAdvisor.shared
+    private let gatewayClient = OpenClawGatewayClient.shared
+    private let logger = ConversationLogger.shared
+    private let preferences = UserPreferenceStore.shared
+    private let initialSetupPromptKey = "initial_setup_prompt"
+    private let screenRecordingSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+    
+    private var cancellables: Set<AnyCancellable> = []
+    private var isWaitingForScreenRecordingAuthorization = false
+    private var isRestartingForScreenRecordingPermission = false
+    private var isWaitingForKimiCLILogin = false
+    private var pendingKimiCLILoginAgentID: String?
+    private var traceDismissTask: Task<Void, Never>?
+    
+    static let shared = CommandRunner()
+    
+    init() {
+        setupNotifications()
+    }
+
+    var isLoading: Bool { isProcessing }
+    
+    private func setupNotifications() {
+        NotificationCenter.default.publisher(for: NSNotification.Name("ShowCapabilityDiscovery"))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                if let gap = notification.object as? CapabilityGap {
+                    self?.handleCapabilityGap(gap)
+                }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.resumePendingScreenRecordingFlowIfNeeded()
+                    await self?.resumePendingKimiCLILoginFlowIfNeeded()
+                }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .skillEvolutionProposalReady)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let proposal = notification.object as? SkillEvolutionProposal else {
+                    return
+                }
+                self?.presentSkillEvolutionProposal(proposal)
+            }
+            .store(in: &cancellables)
+
+        _ = skillEvolutionAdvisor.scanNow()
+    }
+    
+    // MARK: - 主要处理入口
+    
+    /// 处理用户输入（主入口 - 智能解析版）
+    func processInput(_ text: String, images: [String] = []) async {
+        let contextualImages = resolveImagesForRequest(text: text, explicitImages: images)
+
+        // 1. 检查是否在 Agent 创建流程中
+        if creationSkill.isInCreationFlow {
+            await creationSkill.handleInput(text, runner: self)
+            return
+        }
+
+        if let lastMessage = messages.last,
+           let pendingProposalID = lastMessage.metadata?["pending_skill_evolution_id"] {
+            let lowercased = text.lowercased().trimmingCharacters(in: .whitespaces)
+
+            if lowercased == "是" || lowercased == "y" || lowercased == "yes" {
+                let response = skillEvolutionAdvisor.acceptProposal(id: pendingProposalID)
+                let message = ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: response,
+                    timestamp: Date(),
+                    agentId: "builtin-skill-evolution-advisor",
+                    agentName: "Skill 迭代顾问"
+                )
+                await MainActor.run {
+                    messages.append(message)
+                    isProcessing = false
+                }
+                return
+            } else if lowercased == "否" || lowercased == "n" || lowercased == "no" {
+                let response = skillEvolutionAdvisor.rejectProposal(id: pendingProposalID)
+                let message = ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: response,
+                    timestamp: Date(),
+                    agentId: "builtin-skill-evolution-advisor",
+                    agentName: "Skill 迭代顾问"
+                )
+                await MainActor.run {
+                    messages.append(message)
+                    isProcessing = false
+                }
+                return
+            }
+        }
+        
+        // 2. 检查是否是 Skill 确认回复
+        if let lastMessage = messages.last,
+           let pendingSkill = lastMessage.metadata?["pending_skill"],
+           let skillInput = lastMessage.metadata?["skill_input"] {
+            let lowercased = text.lowercased().trimmingCharacters(in: .whitespaces)
+            
+            if lowercased == "是" || lowercased == "y" || lowercased == "yes" {
+                // 用户确认执行 Skill
+                if let skill = AISkill(rawValue: pendingSkill) {
+                    preferences.recordSkillAcceptance(skill)
+                    await handleSkillCommand(skill, input: skillInput, images: images)
+                    return
+                }
+            } else if lowercased == "否" || lowercased == "n" || lowercased == "no" {
+                // 用户拒绝，记录偏好
+                if let skill = AISkill(rawValue: pendingSkill) {
+                    preferences.recordSkillRejection(skill)
+                    
+                    let response = ChatMessage(
+                        id: UUID(),
+                        role: MessageRole.assistant,
+                        content: "好的，已跳过。下次遇到类似情况不再提示此 Skill。",
+                        timestamp: Date()
+                    )
+                    await MainActor.run {
+                        messages.append(response)
+                        isProcessing = false
+                    }
+                    return
+                }
+            }
+        }
+
+        if agentStore.needsInitialSetup {
+            let userMessage = ChatMessage(
+                id: UUID(),
+                role: .user,
+                content: text,
+                timestamp: Date(),
+                images: contextualImages
+            )
+            await MainActor.run {
+                messages.append(userMessage)
+                isProcessing = false
+                presentInitialSetupPrompt(for: contextualImages.isEmpty ? "开始对话" : "处理附件请求")
+            }
+            return
+        }
+        
+        // 3. 智能解析输入
+        let parsed = intelligence.analyzeInput(text)
+        
+        // 4. 记录用户输入
+        logger.logUserInput(text, parsed: parsed)
+        
+        // 3. 添加用户消息（显示原始输入）
+        let userMessage = ChatMessage(
+            id: UUID(),
+            role: .user,
+            content: text,
+            timestamp: Date(),
+            images: contextualImages
+        )
+        let userMessageID = userMessage.id
+        await MainActor.run {
+            clearExecutionTrace()
+            messages.append(userMessage)
+            isProcessing = true
+        }
+
+        if let toolSkillCommand = detectToolSkillCommand(in: text) {
+            await handleToolSkillCommand(toolSkillCommand.name, input: toolSkillCommand.input)
+            return
+        }
+
+        if await handleSkillEvolutionOverviewIfNeeded(text) {
+            return
+        }
+
+        if await handleAgentCreationRequestIfNeeded(text) {
+            return
+        }
+
+        if await handleDirectWebContextIfNeeded(text, images: contextualImages) {
+            return
+        }
+
+        if let nativeMacSkillName = await MacSystemAgent.shared.suggestedSkillName(for: text) {
+            await handleToolSkillCommand(nativeMacSkillName, input: text)
+            return
+        }
+
+        if await handleProjectSkillOverviewIfNeeded(text, images: contextualImages) {
+            return
+        }
+        
+        // 4. 处理 @Agent 提及（检查是否涉及图片）
+        if let mention = parsed.agentMention {
+            let requiresVision = !contextualImages.isEmpty ||
+                                parsed.cleanText.lowercased().contains("图") ||
+                                parsed.cleanText.lowercased().contains("图片") ||
+                                parsed.cleanText.lowercased().contains("截图")
+            let requiredCapability: Capability? = requiresVision ? .vision : nil
+            await handleAgentSwitch(mention.agent, reason: "通过 @\(mention.agentName) 指定", requiredCapability: requiredCapability)
+        }
+        
+        // 5. 处理 /Skill 命令
+        if let skillCommand = parsed.skillCommand {
+            await handleSkillCommand(skillCommand.skill, input: parsed.cleanText, images: contextualImages)
+            return
+        }
+        
+        // 6. 处理检测到的 Skill 意图（需要确认）
+        if let detectedSkill = parsed.detectedSkill {
+            await handleDetectedSkill(
+                detectedSkill,
+                input: parsed.cleanText,
+                images: contextualImages,
+                anchorMessageID: userMessageID
+            )
+            return
+        }
+        
+        // 7. 处理 Agent 建议
+        if let agentSuggestion = parsed.suggestedAgent {
+            await handleAgentSuggestion(agentSuggestion, input: parsed.cleanText, images: contextualImages)
+            return
+        }
+        
+        // 8. 普通消息处理（使用解析后的纯净文本）
+        await processCleanInput(parsed.cleanText, images: contextualImages, anchorMessageID: userMessageID)
+    }
+
+    private func detectToolSkillCommand(in text: String) -> (name: String, input: String)? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/") else { return nil }
+
+        let payload = String(trimmed.dropFirst())
+        let parts = payload.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+        guard let rawName = parts.first else { return nil }
+
+        let name = rawName.lowercased()
+        guard toolSkillRegistry.getSkill(name) != nil else { return nil }
+
+        let input = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : name
+        return (name, input)
+    }
+
+    private func handleProjectSkillOverviewIfNeeded(_ text: String, images: [String]) async -> Bool {
+        guard images.isEmpty, shouldRespondWithProjectSkillOverview(to: text) else {
+            return false
+        }
+
+        let currentAgentName = orchestrator.currentAgent?.name
+        let content = await openClawSkillOverviewMessage()
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: content,
+            timestamp: Date(),
+            agentId: orchestrator.currentAgent?.id,
+            agentName: currentAgentName
+        )
+
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+        }
+        return true
+    }
+
+    private func shouldRespondWithProjectSkillOverview(to text: String) -> Bool {
+        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if normalized.contains("openclaw") && (normalized.contains("skill") || normalized.contains("能力")) {
+            return true
+        }
+
+        let skillKeywords = ["skill", "skills", "技能", "功能", "能做什么", "可以做什么", "会什么", "可用"]
+        let requestKeywords = ["哪些", "什么", "查看", "列出", "介绍", "有哪些", "有什么"]
+
+        let hasSkillIntent = skillKeywords.contains { normalized.contains($0) }
+        let hasRequestIntent = requestKeywords.contains { normalized.contains($0) }
+        return hasSkillIntent && hasRequestIntent
+    }
+
+    private func projectSkillOverviewMessage() -> String {
+        let builtinLines = skillRegistry.skills.map { skill -> String in
+            let status = skillRegistry.isAvailable(skill) ? "可直接用" : "需要对应 Agent/能力"
+            return "\(skill.emoji) `\(skill.name)` (`/\(skill.rawValue)`): \(skill.description) - \(status)"
+        }
+        .joined(separator: "\n")
+
+        let toolLines = toolSkillRegistry.formattedSkillOverview()
+        let currentAgent = orchestrator.currentAgent?.displayName ?? "当前 Agent"
+
+        return """
+        当前项目里有两类可用能力：
+
+        1. 会话内置 Skills
+        这些技能已经接到当前主会话里，既可以通过自然语言触发，也可以直接输入 `/skill_id`：
+        \(builtinLines)
+
+        2. 工具型 / OpenClaw 风格 Skills
+        这些更偏系统和开发操作，建议直接用斜杠命令触发：
+        \(toolLines)
+
+        你现在正在使用 \(currentAgent)。
+        如果你想直接调用，可以试这些例子：
+        `/screenshot`
+        `/code_review 请帮我审查这段代码`
+        `/git`
+        `/system`
+        `/file`
+        """
+    }
+
+    private func openClawSkillOverviewMessage() async -> String {
+        do {
+            let report = try await gatewayClient.skillsStatus()
+            let eligibleSkills = report.skills.filter { $0.eligible && !$0.disabled }
+            let unavailableSkills = report.skills.filter { !$0.eligible || $0.disabled }
+
+            let eligibleLines = eligibleSkills.prefix(12).map { skill in
+                "• `\(skill.name)`: \(skill.description)"
+            }
+            let unavailableLines = unavailableSkills.prefix(6).map { skill in
+                let missing = (skill.missing.bins + skill.missing.env + skill.missing.config)
+                    .joined(separator: ", ")
+                if missing.isEmpty {
+                    return "• `\(skill.name)`: 当前未启用"
+                }
+                return "• `\(skill.name)`: 还缺 \(missing)"
+            }
+
+            var sections: [String] = [
+                "OpenClaw runtime 当前可见的 Skills 如下：",
+                eligibleLines.isEmpty ? "• 当前还没有可直接运行的 Skill。" : eligibleLines.joined(separator: "\n"),
+            ]
+
+            if !unavailableLines.isEmpty {
+                sections.append("下面这些 Skill 还没满足运行条件：")
+                sections.append(unavailableLines.joined(separator: "\n"))
+            }
+
+            sections.append("如果你想直接调用某个能力，可以继续用自然语言描述任务，我会优先走 OpenClaw runtime。")
+            return sections.joined(separator: "\n\n")
+        } catch {
+            return projectSkillOverviewMessage()
+        }
+    }
+
+    private func handleSkillEvolutionOverviewIfNeeded(_ text: String) async -> Bool {
+        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let keywords = [
+            "skill优化", "优化skill", "技能优化", "skill 迭代", "技能迭代",
+            "有哪些skill需要优化", "哪些技能需要优化", "skill建议", "优化建议"
+        ]
+
+        guard keywords.contains(where: { normalized.contains($0) }) else {
+            return false
+        }
+
+        let newlyDiscovered = skillEvolutionAdvisor.scanNow()
+        if !newlyDiscovered.isEmpty {
+            await MainActor.run {
+                for proposal in newlyDiscovered {
+                    presentSkillEvolutionProposal(proposal)
+                }
+            }
+        }
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: skillEvolutionAdvisor.summaryMessage(),
+            timestamp: Date(),
+            agentId: "builtin-skill-evolution-advisor",
+            agentName: "Skill 迭代顾问"
+        )
+
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+        }
+        return true
+    }
+
+    private func handleAgentCreationRequestIfNeeded(_ text: String) async -> Bool {
+        guard let kind = classifyAgentCreationRequest(text) else {
+            return false
+        }
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: agentCreationGuidanceMessage(for: kind, originalInput: text),
+            timestamp: Date(),
+            agentId: "builtin-agent-creation-guard",
+            agentName: "Agent 创建顾问"
+        )
+
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+
+            if kind == .runtimeSetup {
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("ShowInitialSetupWizard"),
+                    object: nil
+                )
+            }
+        }
+
+        return true
+    }
+
+    private func classifyAgentCreationRequest(_ text: String) -> AgentCreationRequestKind? {
+        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+
+        let createKeywords = [
+            "创建", "新建", "新增", "添加", "配置", "设计", "做一个", "做个",
+            "create", "build", "new"
+        ]
+        let agentKeywords = ["agent", "智能体", "助手", "机器人", "bot"]
+
+        guard createKeywords.contains(where: { normalized.contains($0) }),
+              agentKeywords.contains(where: { normalized.contains($0) }) else {
+            return nil
+        }
+
+        let workflowKeywords = [
+            "每天", "每周", "定时", "自动", "监控", "通知", "提醒", "订阅", "策略",
+            "工作流", "任务", "服务", "接口", "部署", "执行", "分析", "跟踪", "告警",
+            "开盘", "收盘", "cron", "schedule", "webhook", "mcp"
+        ]
+        let runtimeKeywords = [
+            "openai", "anthropic", "claude", "moonshot", "kimi", "google", "gemini",
+            "gpt", "api key", "apikey", "provider", "提供商", "模型", "llm"
+        ]
+
+        if workflowKeywords.contains(where: { normalized.contains($0) }) {
+            return .workflowDesign
+        }
+
+        if runtimeKeywords.contains(where: { normalized.contains($0) }) {
+            return .runtimeSetup
+        }
+
+        if text.count >= 80 || normalized.contains("需要") || normalized.contains("希望") {
+            return .workflowDesign
+        }
+
+        return .runtimeSetup
+    }
+
+    private func agentCreationGuidanceMessage(
+        for kind: AgentCreationRequestKind,
+        originalInput: String
+    ) -> String {
+        switch kind {
+        case .runtimeSetup:
+            return """
+            我已经把这次请求切到 **本地 Agent 配置流程**，不会再交给通用对话 Agent 去“自己创建 Agent”。
+
+            当前应用里“创建 Agent”指的是：
+            • 配置 provider / model / 凭证
+            • 建立一个可被路由的模型入口
+
+            我已经为你打开配置向导。完成后，这个 Agent 就能参与正常对话和自愈切换。
+            """
+
+        case .workflowDesign:
+            return """
+            这次你的需求更像是 **业务工作流 Agent**，不是当前应用里那种“模型接入型 Agent”。
+
+            你描述的是：
+            \(originalInput)
+
+            当前版本的 Agent 目前只承载：
+            • provider / model / 凭证
+            • 基础能力路由（文本、代码、视觉等）
+
+            还**不能**直接承载：
+            • 专属业务规则
+            • 定时任务 / 订阅 / 提醒
+            • 服务编排 / 状态跟踪
+
+            所以把这类需求直接交给 Kimi / OpenClaw 去“设计并创建 Agent”是不合理的，我已经拦截了这条路径，避免再掉进长任务收尾丢失。
+
+            更合理的落法是：
+            1. 先保留一个可用的基础模型 Agent
+            2. 再把这类股票监控 / 定时分析 / 通知逻辑沉淀成 Skill 或 AutoAgent 工作流
+
+            如果你愿意，我下一步可以直接把这类“业务 Agent”整理成一份可落地的 Skill / AutoAgent 方案，而不是继续走当前这条伪创建流程。
+            """
+        }
+    }
+
+    private func handleDirectWebContextIfNeeded(_ text: String, images: [String]) async -> Bool {
+        guard let content = await WebContextAgent.shared.responseIfNeeded(for: text, images: images) else {
+            return false
+        }
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: content,
+            timestamp: Date(),
+            agentId: "builtin-web-context-agent",
+            agentName: "网页读取 Agent"
+        )
+
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+        }
+
+        return true
+    }
+
+    private func handleToolSkillCommand(_ skillName: String, input: String) async {
+        guard let skill = toolSkillRegistry.getSkill(skillName) else {
+            await MainActor.run {
+                isProcessing = false
+            }
+            return
+        }
+
+        let args = input.split(whereSeparator: \.isWhitespace).map(String.init)
+        let responseIdentity = toolSkillIdentity(for: skillName)
+
+        do {
+            let result = try await skill.execute(input, args: args)
+            let message = ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: result,
+                timestamp: Date(),
+                agentId: responseIdentity.id,
+                agentName: responseIdentity.name
+            )
+
+            await MainActor.run {
+                messages.append(message)
+                isProcessing = false
+            }
+        } catch {
+            let message = ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: UserFacingErrorFormatter.inlineMessage(for: error, providerName: "/\(skillName)"),
+                timestamp: Date(),
+                agentId: responseIdentity.id,
+                agentName: responseIdentity.name
+            )
+
+            await MainActor.run {
+                messages.append(message)
+                isProcessing = false
+            }
+        }
+    }
+
+    private func toolSkillIdentity(for skillName: String) -> (id: String?, name: String?) {
+        switch skillName {
+        case "app", "futu":
+            return ("builtin-mac-operator", "Mac 操作 Agent")
+        default:
+            return (orchestrator.currentAgent?.id, orchestrator.currentAgent?.name)
+        }
+    }
+
+    private func presentSkillEvolutionProposal(_ proposal: SkillEvolutionProposal) {
+        let evidence = proposal.evidence.map { "• \($0)" }.joined(separator: "\n")
+        let improvements = proposal.improvements.map { "• \($0)" }.joined(separator: "\n")
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: """
+            💡 检测到一条 Skill 优化提案
+
+            目标 Skill: \(proposal.skillName)
+            版本变化: v\(proposal.currentVersion) -> v\(proposal.suggestedVersion)
+            原因: \(proposal.reason)
+
+            观察依据：
+            \(evidence)
+
+            建议落地：
+            \(improvements)
+
+            回复 "是" 或 "y" 确认应用这条优化
+            回复 "否" 或 "n" 忽略这条提案
+            """,
+            timestamp: Date(),
+            agentId: "builtin-skill-evolution-advisor",
+            agentName: "Skill 迭代顾问",
+            metadata: ["pending_skill_evolution_id": proposal.id]
+        )
+
+        messages.append(message)
+    }
+    
+    /// 处理纯净输入
+    private func processCleanInput(_ text: String, images: [String], anchorMessageID: UUID) async {
+        // 检测意图
+        let intent = await orchestrator.analyzeIntent(text)
+        
+        // 路由决策
+        let routingResult = await orchestrator.route(text, images: images, intent: intent)
+        
+        // 处理路由结果
+        switch routingResult {
+        case .agentSelected(let agent):
+            await handleAgentRequest(
+                agent: agent,
+                text: text,
+                images: images,
+                intent: intent,
+                anchorMessageID: anchorMessageID
+            )
+            
+        case .gapDetected(let gap):
+            await handleCapabilityGapInChat(gap: gap)
+            
+        case .multipleAgents(let agents):
+            await handleMultipleAgentOptions(agents: agents, text: text, images: images)
+        }
+    }
+    
+    /// 处理截图命令
+    func handleScreenshot() {
+        Task {
+            let canCapture = await MainActor.run {
+                ensureScreenRecordingAccessForScreenshot()
+            }
+            guard canCapture else { return }
+
+            guard let screenshotPath = saveScreenshotToDesktop() else {
+                await MainActor.run {
+                    appendSystemMessage(
+                        "这次没有生成截图文件。可能是你取消了截图，或者屏幕录制权限还没有真正生效。"
+                    )
+                }
+                return
+            }
+
+            await MainActor.run {
+                completeScreenshotFlow(with: screenshotPath)
+            }
+        }
+    }
+    
+    // MARK: - 智能处理方法
+    
+    /// 处理 Agent 切换（带能力检查）
+    private func handleAgentSwitch(_ agent: Agent, reason: String, requiredCapability: Capability? = nil) async {
+        // 检查是否需要特定能力
+        if let capability = requiredCapability {
+            if !agent.supports(capability) {
+                // Agent 不支持所需能力，引导创建而不是切换
+                let gap = CapabilityGap(
+                    missingCapability: capability,
+                    suggestedProviders: [.openai, .anthropic, .moonshot],
+                    description: "\(agent.displayName) 不支持 \(capability.displayName) 能力"
+                )
+                
+                let systemMessage = ChatMessage(
+                    id: UUID(),
+                    role: MessageRole.system,
+                    content: """
+                    ⚠️ \(agent.displayName) 不支持 \(capability.displayName)
+                    
+                    💡 我可以立即帮你创建一个支持此能力的 Agent：
+                    """,
+                    timestamp: Date()
+                )
+                
+                await MainActor.run {
+                    messages.append(systemMessage)
+                    creationSkill.initiateCreation(for: gap, in: self)
+                    isProcessing = false
+                }
+                
+                // 记录能力缺口
+                logger.logCapabilityGap(gap, context: "切换 Agent 时发现能力不匹配")
+                return
+            }
+        }
+        
+        let previousAgent = orchestrator.currentAgent
+        orchestrator.switchToAgent(agent)
+        
+        // 记录 Agent 切换
+        logger.logAgentSwitch(from: previousAgent, to: agent, reason: reason)
+        
+        let systemMessage = ChatMessage(
+            id: UUID(),
+            role: MessageRole.system,
+            content: "🔄 \(reason)，已切换到 \(agent.displayName)",
+            timestamp: Date()
+        )
+        await MainActor.run {
+            messages.append(systemMessage)
+        }
+    }
+    
+    /// 处理 Skill 命令
+    private func handleSkillCommand(_ skill: AISkill, input: String, images: [String]) async {
+        let startTime = Date()
+        
+        let context = MacAssistant.SkillContext(
+            input: input,
+            images: images,
+            currentAgent: orchestrator.currentAgent,
+            runner: self
+        )
+        
+        let result = await skillRegistry.execute(skill, context: context)
+        let duration = Date().timeIntervalSince(startTime)
+        
+        // 记录 Skill 执行
+        logger.logSkillExecution(skill, result: result, duration: duration)
+        
+        await MainActor.run {
+            isProcessing = false
+            handleSkillResult(result, for: skill)
+        }
+    }
+    
+    /// 处理检测到的 Skill 意图（带确认，考虑用户偏好）
+    private func handleDetectedSkill(
+        _ skill: AISkill,
+        input: String,
+        images: [String],
+        anchorMessageID: UUID
+    ) async {
+        // 1. 检查是否应该跳过（用户之前拒绝过）
+        if preferences.shouldSkipDetection(skill) {
+            // 直接发送纯净文本，不提示 Skill
+            await processCleanInput(input, images: images, anchorMessageID: anchorMessageID)
+            return
+        }
+        
+        // 2. 检查是否应该自动确认（用户经常使用）
+        if preferences.shouldAutoConfirm(skill) {
+            await handleSkillCommand(skill, input: input, images: images)
+            return
+        }
+        
+        // 3. 显示确认提示
+        let confirmMessage = ChatMessage(
+            id: UUID(),
+            role: MessageRole.assistant,
+            content: """
+            💡 检测到 **\(skill.name)** 意图
+            
+            "\(input)"
+            
+            是否使用 \(skill.emoji) \(skill.name)？
+            回复 "是" 或 "y" 确认执行
+            回复 "否" 或 "n" 拒绝（下次不再提示此 Skill）
+            """,
+            timestamp: Date(),
+            metadata: ["pending_skill": skill.rawValue, "skill_input": input]
+        )
+        await MainActor.run {
+            messages.append(confirmMessage)
+            isProcessing = false
+        }
+    }
+    
+    /// 处理 Agent 建议
+    private func handleAgentSuggestion(_ suggestion: AgentSuggestion, input: String, images: [String]) async {
+        switch suggestion.action {
+        case .switchAgent:
+            if let agent = suggestion.suggestedAgent {
+                if shouldAutoDelegateToSuggestedAgent(input: input, images: images, suggestedAgent: agent) {
+                    await delegateRequest(
+                        to: agent,
+                        text: input,
+                        images: images,
+                        intent: .imageAnalysis,
+                        reason: "当前 Agent 不支持图片分析，已自动委托给 \(agent.displayName) 继续处理这次图片请求。"
+                    )
+                    return
+                }
+
+                let confirmMessage = ChatMessage(
+                    id: UUID(),
+                    role: MessageRole.assistant,
+                    content: """
+                    💡 \(suggestion.reason)
+                    
+                    建议切换到 \(agent.displayName) 来处理此请求。
+                    
+                    是否切换？
+                    回复 "是" 或 "y" 确认切换并发送消息。
+                    回复 "否" 或 "n" 使用当前 Agent 继续。
+                    """,
+                    timestamp: Date(),
+                    metadata: ["pending_switch": agent.id, "pending_input": input]
+                )
+                await MainActor.run {
+                    messages.append(confirmMessage)
+                    isProcessing = false
+                }
+            }
+            
+        case .createVisionAgent:
+            // 直接进入 Agent 创建流程
+            if let gap = orchestrator.discoverGap(for: input) {
+                await MainActor.run {
+                    creationSkill.initiateCreation(for: gap, in: self)
+                    isProcessing = false
+                }
+            }
+        }
+    }
+    
+    /// 处理 Skill 执行结果
+    private func handleSkillResult(_ result: SkillResult, for skill: AISkill) {
+        switch result {
+        case .success(let message):
+            let successMessage = ChatMessage(
+                id: UUID(),
+                role: MessageRole.assistant,
+                content: "✅ \(skill.name) 执行成功：\(message)",
+                timestamp: Date()
+            )
+            messages.append(successMessage)
+            
+        case .requiresInput(let prompt):
+            let inputMessage = ChatMessage(
+                id: UUID(),
+                role: MessageRole.assistant,
+                content: "🎯 **\(skill.name)** 需要更多信息：\n\n\(prompt)",
+                timestamp: Date()
+            )
+            messages.append(inputMessage)
+            
+        case .requiresAgentCreation(let gap):
+            creationSkill.initiateCreation(for: gap, in: self)
+            
+        case .error(let message):
+            let errorMessage = ChatMessage(
+                id: UUID(),
+                role: MessageRole.assistant,
+                content: "❌ \(skill.name) 执行失败：\(message)",
+                timestamp: Date()
+            )
+            messages.append(errorMessage)
+        }
+    }
+    
+    // MARK: - 路由处理
+    
+    /// 使用选定 Agent 处理请求
+    private func handleAgentRequest(
+        agent: Agent,
+        text: String,
+        images: [String],
+        intent: Intent,
+        anchorMessageID: UUID
+    ) async {
+        await MainActor.run {
+            startExecutionTrace(
+                anchorMessageID: anchorMessageID,
+                agentName: agent.displayName,
+                intentName: intent.displayName,
+                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)"
+            )
+        }
+        
+        // 发送给 OpenClaw
+        await sendToOpenClaw(agent: agent, text: text, images: images)
+    }
+    
+    /// 处理能力缺口（聊天内引导）
+    private func handleCapabilityGapInChat(gap: CapabilityGap) async {
+        // 记录能力缺口
+        logger.logCapabilityGap(gap, context: "处理用户请求时检测到")
+        
+        // 检查是否是图片分析需求
+        if gap.missingCapability == .vision || gap.missingCapability == .imageAnalysis {
+            // 启动对话引导创建
+            await MainActor.run {
+                creationSkill.initiateCreation(for: gap, in: self)
+            }
+        } else {
+            // 其他能力缺口，显示简单提示
+            let message = ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: """
+                💡 需要 **\(gap.missingCapability.displayName)** 能力
+                
+                \(gap.description)
+                
+                建议的提供商: \(gap.suggestedProviders.map { $0.displayName }.joined(separator: ", "))
+                
+                您可以在 Agent 列表中创建一个支持此能力的 Agent。
+                """,
+                timestamp: Date()
+            )
+            await MainActor.run {
+                messages.append(message)
+                isProcessing = false
+            }
+        }
+    }
+    
+    /// 处理多个可选 Agent
+    private func handleMultipleAgentOptions(agents: [Agent], text: String, images: [String]) async {
+        var options = "找到多个可用的 Agent:\n\n"
+        for (index, agent) in agents.enumerated() {
+            options += "\(index + 1). \(agent.displayName) - \(agent.shortDescription)\n"
+        }
+        options += "\n回复数字选择，或直接输入继续。"
+        
+        let message = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: options,
+            timestamp: Date()
+        )
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+        }
+    }
+    
+    // MARK: - 视觉能力缺口处理
+    
+    private func handleVisionGap(screenshotPath: String) {
+        if let agent = preferredAgent(for: .vision) {
+            Task {
+                await delegateRequest(
+                    to: agent,
+                    text: "分析这张截图",
+                    images: [screenshotPath],
+                    intent: .imageAnalysis,
+                    reason: "当前 Agent 不支持图片分析，已自动委托给 \(agent.displayName) 处理刚才的截图。"
+                )
+            }
+            return
+        }
+
+        // 检测能力缺口
+        if let gap = orchestrator.discoverGap(for: "分析这张截图") {
+            // 在聊天中启动创建流程
+            creationSkill.initiateCreation(for: gap, in: self)
+        }
+    }
+    
+    // MARK: - OpenClaw 集成
+    
+    private func sendToOpenClaw(agent: Agent, text: String, images: [String]) async {
+        let startTime = Date()
+        let assistantMessage = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: "⏳ \(agent.name) 正在思考...",
+            timestamp: Date(),
+            agentId: agent.id,
+            agentName: agent.name
+        )
+        
+        do {
+            await MainActor.run {
+                messages.append(assistantMessage)
+                attachExecutionTrace(to: assistantMessage.id)
+                updateExecutionTrace(
+                    state: .running,
+                    agentName: agent.displayName,
+                    summary: "\(agent.displayName) 正在返回结果"
+                )
+            }
+
+            let fullContent = try await sendViaGateway(
+                agent: agent,
+                sessionKey: "main",
+                sessionLabel: "Main",
+                text: text,
+                images: images,
+                assistantMessageID: assistantMessage.id
+            )
+            
+            let duration = Date().timeIntervalSince(startTime)
+            logger.logSystemResponse(fullContent, agent: agent)
+            logger.logPerformance(operation: "openclaw_request", duration: duration)
+            
+            await MainActor.run {
+                completeExecutionTrace(summary: "这次请求已处理完成")
+                isProcessing = false
+            }
+            
+        } catch {
+            logger.logError(error, context: "发送请求到 OpenClaw")
+
+            var terminalError = error
+            var terminalAgent = agent
+
+            await maybeStartKimiCLILoginRecovery(after: error, for: agent)
+
+            if UserFacingErrorFormatter.isAuthenticationError(error) {
+                agentStore.markTemporarilyUnavailable(agent)
+            }
+
+            for fallbackAgent in fallbackAgentsForAuthenticationFailure(
+                after: error,
+                failingAgent: agent,
+                images: images
+            ) {
+                logger.logAgentSwitch(from: agent, to: fallbackAgent, reason: "远端鉴权失败后自动降级到可用 Agent")
+                orchestrator.switchToAgent(fallbackAgent)
+
+                await MainActor.run {
+                    updateExecutionTrace(
+                        state: .fallback,
+                        agentName: fallbackAgent.displayName,
+                        transitionLabel: "自动回退",
+                        summary: "\(agent.displayName) 不可用，已切换到 \(fallbackAgent.displayName)"
+                    )
+
+                    if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
+                        messages[index].agentId = fallbackAgent.id
+                        messages[index].agentName = fallbackAgent.name
+                        messages[index].content = "⏳ \(fallbackAgent.name) 正在继续处理..."
+                    }
+                }
+
+                do {
+                    terminalAgent = fallbackAgent
+                    let fallbackContent = try await sendViaGateway(
+                        agent: fallbackAgent,
+                        sessionKey: "main",
+                        sessionLabel: "Main",
+                        text: text,
+                        images: images,
+                        assistantMessageID: assistantMessage.id
+                    )
+
+                    let duration = Date().timeIntervalSince(startTime)
+                    logger.logSystemResponse(fallbackContent, agent: fallbackAgent)
+                    logger.logPerformance(operation: "openclaw_request_auth_fallback", duration: duration)
+                    agentStore.restoreAvailability(for: fallbackAgent)
+
+                    await MainActor.run {
+                        completeExecutionTrace(summary: "这次请求已处理完成")
+                        isProcessing = false
+                    }
+                    return
+                } catch {
+                    terminalError = error
+                    logger.logError(error, context: "远端鉴权失败后回退到本地 Agent")
+
+                    if UserFacingErrorFormatter.isAuthenticationError(error) {
+                        agentStore.markTemporarilyUnavailable(fallbackAgent)
+                        continue
+                    }
+                    break
+                }
+            }
+
+            let userFacingMessage = await recoveryGuidanceMessage(
+                after: terminalError,
+                failingAgent: terminalAgent,
+                text: text,
+                images: images
+            ) ?? UserFacingErrorFormatter.chatMessage(
+                for: terminalError,
+                agentName: terminalAgent.displayName,
+                providerName: terminalAgent.provider.displayName
+            )
+            
+            await MainActor.run {
+                failExecutionTrace(summary: "这次请求处理失败")
+                if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
+                    messages[index].content = userFacingMessage
+                } else {
+                    let errorMessage = ChatMessage(
+                        id: UUID(),
+                        role: MessageRole.assistant,
+                        content: userFacingMessage,
+                        timestamp: Date()
+                    )
+                    messages.append(errorMessage)
+                }
+                isProcessing = false
+            }
+        }
+    }
+
+    private func fallbackAgentsForAuthenticationFailure(
+        after error: Error,
+        failingAgent: Agent,
+        images: [String]
+    ) -> [Agent] {
+        guard UserFacingErrorFormatter.isAuthenticationError(error) else {
+            return []
+        }
+
+        let requiredCapability = recoveryCapability(for: images)
+        let candidates = agentStore.usableAgents.filter { candidate in
+            candidate.id != failingAgent.id && candidate.supports(requiredCapability)
+        }
+
+        var ordered: [Agent] = []
+        var seenAgentIDs = Set<String>()
+
+        func appendCandidate(_ candidate: Agent?) {
+            guard let candidate,
+                  seenAgentIDs.insert(candidate.id).inserted,
+                  candidates.contains(where: { $0.id == candidate.id }) else {
+                return
+            }
+            ordered.append(candidate)
+        }
+
+        if requiredCapability == .textChat {
+            candidates
+                .filter { $0.provider == .ollama }
+                .forEach { appendCandidate($0) }
+        }
+
+        appendCandidate(orchestrator.currentAgent)
+        appendCandidate(agentStore.defaultAgent)
+        candidates.forEach { appendCandidate($0) }
+        return ordered
+    }
+
+    private func recoveryCapability(for images: [String]) -> Capability {
+        images.isEmpty ? .textChat : .vision
+    }
+
+    private func isKimiCLIAuthenticationFailure(_ error: Error, agent: Agent) -> Bool {
+        agent.provider == .ollama && UserFacingErrorFormatter.isAuthenticationError(error)
+    }
+
+    private func maybeStartKimiCLILoginRecovery(after error: Error, for agent: Agent) async {
+        guard isKimiCLIAuthenticationFailure(error, agent: agent) else {
+            return
+        }
+
+        let alreadyWaiting = await MainActor.run { () -> Bool in
+            isWaitingForKimiCLILogin && pendingKimiCLILoginAgentID == agent.id
+        }
+        guard !alreadyWaiting else { return }
+
+        await MainActor.run {
+            let launched = agentStore.launchKimiLogin()
+            isWaitingForKimiCLILogin = true
+            pendingKimiCLILoginAgentID = agent.id
+
+            appendSystemMessage(
+                launched
+                ? """
+                🌐 检测到 \(agent.displayName) 的 Kimi CLI 登录已失效。
+
+                我已经在终端执行 `kimi login`。接下来通常会打开网页授权；你完成登录后回到应用，我会自动检测 Kimi CLI 是否已经恢复可用。
+                """
+                : """
+                🌐 检测到 \(agent.displayName) 的 Kimi CLI 登录已失效。
+
+                请在终端执行 `kimi login` 并完成网页授权。登录完成后回到应用，我会自动检测 Kimi CLI 是否已经恢复可用。
+                """
+            )
+        }
+    }
+
+    private func recoveryGuidanceMessage(
+        after error: Error,
+        failingAgent: Agent,
+        text: String,
+        images: [String]
+    ) async -> String? {
+        guard UserFacingErrorFormatter.isAuthenticationError(error) else {
+            return nil
+        }
+
+        if failingAgent.provider == .ollama {
+            return """
+            我刚刚尝试让 \(failingAgent.displayName) 调用 Kimi CLI，但检测到 CLI 登录已经失效，所以这次请求没有成功。
+
+            我已经帮你拉起 `kimi login` 登录流程。通常完成网页授权后回到应用就行；如果没有自动弹出终端，也可以手动执行一次 `kimi login`。登录完成后，把刚才的问题再发一次，我会继续处理。
+            """
+        }
+
+        let requiredCapability = recoveryCapability(for: images)
+        guard preferredAgent(for: requiredCapability) == nil else {
+            return nil
+        }
+
+        if requiredCapability == .vision {
+            let gap = CapabilityGap(
+                missingCapability: .vision,
+                suggestedProviders: [.openai, .anthropic, .moonshot, .google],
+                description: "需要一个支持图片分析的 Agent 才能继续处理这次请求",
+                context: text
+            )
+
+            await MainActor.run {
+                creationSkill.initiateCreation(for: gap, in: self)
+            }
+
+            return """
+            ⚙️ 当前没有可用的视觉 Agent
+
+            \(failingAgent.displayName) 已因鉴权失败被暂时停用。我已经打开配置引导；补一个支持图片分析的 Agent 后，就能继续处理这类请求。
+            """
+        }
+
+        showInitialSetupGuidance(for: "继续对话")
+        return """
+        ⚙️ 当前没有可用的 LLM 或 CLI Agent
+
+        \(failingAgent.displayName) 已因鉴权失败被暂时停用。我已经打开配置向导；只要配置任意一个可用的 LLM 或 CLI Agent，就可以继续。
+        """
+    }
+
+    private func gatewayReturnedError(_ content: String) -> NSError? {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+
+        let lowercased = trimmed.lowercased()
+        let hasProviderPayloadShape = lowercased.contains("\"error\"") ||
+            lowercased.contains("'error'") ||
+            lowercased.contains("invalid_api_key") ||
+            lowercased.contains("invalid_authentication_error")
+        let startsWithProviderPayload = lowercased.hasPrefix("{\"error\"") ||
+            lowercased.hasPrefix("{'error'")
+
+        guard lowercased.hasPrefix("error code:") ||
+              (lowercased.hasPrefix("error:") && hasProviderPayloadShape) ||
+              startsWithProviderPayload else {
+            return nil
+        }
+
+        return NSError(
+            domain: "CommandRunner.GatewayContent",
+            code: gatewayReturnedErrorCode(from: trimmed) ?? 1,
+            userInfo: [NSLocalizedDescriptionKey: trimmed]
+        )
+    }
+
+    private func gatewayReturnedErrorCode(from content: String) -> Int? {
+        guard let range = content.range(of: "Error code:", options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let suffix = content[range.upperBound...]
+        let digits = suffix
+            .drop { !$0.isNumber }
+            .prefix { $0.isNumber }
+
+        return digits.isEmpty ? nil : Int(digits)
+    }
+
+    private func shouldAutoDelegateToSuggestedAgent(input: String, images: [String], suggestedAgent: Agent) -> Bool {
+        suggestedAgent.supportsImageAnalysis && isImageAnalysisRequest(text: input, images: images)
+    }
+
+    private func isImageAnalysisRequest(text: String, images: [String]) -> Bool {
+        if !images.isEmpty {
+            return true
+        }
+
+        let normalized = text.lowercased()
+        return ["图片", "图像", "截图", "看图", "分析图", "分析图片", "分析截图", "这张图"]
+            .contains { normalized.contains($0) }
+    }
+
+    private func resolveImagesForRequest(text: String, explicitImages: [String]) -> [String] {
+        if !explicitImages.isEmpty {
+            return explicitImages
+        }
+
+        guard isImageAnalysisRequest(text: text, images: explicitImages) else {
+            return []
+        }
+
+        if let recentImagePath = latestReusableImagePath() {
+            return [recentImagePath]
+        }
+
+        return []
+    }
+
+    private func latestReusableImagePath() -> String? {
+        let fileManager = FileManager.default
+
+        if let lastScreenshotPath,
+           fileManager.fileExists(atPath: lastScreenshotPath) {
+            return lastScreenshotPath
+        }
+
+        for message in messages.reversed() {
+            guard let imagePath = message.images?.last else { continue }
+            if fileManager.fileExists(atPath: imagePath) {
+                return imagePath
+            }
+        }
+
+        return nil
+    }
+
+    private func preferredAgent(for capability: Capability) -> Agent? {
+        let candidates = agentStore.agentsSupporting(capability)
+
+        if let current = orchestrator.currentAgent,
+           current.supports(capability),
+           agentStore.canUse(current) {
+            return current
+        }
+
+        if let defaultAgent = agentStore.defaultAgent,
+           defaultAgent.supports(capability) {
+            return defaultAgent
+        }
+
+        return candidates.first
+    }
+
+    private func gatewaySessionKey(forTaskSessionID sessionID: String) -> String {
+        let sanitized = sessionID
+            .lowercased()
+            .replacingOccurrences(of: "task-", with: "")
+            .replacingOccurrences(of: "_", with: "-")
+        return "agent:desktop:subagent:\(sanitized)"
+    }
+
+    private func sendViaGateway(
+        agent: Agent,
+        sessionKey: String,
+        sessionLabel: String?,
+        text: String,
+        images: [String],
+        taskSessionID: String? = nil,
+        assistantMessageID: UUID
+    ) async throws -> String {
+        let content = try await gatewayClient.sendMessage(
+            agent: agent,
+            sessionKey: sessionKey,
+            sessionLabel: sessionLabel,
+            text: text,
+            images: images,
+            onAssistantText: { [weak self] partialText in
+                guard let self else { return }
+                guard self.gatewayReturnedError(partialText) == nil else { return }
+                if let taskSessionID {
+                    await MainActor.run {
+                        self.updateTaskSessionMessage(
+                            sessionID: taskSessionID,
+                            messageID: assistantMessageID,
+                            content: partialText
+                        )
+                        self.updateTaskSessionStatus(
+                            sessionID: taskSessionID,
+                            status: .running,
+                            summary: "\(agent.displayName) 正在通过 OpenClaw 持续输出结果"
+                        )
+                    }
+                } else {
+                    await MainActor.run {
+                        self.updateAssistantMessage(id: assistantMessageID, content: partialText)
+                    }
+                }
+            }
+        )
+
+        if let surfacedError = gatewayReturnedError(content) {
+            throw surfacedError
+        }
+
+        let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "服务已返回，但没有拿到可显示的内容。"
+            : content
+
+        await MainActor.run {
+            if let taskSessionID {
+                self.updateTaskSessionMessage(
+                    sessionID: taskSessionID,
+                    messageID: assistantMessageID,
+                    content: resolvedContent
+                )
+            } else {
+                self.updateAssistantMessage(id: assistantMessageID, content: resolvedContent)
+            }
+        }
+
+        return resolvedContent
+    }
+
+    private func delegateRequest(
+        to agent: Agent,
+        text: String,
+        images: [String],
+        intent: Intent,
+        reason: String
+    ) async {
+        await MainActor.run {
+            isProcessing = true
+        }
+
+        let mainAgent = await MainActor.run { orchestrator.currentAgent }
+        let sessionID = await MainActor.run {
+            createTaskSession(
+                mainAgent: mainAgent,
+                delegateAgent: agent,
+                request: text,
+                intent: intent,
+                reason: reason
+            )
+        }
+
+        let result = await runTaskSession(
+            sessionID: sessionID,
+            agent: agent,
+            text: text,
+            images: images
+        )
+
+        guard !result.failed else {
+            await MainActor.run {
+                isProcessing = false
+            }
+            return
+        }
+
+        await reflectTaskResultInMainConversation(
+            taskSessionID: sessionID,
+            originalUserRequest: text,
+            mainAgent: mainAgent,
+            delegateAgent: result.agent,
+            taskResult: result.content
+        )
+    }
+
+    func taskSession(for id: String?) -> AgentTaskSession? {
+        guard let id else { return nil }
+        return taskSessions.first { $0.id == id }
+    }
+
+    func toggleTaskSessionExpansion(_ id: String) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == id }) else { return }
+        taskSessions[index].isExpanded.toggle()
+        taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    private func createTaskSession(
+        mainAgent: Agent?,
+        delegateAgent: Agent,
+        request: String,
+        intent: Intent,
+        reason: String
+    ) -> String {
+        var session = AgentTaskSession(
+            title: "\(delegateAgent.name) 子会话",
+            originalRequest: request,
+            status: .queued,
+            statusSummary: "等待 \(delegateAgent.displayName) 接手",
+            mainAgentName: mainAgent?.name,
+            delegateAgentName: delegateAgent.name,
+            intentName: intent.displayName,
+            isExpanded: true
+        )
+
+        let taskCardMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: "🔀 \(reason)",
+            timestamp: Date(),
+            linkedTaskSessionID: session.id
+        )
+        session.linkedMainMessageID = taskCardMessage.id
+        session.messages = [
+            TaskSessionMessage(role: .system, content: reason),
+            TaskSessionMessage(role: .user, content: request, agentName: mainAgent?.name)
+        ]
+
+        messages.append(taskCardMessage)
+        taskSessions.append(session)
+        return session.id
+    }
+
+    @MainActor
+    private func appendTaskSessionMessage(
+        sessionID: String,
+        role: MessageRole,
+        content: String,
+        agentName: String? = nil
+    ) -> UUID {
+        let message = TaskSessionMessage(
+            role: role,
+            content: content,
+            agentName: agentName
+        )
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else {
+            return message.id
+        }
+        taskSessions[index].messages.append(message)
+        taskSessions[index].updatedAt = Date()
+        return message.id
+    }
+
+    @MainActor
+    private func updateTaskSessionMessage(
+        sessionID: String,
+        messageID: UUID,
+        content: String
+    ) {
+        guard let sessionIndex = taskSessions.firstIndex(where: { $0.id == sessionID }),
+              let messageIndex = taskSessions[sessionIndex].messages.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+
+        guard taskSessions[sessionIndex].messages[messageIndex].content != content else {
+            return
+        }
+
+        taskSessions[sessionIndex].messages[messageIndex].content = content
+        taskSessions[sessionIndex].updatedAt = Date()
+    }
+
+    @MainActor
+    private func updateTaskSessionStatus(
+        sessionID: String,
+        status: TaskSessionStatus,
+        summary: String,
+        isExpanded: Bool? = nil,
+        resultSummary: String? = nil,
+        errorMessage: String? = nil
+    ) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
+
+        var didChange = false
+
+        if taskSessions[index].status != status {
+            taskSessions[index].status = status
+            didChange = true
+        }
+        if taskSessions[index].statusSummary != summary {
+            taskSessions[index].statusSummary = summary
+            didChange = true
+        }
+        if let isExpanded, taskSessions[index].isExpanded != isExpanded {
+            taskSessions[index].isExpanded = isExpanded
+            didChange = true
+        }
+        if let resultSummary, taskSessions[index].resultSummary != resultSummary {
+            taskSessions[index].resultSummary = resultSummary
+            didChange = true
+        }
+        if let errorMessage, taskSessions[index].errorMessage != errorMessage {
+            taskSessions[index].errorMessage = errorMessage
+            didChange = true
+        }
+
+        guard didChange else { return }
+        taskSessions[index].updatedAt = Date()
+    }
+
+    private func summarizeTaskResult(_ content: String) -> String {
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 220 else { return trimmed }
+        let prefix = trimmed.prefix(220)
+        return "\(prefix)…"
+    }
+
+    private func runTaskSession(
+        sessionID: String,
+        agent: Agent,
+        text: String,
+        images: [String]
+    ) async -> TaskExecutionResult {
+        await MainActor.run {
+            updateTaskSessionStatus(
+                sessionID: sessionID,
+                status: .running,
+                summary: "\(agent.displayName) 正在处理这个任务",
+                isExpanded: true
+            )
+        }
+
+        let assistantMessageID = await MainActor.run {
+            appendTaskSessionMessage(
+                sessionID: sessionID,
+                role: .assistant,
+                content: "⏳ \(agent.name) 正在通过 OpenClaw 处理...",
+                agentName: agent.name
+            )
+        }
+
+        do {
+            let content = try await sendViaGateway(
+                agent: agent,
+                sessionKey: gatewaySessionKey(forTaskSessionID: sessionID),
+                sessionLabel: taskSession(for: sessionID)?.title,
+                text: text,
+                images: images,
+                taskSessionID: sessionID,
+                assistantMessageID: assistantMessageID
+            )
+
+            await MainActor.run {
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .completed,
+                    summary: "\(agent.displayName) 已完成，结果已回流到主会话",
+                    isExpanded: false,
+                    resultSummary: summarizeTaskResult(content)
+                )
+            }
+
+            return TaskExecutionResult(agent: agent, content: content, failed: false)
+        } catch {
+            logger.logError(error, context: "执行 Agent 子会话")
+
+            var terminalError = error
+            var terminalAgent = agent
+
+            await maybeStartKimiCLILoginRecovery(after: error, for: agent)
+
+            if UserFacingErrorFormatter.isAuthenticationError(error) {
+                agentStore.markTemporarilyUnavailable(agent)
+            }
+
+            for fallbackAgent in fallbackAgentsForAuthenticationFailure(
+                after: error,
+                failingAgent: agent,
+                images: images
+            ) {
+                logger.logAgentSwitch(from: agent, to: fallbackAgent, reason: "子会话 Agent 鉴权失败后自动切换")
+                orchestrator.switchToAgent(fallbackAgent)
+
+                await MainActor.run {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .running,
+                        summary: "\(agent.displayName) 不可用，已切换到 \(fallbackAgent.displayName)",
+                        isExpanded: true
+                    )
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: "⏳ \(fallbackAgent.name) 正在继续处理..."
+                    )
+                }
+
+                do {
+                    terminalAgent = fallbackAgent
+                    let fallbackContent = try await sendViaGateway(
+                        agent: fallbackAgent,
+                        sessionKey: gatewaySessionKey(forTaskSessionID: sessionID),
+                        sessionLabel: taskSession(for: sessionID)?.title,
+                        text: text,
+                        images: images,
+                        taskSessionID: sessionID,
+                        assistantMessageID: assistantMessageID
+                    )
+
+                    await MainActor.run {
+                        updateTaskSessionStatus(
+                            sessionID: sessionID,
+                            status: .completed,
+                            summary: "\(fallbackAgent.displayName) 已完成，结果已回流到主会话",
+                            isExpanded: false,
+                            resultSummary: summarizeTaskResult(fallbackContent)
+                        )
+                    }
+
+                    return TaskExecutionResult(agent: fallbackAgent, content: fallbackContent, failed: false)
+                } catch {
+                    terminalError = error
+                    logger.logError(error, context: "子会话回退 Agent 失败")
+
+                    if UserFacingErrorFormatter.isAuthenticationError(error) {
+                        agentStore.markTemporarilyUnavailable(fallbackAgent)
+                        continue
+                    }
+                    break
+                }
+            }
+
+            let userFacingMessage = await recoveryGuidanceMessage(
+                after: terminalError,
+                failingAgent: terminalAgent,
+                text: text,
+                images: images
+            ) ?? UserFacingErrorFormatter.chatMessage(
+                for: terminalError,
+                agentName: terminalAgent.displayName,
+                providerName: terminalAgent.provider.displayName
+            )
+            let terminalAgentName = terminalAgent.displayName
+
+            await MainActor.run {
+                updateTaskSessionMessage(
+                    sessionID: sessionID,
+                    messageID: assistantMessageID,
+                    content: userFacingMessage
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .failed,
+                    summary: "\(terminalAgentName) 执行失败",
+                    isExpanded: true,
+                    errorMessage: userFacingMessage
+                )
+            }
+
+            return TaskExecutionResult(agent: terminalAgent, content: userFacingMessage, failed: true)
+        }
+    }
+
+    private func reflectTaskResultInMainConversation(
+        taskSessionID: String,
+        originalUserRequest: String,
+        mainAgent: Agent?,
+        delegateAgent: Agent,
+        taskResult: String
+    ) async {
+        let traceAnchorMessageID = await MainActor.run {
+            taskSession(for: taskSessionID)?.linkedMainMessageID
+        }
+
+        let reflectionAgent = await MainActor.run { () -> Agent? in
+            if let mainAgent, agentStore.canUse(mainAgent) {
+                return mainAgent
+            }
+            return preferredAgent(for: .textChat)
+        }
+
+        await MainActor.run {
+            if let traceAnchorMessageID {
+                startExecutionTrace(
+                    anchorMessageID: traceAnchorMessageID,
+                    agentName: reflectionAgent?.displayName ?? delegateAgent.displayName,
+                    intentName: "结果整合",
+                    summary: "主会话正在整合 \(delegateAgent.displayName) 的执行结果",
+                    state: .synthesizing,
+                    transitionLabel: "子会话回流"
+                )
+            }
+        }
+
+        guard let reflectionAgent else {
+            await MainActor.run {
+                completeExecutionTrace(summary: "已直接回流子会话结果")
+                let fallbackMessage = ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: summarizeTaskResult(taskResult),
+                    timestamp: Date()
+                )
+                messages.append(fallbackMessage)
+                isProcessing = false
+            }
+            return
+        }
+
+        let reflectionPrompt = """
+        你现在是主会话 AI，需要根据一个子会话的执行结果，直接给用户最终答复。
+
+        用户原始请求：
+        \(originalUserRequest)
+
+        子会话执行 Agent：
+        \(delegateAgent.displayName)
+
+        子会话结果：
+        \(taskResult)
+
+        请直接面向用户作答：
+        1. 不要提内部委托、子会话、路由机制。
+        2. 用自然语言整合子会话结果，给出结论或下一步建议。
+        3. 如果信息不足，明确说明还缺什么。
+        """
+
+        _ = await sendToOpenClaw(agent: reflectionAgent, text: reflectionPrompt, images: [])
+    }
+
+    private func streamLocalBridgeForTask(
+        sessionID: String,
+        agent: Agent,
+        text: String,
+        images: [String],
+        assistantMessageID: UUID
+    ) async throws -> String {
+        var requestBody: [String: Any] = [
+            "model": "\(agent.provider.rawValue)/\(agent.model)",
+            "messages": [
+                ["role": "user", "content": text]
+            ],
+            "stream": true
+        ]
+
+        if !images.isEmpty && agent.supportsImageAnalysis {
+            requestBody["images"] = images
+        }
+
+        let url = URL(string: "http://localhost:11434/api/chat")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+
+        let (stream, response) = try await URLSession.shared.bytes(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 15,
+                userInfo: [NSLocalizedDescriptionKey: "本地 OpenClaw Bridge 请求失败"]
+            )
+        }
+
+        var fullContent = ""
+        var lastUpdateTime = Date()
+        var hasReceivedContent = false
+
+        for try await line in stream.lines {
+            if let data = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = json["message"] as? [String: Any],
+               let content = message["content"] as? String {
+
+                fullContent += content
+                hasReceivedContent = true
+                let contentSnapshot = fullContent
+                await MainActor.run {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: contentSnapshot
+                    )
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .running,
+                        summary: "\(agent.displayName) 正在持续输出结果"
+                    )
+                }
+                lastUpdateTime = Date()
+            }
+
+            if let data = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let done = json["done"] as? Bool, done {
+                break
+            }
+
+            if !hasReceivedContent && Date().timeIntervalSince(lastUpdateTime) > 3 {
+                await MainActor.run {
+                    updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: "⏳ \(agent.name) 正在连接..."
+                    )
+                }
+                lastUpdateTime = Date()
+            }
+        }
+
+        if fullContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let fallback = "服务已返回，但没有拿到可显示的内容。"
+            await MainActor.run {
+                updateTaskSessionMessage(
+                    sessionID: sessionID,
+                    messageID: assistantMessageID,
+                    content: fallback
+                )
+            }
+            return fallback
+        }
+
+        return fullContent
+    }
+
+    private func sendToConfiguredProviderForTask(
+        sessionID: String,
+        agent: Agent,
+        text: String,
+        images: [String],
+        assistantMessageID: UUID
+    ) async throws -> String {
+        guard let profile = agentStore.runtimeProfile(for: agent) else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 16,
+                userInfo: [NSLocalizedDescriptionKey: "\(agent.displayName) 缺少认证配置，请重新配置该 Agent。"]
+            )
+        }
+
+        let responseText: String
+        switch agent.provider {
+        case .openai, .moonshot:
+            responseText = try await callOpenAICompatibleProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .anthropic:
+            responseText = try await callAnthropicProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .google:
+            responseText = try await callGoogleProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .ollama:
+            throw NSError(
+                domain: "CommandRunner",
+                code: 17,
+                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
+            )
+        }
+
+        let finalText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = finalText.isEmpty ? "服务已返回，但没有拿到可显示的内容。" : finalText
+        await MainActor.run {
+            updateTaskSessionMessage(
+                sessionID: sessionID,
+                messageID: assistantMessageID,
+                content: content
+            )
+        }
+        return content
+    }
+
+    private func streamLocalBridge(
+        agent: Agent,
+        text: String,
+        images: [String],
+        assistantMessageID: UUID
+    ) async throws -> String {
+        var requestBody: [String: Any] = [
+            "model": "\(agent.provider.rawValue)/\(agent.model)",
+            "messages": [
+                ["role": "user", "content": text]
+            ],
+            "stream": true
+        ]
+
+        if !images.isEmpty && agent.supportsImageAnalysis {
+            requestBody["images"] = images
+        }
+
+        let url = URL(string: "http://localhost:11434/api/chat")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
+
+        let (stream, response) = try await URLSession.shared.bytes(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200 else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "本地 OpenClaw Bridge 请求失败"]
+            )
+        }
+
+        var fullContent = ""
+        var lastUpdateTime = Date()
+        var hasReceivedContent = false
+
+        for try await line in stream.lines {
+            if let data = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = json["message"] as? [String: Any],
+               let content = message["content"] as? String {
+
+                fullContent += content
+                hasReceivedContent = true
+                await updateAssistantMessage(id: assistantMessageID, content: fullContent)
+                lastUpdateTime = Date()
+            }
+
+            if let data = line.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let done = json["done"] as? Bool, done {
+                break
+            }
+
+            if !hasReceivedContent && Date().timeIntervalSince(lastUpdateTime) > 3 {
+                await updateAssistantMessage(id: assistantMessageID, content: "⏳ \(agent.name) 正在连接...")
+                lastUpdateTime = Date()
+            }
+        }
+
+        if fullContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let fallback = "服务已返回，但没有拿到可显示的内容。"
+            await updateAssistantMessage(id: assistantMessageID, content: fallback)
+            return fallback
+        }
+
+        return fullContent
+    }
+
+    private func sendToConfiguredProvider(
+        agent: Agent,
+        text: String,
+        images: [String],
+        assistantMessageID: UUID
+    ) async throws -> String {
+        guard let profile = agentStore.runtimeProfile(for: agent) else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "\(agent.displayName) 缺少认证配置，请重新配置该 Agent。"]
+            )
+        }
+
+        let responseText: String
+        switch agent.provider {
+        case .openai, .moonshot:
+            responseText = try await callOpenAICompatibleProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .anthropic:
+            responseText = try await callAnthropicProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .google:
+            responseText = try await callGoogleProvider(
+                agent: agent,
+                text: text,
+                images: images,
+                profile: profile
+            )
+        case .ollama:
+            throw NSError(
+                domain: "CommandRunner",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
+            )
+        }
+
+        let finalText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = finalText.isEmpty ? "服务已返回，但没有拿到可显示的内容。" : finalText
+        await updateAssistantMessage(id: assistantMessageID, content: content)
+        return content
+    }
+
+    private func callOpenAICompatibleProvider(
+        agent: Agent,
+        text: String,
+        images: [String],
+        profile: AgentStore.RuntimeProfile
+    ) async throws -> String {
+        guard !profile.apiKey.isEmpty else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "\(agent.provider.displayName) API Key 为空，请重新配置。"]
+            )
+        }
+
+        let endpoint = URL(string: "\(normalizedBaseURL(profile.baseURL))/chat/completions")!
+        let messageContent = try buildOpenAICompatibleContent(text: text, images: images)
+        var body: [String: Any] = [
+            "model": profile.model,
+            "messages": [
+                ["role": "user", "content": messageContent]
+            ],
+            "stream": false
+        ]
+        body["temperature"] = agent.config.temperature
+        body["max_tokens"] = agent.config.maxTokens
+
+        let data = try await performJSONRequest(
+            url: endpoint,
+            headers: [
+                "Authorization": "Bearer \(profile.apiKey)",
+                "Content-Type": "application/json"
+            ],
+            body: body,
+            providerName: agent.provider.displayName,
+            agent: agent
+        )
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "\(agent.provider.displayName) 返回了无法解析的响应。"]
+            )
+        }
+
+        if let errorMessage = extractProviderErrorMessage(from: json) {
+            throw NSError(domain: "CommandRunner", code: 6, userInfo: [NSLocalizedDescriptionKey: errorMessage])
+        }
+
+        let choices = json["choices"] as? [[String: Any]] ?? []
+        let message = choices.first?["message"] as? [String: Any]
+        return extractOpenAICompatibleText(from: message?["content"])
+    }
+
+    private func callAnthropicProvider(
+        agent: Agent,
+        text: String,
+        images: [String],
+        profile: AgentStore.RuntimeProfile
+    ) async throws -> String {
+        guard !profile.apiKey.isEmpty else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "Anthropic API Key 为空，请重新配置。"]
+            )
+        }
+
+        let endpoint = URL(string: "\(normalizedBaseURL(profile.baseURL))/messages")!
+        let content = try buildAnthropicContent(text: text, images: images)
+        var body: [String: Any] = [
+            "model": profile.model,
+            "max_tokens": max(agent.config.maxTokens, 1024),
+            "messages": [
+                ["role": "user", "content": content]
+            ]
+        ]
+        body["temperature"] = agent.config.temperature
+
+        let data = try await performJSONRequest(
+            url: endpoint,
+            headers: [
+                "x-api-key": profile.apiKey,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            ],
+            body: body,
+            providerName: agent.provider.displayName,
+            agent: agent
+        )
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 8,
+                userInfo: [NSLocalizedDescriptionKey: "Anthropic 返回了无法解析的响应。"]
+            )
+        }
+
+        if let errorMessage = extractProviderErrorMessage(from: json) {
+            throw NSError(domain: "CommandRunner", code: 9, userInfo: [NSLocalizedDescriptionKey: errorMessage])
+        }
+
+        let contentBlocks = json["content"] as? [[String: Any]] ?? []
+        let textBlocks = contentBlocks.compactMap { block -> String? in
+            guard (block["type"] as? String) == "text" else { return nil }
+            return (block["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return textBlocks.joined(separator: "\n")
+    }
+
+    private func callGoogleProvider(
+        agent: Agent,
+        text: String,
+        images: [String],
+        profile: AgentStore.RuntimeProfile
+    ) async throws -> String {
+        guard !profile.apiKey.isEmpty else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "Google API Key 为空，请重新配置。"]
+            )
+        }
+
+        var components = URLComponents(string: "\(normalizedBaseURL(profile.baseURL))/models/\(profile.model):generateContent")
+        components?.queryItems = [URLQueryItem(name: "key", value: profile.apiKey)]
+
+        guard let endpoint = components?.url else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "Google 请求地址无效。"]
+            )
+        }
+
+        let parts = try buildGoogleParts(text: text, images: images)
+        var body: [String: Any] = [
+            "contents": [
+                ["role": "user", "parts": parts]
+            ]
+        ]
+        body["generationConfig"] = [
+            "temperature": agent.config.temperature,
+            "maxOutputTokens": agent.config.maxTokens
+        ]
+
+        let data = try await performJSONRequest(
+            url: endpoint,
+            headers: ["Content-Type": "application/json"],
+            body: body,
+            providerName: agent.provider.displayName,
+            agent: agent
+        )
+
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "Google 返回了无法解析的响应。"]
+            )
+        }
+
+        if let errorMessage = extractProviderErrorMessage(from: json) {
+            throw NSError(domain: "CommandRunner", code: 13, userInfo: [NSLocalizedDescriptionKey: errorMessage])
+        }
+
+        let candidates = json["candidates"] as? [[String: Any]] ?? []
+        let content = candidates.first?["content"] as? [String: Any]
+        let partsResponse = content?["parts"] as? [[String: Any]] ?? []
+        let textParts = partsResponse.compactMap { ($0["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return textParts.joined(separator: "\n")
+    }
+
+    private func performJSONRequest(
+        url: URL,
+        headers: [String: String],
+        body: [String: Any],
+        providerName: String,
+        agent: Agent? = nil
+    ) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NSError(
+                domain: "CommandRunner",
+                code: 14,
+                userInfo: [NSLocalizedDescriptionKey: "\(providerName) 没有返回有效的 HTTP 响应。"]
+            )
+        }
+
+        // 记录详细的请求/响应日志用于诊断
+        let hasAuthHeader = headers.keys.contains { $0.lowercased() == "authorization" || $0.lowercased() == "x-api-key" }
+        let apiKeyPreview = hasAuthHeader ? "已提供" : "未提供"
+        
+        LogDebug("API 请求: \(providerName) \(url.path), 认证: \(apiKeyPreview), 状态码: \(httpResponse.statusCode)")
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            let rawMessage = extractProviderErrorMessage(from: data)
+            let responsePreview = String(data: data, encoding: .utf8)?.prefix(500) ?? "无法解析"
+            
+            LogError("API 错误: \(providerName) HTTP \(httpResponse.statusCode), 响应: \(responsePreview)")
+            
+            // 根据状态码提供用户友好的错误信息
+            let userMessage: String
+            switch httpResponse.statusCode {
+            case 401:
+                let detail = rawMessage ?? "API Key 无效或已过期"
+                userMessage = "❌ \(providerName) 认证失败\n\n原因: \(detail)\n\n解决方法:\n1. 检查 API Key 是否正确复制（没有多余的空格）\n2. 确认 API Key 没有过期\n3. 在 Agent 列表中重新配置"
+            case 403:
+                userMessage = "❌ \(providerName) 权限不足\n\n您的 API Key 可能没有访问该模型的权限。"
+            case 429:
+                userMessage = "⚠️ \(providerName) 请求过于频繁\n\n请稍后再试，或检查您的用量限制。"
+            case 500...599:
+                userMessage = "⚠️ \(providerName) 服务器错误 (HTTP \(httpResponse.statusCode))\n\n这是提供商的服务器问题，请稍后再试。"
+            default:
+                userMessage = rawMessage ?? "\(providerName) 请求失败，HTTP \(httpResponse.statusCode)。"
+            }
+            
+            throw NSError(
+                domain: "CommandRunner",
+                code: httpResponse.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: userMessage]
+            )
+        }
+
+        if let agent {
+            agentStore.restoreAvailability(for: agent)
+        }
+
+        return data
+    }
+
+    private func extractProviderErrorMessage(from data: Data) -> String? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return raw?.isEmpty == false ? raw : nil
+        }
+        return extractProviderErrorMessage(from: json)
+    }
+
+    private func extractProviderErrorMessage(from json: [String: Any]) -> String? {
+        if let error = json["error"] as? String, !error.isEmpty {
+            return error
+        }
+
+        if let error = json["error"] as? [String: Any] {
+            if let message = error["message"] as? String, !message.isEmpty {
+                return message
+            }
+            if let details = error["details"] as? String, !details.isEmpty {
+                return details
+            }
+        }
+
+        if let message = json["message"] as? String, !message.isEmpty {
+            return message
+        }
+
+        return nil
+    }
+
+    private func buildOpenAICompatibleContent(text: String, images: [String]) throws -> Any {
+        let prompt = normalizedPrompt(text, hasImages: !images.isEmpty)
+        guard !images.isEmpty else { return prompt }
+
+        var content: [[String: Any]] = [
+            ["type": "text", "text": prompt]
+        ]
+
+        for path in images {
+            let attachment = try loadImageAttachment(at: path)
+            content.append([
+                "type": "image_url",
+                "image_url": ["url": "data:\(attachment.mimeType);base64,\(attachment.base64)"]
+            ])
+        }
+
+        return content
+    }
+
+    private func buildAnthropicContent(text: String, images: [String]) throws -> [[String: Any]] {
+        var content: [[String: Any]] = [
+            ["type": "text", "text": normalizedPrompt(text, hasImages: !images.isEmpty)]
+        ]
+
+        for path in images {
+            let attachment = try loadImageAttachment(at: path)
+            content.append([
+                "type": "image",
+                "source": [
+                    "type": "base64",
+                    "media_type": attachment.mimeType,
+                    "data": attachment.base64
+                ]
+            ])
+        }
+
+        return content
+    }
+
+    private func buildGoogleParts(text: String, images: [String]) throws -> [[String: Any]] {
+        var parts: [[String: Any]] = [
+            ["text": normalizedPrompt(text, hasImages: !images.isEmpty)]
+        ]
+
+        for path in images {
+            let attachment = try loadImageAttachment(at: path)
+            parts.append([
+                "inline_data": [
+                    "mime_type": attachment.mimeType,
+                    "data": attachment.base64
+                ]
+            ])
+        }
+
+        return parts
+    }
+
+    private func extractOpenAICompatibleText(from payload: Any?) -> String {
+        if let text = payload as? String {
+            return text
+        }
+
+        if let blocks = payload as? [[String: Any]] {
+            let texts = blocks.compactMap { block -> String? in
+                if let text = block["text"] as? String {
+                    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let type = block["type"] as? String, type == "output_text",
+                   let text = block["text"] as? String {
+                    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                return nil
+            }
+            return texts.joined(separator: "\n")
+        }
+
+        return ""
+    }
+
+    private func loadImageAttachment(at path: String) throws -> (mimeType: String, base64: String) {
+        let url = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: url)
+        return (mimeType(for: url.pathExtension), data.base64EncodedString())
+    }
+
+    private func mimeType(for pathExtension: String) -> String {
+        switch pathExtension.lowercased() {
+        case "png":
+            return "image/png"
+        case "jpg", "jpeg":
+            return "image/jpeg"
+        case "webp":
+            return "image/webp"
+        case "gif":
+            return "image/gif"
+        case "heic":
+            return "image/heic"
+        case "bmp":
+            return "image/bmp"
+        case "tiff", "tif":
+            return "image/tiff"
+        default:
+            return "application/octet-stream"
+        }
+    }
+
+    private func normalizedPrompt(_ text: String, hasImages: Bool) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            return trimmed
+        }
+        return hasImages ? "请分析这张图片。" : "你好"
+    }
+
+    private func normalizedBaseURL(_ baseURL: String) -> String {
+        var value = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while value.hasSuffix("/") {
+            value.removeLast()
+        }
+        return value
+    }
+
+    @MainActor
+    private func updateAssistantMessage(id: UUID, content: String) {
+        if let index = messages.firstIndex(where: { $0.id == id }) {
+            guard messages[index].content != content else { return }
+            messages[index].content = content
+        }
+    }
+
+    @MainActor
+    private func startExecutionTrace(
+        anchorMessageID: UUID,
+        agentName: String,
+        intentName: String,
+        summary: String,
+        state: ExecutionTraceState = .routing,
+        transitionLabel: String? = nil
+    ) {
+        traceDismissTask?.cancel()
+        currentExecutionTrace = ExecutionTrace(
+            anchorMessageID: anchorMessageID,
+            agentName: agentName,
+            intentName: intentName,
+            transitionLabel: transitionLabel,
+            summary: summary,
+            state: state
+        )
+    }
+
+    @MainActor
+    private func attachExecutionTrace(to assistantMessageID: UUID) {
+        guard var trace = currentExecutionTrace else { return }
+        trace.assistantMessageID = assistantMessageID
+        currentExecutionTrace = trace
+    }
+
+    @MainActor
+    private func updateExecutionTrace(
+        state: ExecutionTraceState,
+        agentName: String? = nil,
+        intentName: String? = nil,
+        transitionLabel: String? = nil,
+        summary: String? = nil
+    ) {
+        guard var trace = currentExecutionTrace else { return }
+        traceDismissTask?.cancel()
+        trace.state = state
+        if let agentName {
+            trace.agentName = agentName
+        }
+        if let intentName {
+            trace.intentName = intentName
+        }
+        trace.transitionLabel = transitionLabel
+        if let summary {
+            trace.summary = summary
+        }
+        if !state.isActive {
+            trace.finishedAt = Date()
+        }
+        currentExecutionTrace = trace
+    }
+
+    @MainActor
+    private func completeExecutionTrace(summary: String) {
+        updateExecutionTrace(state: .completed, summary: summary)
+        scheduleExecutionTraceDismiss(after: 1.6)
+    }
+
+    @MainActor
+    private func failExecutionTrace(summary: String) {
+        updateExecutionTrace(state: .failed, summary: summary)
+        scheduleExecutionTraceDismiss(after: 4)
+    }
+
+    @MainActor
+    private func clearExecutionTrace() {
+        traceDismissTask?.cancel()
+        traceDismissTask = nil
+        currentExecutionTrace = nil
+    }
+
+    @MainActor
+    private func scheduleExecutionTraceDismiss(after delay: TimeInterval) {
+        guard let traceID = currentExecutionTrace?.id else { return }
+        traceDismissTask?.cancel()
+        traceDismissTask = Task { @MainActor [weak self] in
+            let duration = UInt64(max(delay, 0) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: duration)
+            guard let self, self.currentExecutionTrace?.id == traceID else { return }
+            self.currentExecutionTrace = nil
+            self.traceDismissTask = nil
+        }
+    }
+    
+    // MARK: - 辅助方法
+    
+    @MainActor
+    private func ensureScreenRecordingAccessForScreenshot() -> Bool {
+        if #available(macOS 10.15, *) {
+            guard !isRestartingForScreenRecordingPermission else { return false }
+
+            if CGPreflightScreenCaptureAccess() {
+                isWaitingForScreenRecordingAuthorization = false
+                return true
+            }
+
+            isWaitingForScreenRecordingAuthorization = true
+            appendSystemMessage(
+                """
+                为了截图，我需要先获得 macOS 的“屏幕与系统音频录制”权限。
+
+                我会打开系统设置。你授权后回到当前这个开发版应用，我会重新打开现在这份源码版实例，不会再跳到旧版 App。
+                """
+            )
+
+            let granted = CGRequestScreenCaptureAccess()
+            if granted {
+                appendSystemMessage("已经检测到截图权限可用，正在重新打开当前源码版应用以让权限生效。")
+                restartCurrentAppForScreenRecordingPermission()
+            } else if let settingsURL = screenRecordingSettingsURL {
+                NSWorkspace.shared.open(settingsURL)
+            }
+
+            return false
+        }
+
+        return true
+    }
+
+    @MainActor
+    private func resumePendingScreenRecordingFlowIfNeeded() {
+        guard isWaitingForScreenRecordingAuthorization, !isRestartingForScreenRecordingPermission else {
+            return
+        }
+
+        if #available(macOS 10.15, *), CGPreflightScreenCaptureAccess() {
+            isWaitingForScreenRecordingAuthorization = false
+            appendSystemMessage("已检测到你刚刚授予了截图权限，正在重新打开当前源码版应用。")
+            restartCurrentAppForScreenRecordingPermission()
+        }
+    }
+
+    @MainActor
+    private func resumePendingKimiCLILoginFlowIfNeeded() async {
+        guard isWaitingForKimiCLILogin,
+              let agentID = pendingKimiCLILoginAgentID,
+              let agent = agentStore.agent(withId: agentID) else {
+            return
+        }
+
+        let status = await agentStore.validateLocalCodingRuntimeStatus()
+        guard status.isValid else {
+            return
+        }
+
+        isWaitingForKimiCLILogin = false
+        pendingKimiCLILoginAgentID = nil
+
+        appendSystemMessage(
+            "✅ 已检测到 \(agent.displayName) 的 Kimi CLI 登录恢复成功。你现在可以继续提问了。"
+        )
+    }
+
+    @MainActor
+    private func restartCurrentAppForScreenRecordingPermission() {
+        guard !isRestartingForScreenRecordingPermission else { return }
+
+        let bundleURL = Bundle.main.bundleURL.standardizedFileURL
+        isRestartingForScreenRecordingPermission = true
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        configuration.createsNewApplicationInstance = true
+
+        NSWorkspace.shared.openApplication(at: bundleURL, configuration: configuration) { _, error in
+            DispatchQueue.main.async {
+                if let error {
+                    CommandRunner.shared.appendSystemMessage(
+                        "我已经拿到截图权限，但重新打开当前源码版应用时失败了：\(error.localizedDescription)"
+                    )
+                    CommandRunner.shared.fallbackRelaunchCurrentApp(at: bundleURL)
+                    return
+                }
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func fallbackRelaunchCurrentApp(at bundleURL: URL) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = ["-n", bundleURL.path]
+
+        do {
+            try task.run()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                NSApp.terminate(nil)
+            }
+        } catch {
+            isRestartingForScreenRecordingPermission = false
+            appendSystemMessage(
+                "截图权限已经准备好了，但我没能重新拉起当前源码版应用。你可以手动重新打开这份开发版 App。"
+            )
+        }
+    }
+
+    @MainActor
+    private func completeScreenshotFlow(with screenshotPath: String) {
+        lastScreenshotPath = screenshotPath
+
+        appendSystemMessage(
+            "📸 截图已保存: \(screenshotPath)",
+            images: [screenshotPath]
+        )
+
+        guard !agentStore.needsInitialSetup else {
+            presentInitialSetupPrompt(for: "分析截图")
+            return
+        }
+
+        if let currentAgent = orchestrator.currentAgent {
+            if currentAgent.supportsImageAnalysis {
+                Task {
+                    await processInput("分析这张截图", images: [screenshotPath])
+                }
+            } else {
+                handleVisionGap(screenshotPath: screenshotPath)
+            }
+        } else {
+            handleVisionGap(screenshotPath: screenshotPath)
+        }
+    }
+
+    @MainActor
+    private func appendSystemMessage(_ content: String, images: [String] = []) {
+        let systemMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: content,
+            timestamp: Date(),
+            images: images
+        )
+        messages.append(systemMessage)
+    }
+
+    /// 保存截图到桌面
+    private func saveScreenshotToDesktop() -> String? {
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd-HH-mm-ss"
+        let filename = "screenshot-\(dateFormatter.string(from: Date())).png"
+        
+        let desktopPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Desktop")
+            .appendingPathComponent(filename)
+        
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        task.arguments = ["-i", "-x", desktopPath.path]
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard task.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: desktopPath.path) else {
+            return nil
+        }
+
+        return desktopPath.path
+    }
+    
+    /// 旧方法：通过通知显示能力缺口（保留弹窗选项）
+    private func handleCapabilityGap(_ gap: CapabilityGap) {
+        // 仍然发送通知，让 UI 层决定是否显示弹窗
+        NotificationCenter.default.post(
+            name: NSNotification.Name("ShowCapabilityWizard"),
+            object: gap
+        )
+    }
+    
+    /// 清除对话历史
+    func clearMessages() {
+        messages.removeAll()
+    }
+
+    func loadHistory() {
+        messages = StorageManager.shared.getRecentMessages(limit: 50)
+    }
+
+    func clearHistory() {
+        messages.removeAll()
+        StorageManager.shared.clearHistory()
+    }
+
+    func screenshotAndAsk() {
+        handleScreenshot()
+    }
+
+    func clipboardAndAsk() {
+        let text = NSPasteboard.general.string(forType: .string) ?? ""
+        guard !text.isEmpty else { return }
+        Task {
+            await processInput(text)
+        }
+    }
+
+    func showInitialSetupGuidance(for action: String? = nil) {
+        if Thread.isMainThread {
+            presentInitialSetupPrompt(for: action)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.presentInitialSetupPrompt(for: action)
+            }
+        }
+    }
+
+    private func presentInitialSetupPrompt(for action: String? = nil) {
+        let actionText = action ?? "使用 OpenClaw"
+        let content = """
+        ⚙️ 当前还没有可用的 LLM 或 CLI Agent
+
+        在首次使用前，请先完成一次模型配置，然后再继续\(actionText)。
+        你可以先配置本地 Kimi CLI，或者添加其他需要 API Key 的 Agent。
+        """
+
+        let isDuplicatePrompt = messages.last?.metadata?[initialSetupPromptKey] == "true"
+        if !isDuplicatePrompt {
+            let promptMessage = ChatMessage(
+                id: UUID(),
+                role: .system,
+                content: content,
+                timestamp: Date(),
+                metadata: [initialSetupPromptKey: "true"]
+            )
+            messages.append(promptMessage)
+        }
+
+        NotificationCenter.default.post(
+            name: NSNotification.Name("ShowInitialSetupWizard"),
+            object: nil
+        )
+    }
+}
+
+// 注意: ChatMessage 定义在 ChatModels.swift 中共享使用

@@ -1,0 +1,14 @@
+.DS_Store
+
+# Python
+backend/__pycache__/
+*.pyc
+
+# Build outputs and logs
+build/
+mac-app/.build/
+mac-app/MacAssistant/.build/
+mac-app/MacAssistant/build/
+
+# Local runtime artifacts
+*.log

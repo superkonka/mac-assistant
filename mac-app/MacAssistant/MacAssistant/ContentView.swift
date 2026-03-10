@@ -1,28 +1,31 @@
 //
 //  ContentView.swift
-//  主界面 - 集成语音输入
+//  Agent 版 - 直接调用 Kimi CLI + Skill 系统
 //
 
 import SwiftUI
 
 struct ContentView: View {
-    @EnvironmentObject var backend: BackendService
-    @StateObject private var speechRecognizer = SpeechRecognizer()
-    
-    @State private var messageText = ""
-    @State private var scrollProxy: ScrollViewProxy? = nil
-    @State private var showRecordingPanel = false
+    @EnvironmentObject var runner: CommandRunner
+    @EnvironmentObject var autoAgent: AutoAgent
+    @StateObject private var orchestrator = AgentOrchestrator.shared
+    @StateObject private var agentStore = AgentStore.shared
+    @State private var inputText = ""
     @FocusState private var isInputFocused: Bool
+    
+    // Agent 系统相关状态
+    @State private var showingAgentList = false
+    @State private var showingWizard = false
+    @State private var currentGap: CapabilityGap?
+    @State private var showingGapAlert = false
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部工具栏（带连接状态）
-            toolbar
+            // Agent 切换栏
+            agentBar
             
-            // 连接状态警告
-            if let error = backend.connectionError, !backend.isConnected {
-                connectionAlert(error)
-            }
+            // CLI 进度走马灯（吸顶）
+            CLIMarqueeView()
             
             Divider()
             
@@ -31,406 +34,394 @@ struct ContentView: View {
             
             Divider()
             
-            // 录音状态面板
-            if showRecordingPanel {
-                RecordingIndicator(
-                    transcript: speechRecognizer.transcript,
-                    onCancel: {
-                        speechRecognizer.stopRecording()
-                        showRecordingPanel = false
-                    },
-                    onConfirm: {
-                        speechRecognizer.stopRecording()
-                        if !speechRecognizer.transcript.isEmpty {
-                            messageText = speechRecognizer.transcript
-                            sendMessage()
-                        }
-                        showRecordingPanel = false
-                    }
-                )
-                .padding(.horizontal)
-                .padding(.bottom, 8)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-            
             // 输入区域
             inputArea
         }
-        .frame(width: 400, height: 600)
+        .frame(width: 500, height: 700)
         .onAppear {
-            backend.loadHistory()
+            runner.loadHistory()
             isInputFocused = true
-            
-            // 设置语音识别回调
-            speechRecognizer.onResult = { text in
-                messageText = text
-            }
         }
-        .onChange(of: speechRecognizer.isRecording) { isRecording in
-            withAnimation {
-                showRecordingPanel = isRecording
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("ShowCapabilityDiscovery"))) { notification in
+            if let gap = notification.object as? CapabilityGap {
+                currentGap = gap
+                showingWizard = true
             }
         }
     }
     
-    // MARK: - Toolbar
+    // MARK: - Agent 切换栏
     
-    var toolbar: some View {
+    var agentBar: some View {
         HStack(spacing: 12) {
-            // 连接状态指示器
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(backend.isConnected ? Color.green : Color.red)
-                    .frame(width: 8, height: 8)
-                
-                Text(backend.isConnected ? "已连接" : "未连接")
-                    .font(.caption)
-                    .foregroundColor(backend.isConnected ? .green : .red)
-            }
-            
-            Spacer()
-            
-            // 快捷操作按钮
-            Button(action: { backend.takeScreenshot() }) {
-                Image(systemName: "camera")
-                    .foregroundColor(backend.isConnected ? .primary : .gray)
-            }
-            .buttonStyle(PlainButtonStyle())
-            .disabled(!backend.isConnected)
-            .help("截图")
-            
-            Button(action: { backend.clearHistory() }) {
-                Image(systemName: "trash")
-                    .foregroundColor(.secondary)
-            }
-            .buttonStyle(PlainButtonStyle())
-            .help("清空历史")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(Color(NSColor.windowBackgroundColor))
-    }
-    
-    // MARK: - 连接状态警告
-    
-    func connectionAlert(_ error: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
-            
-            Text(error)
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(2)
-            
-            Spacer()
-            
-            Button("重试") {
-                Task {
-                    _ = await backend.checkHealth()
+            // 当前 Agent 信息
+            if let currentAgent = orchestrator.currentAgent {
+                HStack(spacing: 6) {
+                    Text(currentAgent.emoji)
+                    
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(currentAgent.name)
+                            .font(.system(size: 12, weight: .medium))
+                        Text(currentAgent.provider.displayName)
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(6)
+                .onTapGesture {
+                    showingAgentList = true
+                }
+            }
+            
+            Spacer()
+            
+            // 添加 Agent 按钮
+            Button(action: { showingAgentList = true }) {
+                Image(systemName: "plus")
+                    .font(.system(size: 10, weight: .medium))
+                    .frame(width: 20, height: 20)
+                    .background(Color.gray.opacity(0.2))
+                    .cornerRadius(4)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help("管理 Agents")
+            
+            Button("清空") {
+                runner.clearHistory()
             }
             .font(.caption)
             .buttonStyle(LinkButtonStyle())
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color.orange.opacity(0.1))
+        .background(Color(NSColor.controlBackgroundColor))
+        .sheet(isPresented: $showingAgentList) {
+            AgentListView()
+        }
+        .sheet(isPresented: $showingWizard) {
+            AgentConfigurationWizard(gap: currentGap) { newAgent in
+                orchestrator.switchToAgent(newAgent)
+            }
+        }
     }
     
-    // MARK: - Messages List
+    // MARK: - 分析面板
+    
+    var analysisPanel: some View {
+        VStack(spacing: 8) {
+            // 待处理通知
+            ForEach(autoAgent.pendingNotifications.prefix(3)) { notification in
+                NotificationBanner(notification: notification)
+            }
+            
+            // 最新分析结果
+            if let analysis = autoAgent.lastAnalysis {
+                AnalysisCard(analysis: analysis)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+    
+    // MARK: - 消息列表
     
     var messagesList: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    // 欢迎消息
-                    if backend.messages.isEmpty {
-                        welcomeView
-                    }
-                    
-                    ForEach(backend.messages) { message in
+                    ForEach(runner.messages) { message in
                         MessageBubble(message: message)
                             .id(message.id)
                     }
                     
-                    if backend.isLoading {
-                        LoadingIndicator()
+                    if runner.isLoading {
+                        LoadingView()
                             .id("loading")
                     }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding()
             }
-            .onChange(of: backend.messages.count) { _ in
-                scrollToBottom(proxy: proxy)
-            }
-            .onAppear {
-                self.scrollProxy = proxy
+            .onChange(of: runner.messages.count) { _ in
                 scrollToBottom(proxy: proxy)
             }
         }
     }
     
     func scrollToBottom(proxy: ScrollViewProxy) {
-        if let lastId = backend.messages.last?.id {
+        if let lastId = runner.messages.last?.id {
             withAnimation(.easeOut(duration: 0.2)) {
                 proxy.scrollTo(lastId, anchor: .bottom)
             }
         }
     }
     
-    // MARK: - Welcome View
-    
-    var welcomeView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "bubble.left.and.bubble.right.fill")
-                .font(.system(size: 48))
-                .foregroundColor(.blue.opacity(0.6))
-            
-            Text("Mac Assistant")
-                .font(.title2)
-                .bold()
-            
-            VStack(spacing: 8) {
-                Text("快捷键")
-                    .font(.headline)
-                    .foregroundColor(.secondary)
-                
-                HStack(spacing: 16) {
-                    ShortcutBadge(key: "⌘⇧Space", desc: "打开")
-                    ShortcutBadge(key: "⌘⇧1", desc: "截图")
-                    ShortcutBadge(key: "⌘⇧V", desc: "剪贴板")
-                }
-                
-                Text("🎙️ 点击麦克风按钮使用语音输入")
-                    .font(.callout)
-                    .foregroundColor(.blue)
-                    .padding(.top, 8)
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: 300)
-        .padding()
-    }
-    
-    // MARK: - Input Area
+    // MARK: - 输入区域
     
     var inputArea: some View {
         VStack(spacing: 8) {
-            // 快捷指令栏
             HStack(spacing: 8) {
-                QuickActionButton(icon: "scissors", text: "解释代码") {
-                    insertQuickCommand("解释这段代码：")
-                }
+                TextField("输入消息或命令...", text: $inputText)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .focused($isInputFocused)
+                    .onSubmit { send() }
                 
-                QuickActionButton(icon: "doc.text", text: "总结") {
-                    insertQuickCommand("总结以下内容：")
+                Button(action: send) {
+                    Image(systemName: runner.isLoading ? "hourglass" : "arrow.up.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(canSend ? .blue : .gray)
                 }
-                
-                QuickActionButton(icon: "character.cursor.ibeam", text: "润色") {
-                    insertQuickCommand("润色这段文字：")
-                }
-                
-                QuickActionButton(icon: "globe", text: "翻译") {
-                    insertQuickCommand("翻译成中文：")
-                }
+                .disabled(!canSend)
+                .buttonStyle(PlainButtonStyle())
             }
             
-            // 输入框 + 语音按钮
-            HStack(spacing: 8) {
-                TextEditor(text: $messageText)
-                    .font(.body)
-                    .frame(height: 60)
-                    .focused($isInputFocused)
-                    .overlay(
-                        Group {
-                            if messageText.isEmpty && !showRecordingPanel {
-                                Text("输入消息或点击麦克风...")
-                                    .foregroundColor(.gray)
-                                    .padding(.leading, 5)
-                                    .allowsHitTesting(false)
-                            }
-                        },
-                        alignment: .leading
-                    )
-                
-                VStack(spacing: 8) {
-                    // 语音输入按钮
-                    VoiceInputButton(speechRecognizer: speechRecognizer) { text in
-                        messageText = text
-                        // 自动发送
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            if !messageText.isEmpty {
-                                sendMessage()
-                            }
-                        }
-                    }
-                    
-                    // 发送按钮
-                    Button(action: sendMessage) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                            .foregroundColor(canSend ? .blue : .gray)
-                    }
-                    .disabled(!canSend)
-                    .buttonStyle(PlainButtonStyle())
-                    
-                    // 截图按钮
-                    Button(action: { backend.takeScreenshotAndAsk() }) {
-                        Image(systemName: "camera.fill")
-                            .font(.caption)
-                            .foregroundColor(backend.isConnected ? .primary : .gray)
-                    }
-                    .disabled(!backend.isConnected)
-                    .buttonStyle(PlainButtonStyle())
-                }
+            HStack(spacing: 10) {
+                QuickButton(icon: "camera", text: "截图") { inputText = "/截图"; send() }
+                QuickButton(icon: "doc.on.clipboard", text: "剪贴板") { inputText = "/剪贴板"; send() }
+                QuickButton(icon: "magnifyingglass", text: "搜索") { inputText = "/搜索 "; isInputFocused = true }
+                QuickButton(icon: "brain.head.profile", text: "分析") { inputText = "/分析"; send() }
+                QuickButton(icon: "questionmark.circle", text: "帮助") { inputText = "/帮助"; send() }
             }
         }
-        .padding(12)
+        .padding()
         .background(Color(NSColor.controlBackgroundColor))
     }
     
     var canSend: Bool {
-        !messageText.isEmpty && backend.isConnected && !backend.isLoading && !speechRecognizer.isRecording
+        !inputText.isEmpty && !runner.isLoading && !orchestrator.isAnalyzing
     }
     
-    func sendMessage() {
+    func send() {
         guard canSend else { return }
-        let text = messageText
-        messageText = ""
+        let text = inputText
+        inputText = ""
         isInputFocused = true
         
+        // 使用 AgentOrchestrator 处理
         Task {
-            await backend.sendMessage(text)
-        }
-    }
-    
-    func insertQuickCommand(_ command: String) {
-        messageText = command
-        isInputFocused = true
-    }
-}
-
-// MARK: - Shortcut Badge
-
-struct ShortcutBadge: View {
-    let key: String
-    let desc: String
-    
-    var body: some View {
-        VStack(spacing: 4) {
-            Text(key)
-                .font(.system(.caption, design: .monospaced))
-                .fontWeight(.semibold)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.gray.opacity(0.15))
-                .cornerRadius(6)
+            let result = await orchestrator.processInput(text)
             
-            Text(desc)
-                .font(.caption2)
-                .foregroundColor(.secondary)
-        }
-    }
-}
-
-// MARK: - Message Bubble (保持不变)
-
-struct MessageBubble: View {
-    let message: ChatMessage
-    
-    var body: some View {
-        HStack {
-            if message.role == .user {
-                Spacer()
-            }
-            
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 2) {
-                Text(message.content)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(
-                        message.role == .user 
-                            ? Color.blue.opacity(0.15)
-                            : Color.gray.opacity(0.15)
+            await MainActor.run {
+                switch result {
+                case .success(let agent, let intent):
+                    // 正常处理，Agent 已切换
+                    LogInfo("✅ 使用 \(agent.name) 处理 \(intent.displayName) 请求")
+                    runner.sendMessage(text)
+                    
+                case .needConfiguration(let gap):
+                    // 需要配置新 Agent
+                    currentGap = gap
+                    showingGapAlert = true
+                    
+                case .needSelection(let agents, let intent):
+                    // 多个 Agent 可选，使用第一个
+                    if let first = agents.first {
+                        orchestrator.switchToAgent(first)
+                        runner.sendMessage(text)
+                    }
+                    
+                case .failed(let error):
+                    // 处理失败
+                    let errorMsg = ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: "❌ \(error)",
+                        timestamp: Date()
                     )
-                    .foregroundColor(.primary)
-                    .cornerRadius(12)
-                
-                if let timestamp = message.timestamp {
-                    Text(formatTime(timestamp))
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
+                    runner.messages.append(errorMsg)
                 }
             }
-            
-            if message.role == .assistant {
-                Spacer()
-            }
         }
-    }
-    
-    func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
     }
 }
 
-// MARK: - Loading Indicator (保持不变)
+// MARK: - 能力缺口提示
 
-struct LoadingIndicator: View {
-    @State private var isAnimating = false
+struct CapabilityGapAlert: View {
+    let gap: CapabilityGap
+    @Binding var isPresented: Bool
+    let onConfigure: () -> Void
     
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "lightbulb.fill")
+                .font(.system(size: 40))
+                .foregroundColor(.yellow)
+            
+            Text("需要 \(gap.missingCapability.displayName) 能力")
+                .font(.headline)
+            
+            Text(gap.solutionDescription)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            
+            HStack(spacing: 12) {
+                Button("跳过") {
+                    isPresented = false
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                
+                Button("配置 Agent") {
+                    onConfigure()
+                    isPresented = false
+                }
+                .buttonStyle(PrimaryButtonStyle())
+            }
+        }
+        .padding(24)
+        .frame(width: 350)
+    }
+}
+
+// MARK: - 通知横幅
+
+struct NotificationBanner: View {
+    let notification: AgentNotification
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .foregroundColor(iconColor)
+            
+            VStack(alignment: .leading, spacing: 2) {
+                Text(notification.title)
+                    .font(.system(size: 12, weight: .medium))
+                Text(notification.message)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+            }
+            
+            Spacer()
+            
+            if let action = notification.action {
+                Button(action: action) {}
+                .font(.caption)
+                .buttonStyle(BorderedButtonStyle())
+            }
+        }
+        .padding(8)
+        .background(backgroundColor.opacity(0.1))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(backgroundColor.opacity(0.3), lineWidth: 1)
+        )
+    }
+    
+    var iconName: String {
+        switch notification.type {
+        case .info: return "info.circle"
+        case .warning: return "exclamationmark.triangle"
+        case .action: return "bolt.fill"
+        case .suggestion: return "lightbulb"
+        case .alert: return "exclamationmark.octagon"
+        case .systemAlert: return "exclamationmark.octagon.fill"
+        case .insight: return "magnifyingglass"
+        case .reminder: return "clock"
+        case .automation: return "gearshape.2"
+        @unknown default: return "questionmark.circle"
+        }
+    }
+    
+    var iconColor: Color {
+        switch notification.type {
+        case .info: return .blue
+        case .warning: return .orange
+        case .action: return .purple
+        case .suggestion: return .green
+        case .alert: return .red
+        case .systemAlert: return .red
+        case .insight: return .cyan
+        case .reminder: return .yellow
+        case .automation: return .indigo
+        @unknown default: return .gray
+        }
+    }
+    
+    var backgroundColor: Color {
+        iconColor
+    }
+}
+
+// MARK: - 分析卡片
+
+struct AnalysisCard: View {
+    let analysis: AnalysisResult
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("环境分析", systemImage: "brain")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                Text("置信度: \(Int(analysis.confidence * 100))%")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            
+            if !analysis.findings.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(analysis.findings.prefix(2), id: \.content) { finding in
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(finding.source == .openclaw ? Color.blue : Color.green)
+                                .frame(width: 4, height: 4)
+                            Text(finding.content)
+                                .font(.caption)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.gray.opacity(0.1))
+        .cornerRadius(8)
+    }
+}
+
+// MARK: - 其他组件
+
+struct LoadingView: View {
+    @State private var isAnimating = false
     var body: some View {
         HStack {
             Spacer()
             HStack(spacing: 4) {
                 ForEach(0..<3) { i in
-                    Circle()
-                        .fill(Color.gray)
-                        .frame(width: 6, height: 6)
-                        .opacity(isAnimating ? 1 : 0.3)
-                        .animation(
-                            Animation.easeInOut(duration: 0.5)
-                                .repeatForever()
-                                .delay(Double(i) * 0.15),
-                            value: isAnimating
-                        )
+                    Circle().fill(Color.gray).frame(width: 6, height: 6)
+                        .scaleEffect(isAnimating ? 1.2 : 0.8)
+                        .opacity(isAnimating ? 1 : 0.5)
+                        .animation(.easeInOut(duration: 0.5).repeatForever().delay(Double(i) * 0.15), value: isAnimating)
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color.gray.opacity(0.1))
-            .cornerRadius(12)
+            .padding(8)
             Spacer()
         }
-        .onAppear {
-            isAnimating = true
-        }
+        .onAppear { isAnimating = true }
     }
 }
 
-// MARK: - Quick Action Button (保持不变)
-
-struct QuickActionButton: View {
+struct QuickButton: View {
     let icon: String
     let text: String
     let action: () -> Void
-    
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.caption)
-                Text(text)
-                    .font(.caption)
+            VStack(spacing: 2) {
+                Image(systemName: icon).font(.system(size: 14))
+                Text(text).font(.caption2)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.blue.opacity(0.1))
-            .foregroundColor(.blue)
-            .cornerRadius(6)
+            .foregroundColor(.secondary)
+            .frame(width: 45)
         }
         .buttonStyle(PlainButtonStyle())
     }
