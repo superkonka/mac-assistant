@@ -130,7 +130,7 @@ struct ChatView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(AppColors.controlBackground)
     }
     
     private var messageList: some View {
@@ -223,7 +223,7 @@ struct ChatView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
-        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+        .background(AppColors.controlBackground.opacity(0.5))
     }
     
     // MARK: - 动作
@@ -358,7 +358,7 @@ struct InitialSetupCard: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(AppColors.controlBackground)
         .cornerRadius(12)
     }
 }
@@ -385,7 +385,7 @@ struct TypingIndicator: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(Color(NSColor.controlBackgroundColor))
+            .background(AppColors.controlBackground)
             .cornerRadius(12)
         }
         .onAppear {

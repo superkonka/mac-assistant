@@ -46,7 +46,7 @@ struct SkillsListView: View {
             }
         }
         .frame(width: 760, height: 540)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(AppColors.controlBackground)
         .task {
             guard !hasLoadedMarketplace else { return }
             hasLoadedMarketplace = true
@@ -635,7 +635,7 @@ private struct AISkillCard: View {
         .frame(height: 120)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(isHovered ? Color.blue.opacity(0.05) : Color(NSColor.controlBackgroundColor))
+                .fill(isHovered ? Color.blue.opacity(0.05) : AppColors.controlBackground)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12)

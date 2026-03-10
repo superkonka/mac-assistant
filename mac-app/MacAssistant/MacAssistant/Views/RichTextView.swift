@@ -323,7 +323,7 @@ private struct TableCellView: View, Equatable {
             return Color.green.opacity(0.08)
         case let .body(rowIndex):
             return rowIndex.isMultiple(of: 2)
-                ? Color(NSColor.textBackgroundColor)
+                ? AppColors.inputBackground
                 : Color.gray.opacity(0.04)
         }
     }

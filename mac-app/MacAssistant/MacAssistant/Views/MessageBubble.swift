@@ -171,9 +171,9 @@ struct MessageBubble: View, Equatable {
     
     private var bubbleBackground: Color {
         if message.role == .user {
-            return Color.blue.opacity(0.08)
+            return AppColors.userMessageBackground
         } else {
-            return Color(NSColor.controlBackgroundColor)
+            return AppColors.assistantMessageBackground
         }
     }
     

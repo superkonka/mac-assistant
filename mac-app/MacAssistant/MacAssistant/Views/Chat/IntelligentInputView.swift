@@ -9,6 +9,9 @@ import SwiftUI
 import Combine
 import AppKit
 
+// 导入颜色管理
+@_exported import struct SwiftUI.Color
+
 struct IntelligentInputView: View {
     @Binding var text: String
     @StateObject private var intelligence = ConversationIntelligence.shared
@@ -69,8 +72,7 @@ struct IntelligentInputView: View {
                     onSend: onSend
                 )
                     .frame(height: min(max(36, textHeight), 120))
-                    .background(Color(NSColor.textBackgroundColor))
-                    .cornerRadius(8)
+                    .inputFieldStyle(isFocused: isFocused)
                     .onChange(of: text) { newValue in
                         handleTextChange(newValue)
                     }
@@ -79,7 +81,7 @@ struct IntelligentInputView: View {
                 if text.isEmpty {
                     Text("输入 @ 选择 Agent，/ 使用 Skill...")
                         .font(.system(size: 14))
-                        .foregroundColor(.secondary)
+                        .foregroundColor(AppColors.inputPlaceholder)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 12)
                         .allowsHitTesting(false)
@@ -234,7 +236,7 @@ struct ChatInputTextView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.textContainerInset = NSSize(width: 8, height: 10)
-        textView.textColor = .labelColor
+        textView.textColor = NSColor.controlTextColor
 
         if let textContainer = textView.textContainer {
             textContainer.widthTracksTextView = true

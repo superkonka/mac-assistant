@@ -24,7 +24,7 @@ struct CLIMarqueeView: View {
                 }
             }
         }
-        .background(Color(NSColor.textBackgroundColor))
+        .background(AppColors.inputBackground)
         .cornerRadius(6)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
@@ -77,7 +77,7 @@ struct CLIMarqueeView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(Color(NSColor.controlBackgroundColor))
+        .background(AppColors.controlBackground)
     }
     
     // MARK: - 收起模式：简单进度条
