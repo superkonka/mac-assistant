@@ -65,12 +65,11 @@ struct IntelligentInputView: View {
             }
             
             // 智能输入框
-            ZStack(alignment: .topLeading) {
+            ZStack(alignment: .leading) {
                 TextEditor(text: $text)
                     .font(.system(size: 14))
                     .foregroundColor(.black)
-                    .frame(minHeight: 36, maxHeight: 120)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(height: 36)
                     .scrollContentBackground(.hidden)
                     .background(Color.white)
                     .cornerRadius(8)
@@ -84,7 +83,8 @@ struct IntelligentInputView: View {
                     .onChange(of: text) { newValue in
                         handleTextChange(newValue)
                     }
-                    .padding(.vertical, 0)
+                    // 垂直居中对齐
+                    .multilineTextAlignment(.leading)
                 
                 // 提示文字（当输入框为空时）
                 if text.isEmpty {
@@ -92,7 +92,6 @@ struct IntelligentInputView: View {
                         .font(.system(size: 14))
                         .foregroundColor(AppColors.inputPlaceholder)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
                         .allowsHitTesting(false)
                 }
             }
