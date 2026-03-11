@@ -12,14 +12,14 @@ enum AppColors {
     
     // MARK: - 输入框颜色
     
-    /// 输入框背景色 - 使用明确的系统颜色
+    /// 输入框背景色 - 固定白色，不随系统变化
     static var inputBackground: Color {
-        Color(NSColor.textBackgroundColor)
+        Color.white
     }
     
-    /// 输入框文字颜色
+    /// 输入框文字颜色 - 固定黑色，不随系统变化
     static var inputText: Color {
-        Color(NSColor.textColor)
+        Color.black
     }
     
     /// 输入框占位符颜色
