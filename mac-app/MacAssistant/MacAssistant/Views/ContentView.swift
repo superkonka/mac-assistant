@@ -21,6 +21,9 @@ struct ContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
+            // 测试条 - 如果能看到说明应用已更新
+            Color.red.frame(height: 20)
+            
             // Agent 切换栏
             agentBar
             
