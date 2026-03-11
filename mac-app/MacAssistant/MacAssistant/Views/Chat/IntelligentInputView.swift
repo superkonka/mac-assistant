@@ -66,16 +66,25 @@ struct IntelligentInputView: View {
             
             // 智能输入框
             ZStack(alignment: .topLeading) {
-                ChatInputTextView(
-                    text: $text,
-                    isFocused: $isFocused,
-                    onSend: onSend
-                )
-                    .frame(height: min(max(36, textHeight), 120))
-                    .inputFieldStyle(isFocused: isFocused)
+                TextEditor(text: $text)
+                    .font(.system(size: 14))
+                    .foregroundColor(.black)
+                    .frame(minHeight: 36, maxHeight: 120)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .scrollContentBackground(.hidden)
+                    .background(Color.white)
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(
+                                isFocused ? AppColors.inputBorderFocused : AppColors.inputBorder,
+                                lineWidth: isFocused ? 1.5 : 1
+                            )
+                    )
                     .onChange(of: text) { newValue in
                         handleTextChange(newValue)
                     }
+                    .padding(.vertical, 0)
                 
                 // 提示文字（当输入框为空时）
                 if text.isEmpty {
@@ -83,7 +92,7 @@ struct IntelligentInputView: View {
                         .font(.system(size: 14))
                         .foregroundColor(AppColors.inputPlaceholder)
                         .padding(.horizontal, 12)
-                        .padding(.vertical, 12)
+                        .padding(.vertical, 10)
                         .allowsHitTesting(false)
                 }
             }
@@ -228,7 +237,8 @@ struct ChatInputTextView: NSViewRepresentable {
             onSend(textView?.string ?? text)
         }
         textView.font = .systemFont(ofSize: 14)
-        textView.drawsBackground = false
+        textView.drawsBackground = true
+        textView.backgroundColor = NSColor.white
         textView.isRichText = false
         textView.importsGraphics = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
@@ -237,6 +247,7 @@ struct ChatInputTextView: NSViewRepresentable {
         textView.isContinuousSpellCheckingEnabled = false
         textView.textContainerInset = NSSize(width: 8, height: 10)
         textView.textColor = NSColor.black
+        textView.insertionPointColor = NSColor.black
 
         if let textContainer = textView.textContainer {
             textContainer.widthTracksTextView = true
