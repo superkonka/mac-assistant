@@ -13,6 +13,19 @@ class OpenClawGatewayRuntimeManager {
         let modelRefsByAgentID: [String: String]
         let primaryModelRef: String?
     }
+
+    struct GatewayInspection: Sendable {
+        let executablePath: String?
+        let profileDirectory: URL
+        let configPath: URL
+        let workspaceDirectory: URL
+        let logPath: URL
+        let processRunning: Bool
+        let configExists: Bool
+        let healthCheckSucceeded: Bool
+        let healthCheckOutput: String
+        let readinessDescription: String
+    }
     
     /// Gateway 准备状态
     enum GatewayReadiness {
@@ -143,6 +156,82 @@ class OpenClawGatewayRuntimeManager {
 
     func managedSkillsDirectory() -> URL {
         self.workspaceDirectory().appendingPathComponent("skills", isDirectory: true)
+    }
+
+    func currentExecutablePath() -> String? {
+        self.openclawExecutablePath
+    }
+
+    func stopGateway() async throws {
+        try await self.stopGatewayIfNeeded()
+    }
+
+    func resetRuntimeState(preserveWorkspace: Bool = true) async throws {
+        try await self.stopGatewayIfNeeded()
+
+        let fileManager = FileManager.default
+        let profileDirectory = self.profileDirectory()
+
+        if fileManager.fileExists(atPath: profileDirectory.path) {
+            if preserveWorkspace {
+                let entries = try fileManager.contentsOfDirectory(
+                    at: profileDirectory,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                )
+                for entry in entries where entry.lastPathComponent != "workspace" {
+                    try? fileManager.removeItem(at: entry)
+                }
+            } else {
+                try fileManager.removeItem(at: profileDirectory)
+            }
+        }
+
+        self.configFingerprint = nil
+        self.lastGatewayHealthCheckAt = .distantPast
+        self.lastGatewayHealthWasOK = false
+        self.readiness = .notStarted
+    }
+
+    func inspectGatewayState(preferredExecutablePath: String? = nil) async -> GatewayInspection {
+        let executablePath = preferredExecutablePath ?? self.openclawExecutablePath ?? self.resolveExecutable(named: "openclaw")
+        let profileDirectory = self.profileDirectory()
+        let configPath = self.configPath()
+        let workspaceDirectory = self.workspaceDirectory()
+        let logPath = self.gatewayLogPath()
+        let processRunning = self.gatewayProcess?.isRunning ?? false
+        let environment = self.processEnvironment()
+        let profileName = self.profileName
+        let readinessDescription = self.readinessDescription()
+
+        return await Task.detached(priority: .utility) {
+            let fileManager = FileManager.default
+            let configExists = fileManager.fileExists(atPath: configPath.path)
+            let result = Self.executeOpenClaw(
+                arguments: [
+                    "--profile", profileName,
+                    "gateway",
+                    "call",
+                    "health",
+                    "--json",
+                ],
+                executablePath: executablePath,
+                environment: environment
+            )
+
+            return GatewayInspection(
+                executablePath: executablePath,
+                profileDirectory: profileDirectory,
+                configPath: configPath,
+                workspaceDirectory: workspaceDirectory,
+                logPath: logPath,
+                processRunning: processRunning,
+                configExists: configExists,
+                healthCheckSucceeded: result.status == 0,
+                healthCheckOutput: result.output.trimmingCharacters(in: .whitespacesAndNewlines),
+                readinessDescription: readinessDescription
+            )
+        }.value
     }
 
     private struct ManagedConfigSnapshot {
@@ -388,16 +477,16 @@ class OpenClawGatewayRuntimeManager {
         }
     }
 
-    private func profileDirectory() -> URL {
+    func profileDirectory() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".openclaw-\(self.profileName)")
     }
 
-    private func configPath() -> URL {
+    func configPath() -> URL {
         self.profileDirectory().appendingPathComponent("openclaw.json")
     }
 
-    private func gatewayLogPath() -> URL {
+    func gatewayLogPath() -> URL {
         self.profileDirectory().appendingPathComponent("gateway.log")
     }
 
@@ -523,27 +612,51 @@ class OpenClawGatewayRuntimeManager {
 
     private func processEnvironment() -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
-        let localBin = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin").path
-        let defaultPath = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        environment["PATH"] = environment["PATH"].map { "\($0):\(defaultPath)" } ?? defaultPath
+        environment["PATH"] = dependencyManager.pathEnvironment()
         return environment
     }
 
     private func runOpenClaw(arguments: [String]) -> (status: Int32, output: String) {
+        Self.executeOpenClaw(
+            arguments: arguments,
+            executablePath: self.openclawExecutablePath ?? resolveExecutable(named: "openclaw"),
+            environment: self.processEnvironment()
+        )
+    }
+
+    private func readinessDescription() -> String {
+        switch self.readiness {
+        case .notStarted:
+            return "未启动"
+        case .installingDependencies:
+            return "安装依赖中"
+        case .starting:
+            return "启动中"
+        case .ready:
+            return "已就绪"
+        case .failed(let message):
+            return "失败: \(message)"
+        }
+    }
+
+    nonisolated private static func executeOpenClaw(
+        arguments: [String],
+        executablePath: String?,
+        environment: [String: String]
+    ) -> (status: Int32, output: String) {
         let process = Process()
-        
-        // 优先使用已安装的路径
-        let executablePath = self.openclawExecutablePath ?? resolveExecutable(named: "openclaw")
-        
-        if let path = executablePath, path.hasSuffix("/openclaw") {
+
+        if let path = executablePath,
+           path.hasSuffix("/openclaw"),
+           FileManager.default.isExecutableFile(atPath: path) {
             process.executableURL = URL(fileURLWithPath: path)
             process.arguments = arguments
         } else {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = ["openclaw"] + arguments
         }
-        
-        process.environment = self.processEnvironment()
+
+        process.environment = environment
 
         let pipe = Pipe()
         process.standardOutput = pipe

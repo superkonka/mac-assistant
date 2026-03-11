@@ -13,12 +13,14 @@ struct ChatView: View {
     @StateObject private var agentStore = AgentStore.shared
     @StateObject private var orchestrator = AgentOrchestrator.shared
     @StateObject private var intelligence = ConversationIntelligence.shared
+    @StateObject private var clawDoctor = OpenClawDoctor.shared
     
     @State private var inputText: String = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
     @State private var showAgentList: Bool = false
     @State private var showWizard: Bool = false
     @State private var showSkills: Bool = false
+    @State private var showClawDoctor: Bool = false
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
     @State private var lastStreamingScrollAt: Date = .distantPast
@@ -50,6 +52,7 @@ struct ChatView: View {
         .onAppear {
             setupNotifications()
             presentInitialSetupIfNeeded()
+            clawDoctor.startMonitoring()
         }
         .onChange(of: agentStore.usableAgents.count) { _ in
             presentInitialSetupIfNeeded()
@@ -85,6 +88,9 @@ struct ChatView: View {
             SkillsListView()
                 .frame(width: 760, height: 540)
         }
+        .popover(isPresented: $showClawDoctor, attachmentAnchor: .point(.top), arrowEdge: .top) {
+            OpenClawDoctorPanelView(doctor: clawDoctor)
+        }
     }
     
     // MARK: - 子视图
@@ -107,6 +113,10 @@ struct ChatView: View {
                 .cornerRadius(6)
             }
             .buttonStyle(PlainButtonStyle())
+
+            OpenClawStatusEntry(doctor: clawDoctor) {
+                showClawDoctor = true
+            }
             
             Spacer()
             
