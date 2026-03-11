@@ -306,13 +306,14 @@ final class OpenClawDoctor: ObservableObject {
         }
 
         if let issue = binary.issue {
+            let recommendation = binary.canInstallFromBundle
+                ? "可以先点“自动修复”；如果仍失败，再执行“重装 Claw”。"
+                : "当前安装包里的 OpenClaw 本体无效，不能迁移到应用管理版本；请更新安装包。"
             return Snapshot(
                 status: .needsRepair,
                 summary: "OpenClaw 可执行文件存在，但当前不可用。",
                 detail: "\(issue)\n应用会优先修复到受控运行时副本。\(detailSuffix)",
-                recommendation: binary.canInstallFromBundle
-                    ? "可以先点“自动修复”；如果仍失败，再执行“重装 Claw”。"
-                    : "当前没有 bundle 可重装，只能替换安装包。",
+                recommendation: recommendation,
                 sourceLabel: binary.source.displayName,
                 executablePath: binary.executablePath ?? binary.managedInstallPath,
                 version: binary.version,
@@ -369,13 +370,26 @@ final class OpenClawDoctor: ObservableObject {
 
         if gateway.healthCheckSucceeded {
             if binary.isExternalSource {
+                let bundleBlockedDetail = binary.bundledIssue.map {
+                    "应用内置 runtime 当前不可迁移：\($0)"
+                }
                 return Snapshot(
                     status: .externalHealthy,
-                    summary: "OpenClaw 当前可用，但运行在外部安装源上。",
-                    detail: "当前来源：\(binary.source.displayName)\n为了跨设备更稳定，建议迁移到应用自管运行时。\(detailSuffix)",
+                    summary: binary.canInstallFromBundle
+                        ? "OpenClaw 当前可用，但运行在外部安装源上。"
+                        : "OpenClaw 当前可用，但应用内置 runtime 无法接管，所以仍在使用外部安装。",
+                    detail: [
+                        "当前来源：\(binary.source.displayName)",
+                        binary.canInstallFromBundle
+                            ? "为了跨设备更稳定，建议迁移到应用自管运行时。"
+                            : bundleBlockedDetail ?? "当前安装包里的内置 runtime 无法通过校验，所以只能继续使用外部 Claw。",
+                        detailSuffix.isEmpty ? nil : detailSuffix.trimmingCharacters(in: .whitespacesAndNewlines)
+                    ]
+                    .compactMap { $0 }
+                    .joined(separator: "\n"),
                     recommendation: binary.canInstallFromBundle
                         ? "可选：点“重装 Claw”迁移到应用管理版本。"
-                        : "当前兼容模式可继续使用。",
+                        : "当前兼容模式可继续使用，但要修复安装包里的内置 runtime 才能迁移。",
                     sourceLabel: binary.source.displayName,
                     executablePath: binary.executablePath,
                     version: binary.version,
@@ -417,7 +431,7 @@ final class OpenClawDoctor: ObservableObject {
             detail: "\(processDescription)\n\(healthOutput)\(detailSuffix)",
             recommendation: binary.canInstallFromBundle
                 ? "先点“自动修复”；如果仍失败，再点“重装 Claw”。"
-                : "当前没有 bundle 可重装，只能先执行自动修复或替换安装包。",
+                : "先点“自动修复”；当前安装包里的内置 runtime 不可迁移，无法用重装切换到应用管理版本。",
             sourceLabel: binary.source.displayName,
             executablePath: binary.executablePath,
             version: binary.version,

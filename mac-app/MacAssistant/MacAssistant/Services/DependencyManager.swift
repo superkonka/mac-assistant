@@ -46,12 +46,14 @@ struct OpenClawBinaryInspection: Equatable {
     let version: String?
     let issue: String?
     let bundledPath: String?
+    let bundledVersion: String?
+    let bundledIssue: String?
     let managedInstallPath: String
     let legacyInstallPath: String
     let systemPath: String?
 
     var canInstallFromBundle: Bool {
-        bundledPath != nil
+        bundledPath != nil && bundledIssue == nil
     }
 
     var isUsable: Bool {
@@ -114,12 +116,19 @@ class DependencyManager: ObservableObject {
 
         var bundleInstallError: Error?
         if let bundledPath = bundledOpenClawPath() {
+            let bundledCandidate = await inspectCandidate(at: bundledPath, source: .bundledOnly)
             self.openclawStatus = .bundledAvailable
-            do {
-                return try await installFromBundle(bundledPath: bundledPath)
-            } catch {
-                bundleInstallError = error
-                LogError("安装 bundle 内 OpenClaw 失败，尝试外部回退", error: error)
+            if let bundledCandidate, bundledCandidate.isUsable {
+                do {
+                    return try await installFromBundle(bundledPath: bundledPath)
+                } catch {
+                    bundleInstallError = error
+                    LogError("安装 bundle 内 OpenClaw 失败，尝试外部回退", error: error)
+                }
+            } else {
+                let reason = bundledCandidate?.issue ?? "无法验证 bundle 内 OpenClaw"
+                bundleInstallError = DependencyError.installFailed("App Bundle 内置 OpenClaw 不可用: \(reason)")
+                LogError("bundle 内 OpenClaw 不可用，尝试外部回退: \(reason)")
             }
         }
 
@@ -160,6 +169,13 @@ class DependencyManager: ObservableObject {
         let systemPath = await findSystemOpenClaw()
         let managed = await inspectCandidate(at: managedInstallPath, source: .managedInstall)
 
+        let bundledInspection: OpenClawCandidateInspection?
+        if let bundledPath {
+            bundledInspection = await inspectCandidate(at: bundledPath, source: .bundledOnly)
+        } else {
+            bundledInspection = nil
+        }
+
         if let managed, managed.isUsable {
             return OpenClawBinaryInspection(
                 source: managed.source,
@@ -167,6 +183,8 @@ class DependencyManager: ObservableObject {
                 version: managed.version,
                 issue: nil,
                 bundledPath: bundledPath,
+                bundledVersion: bundledInspection?.version,
+                bundledIssue: bundledInspection?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -181,6 +199,8 @@ class DependencyManager: ObservableObject {
                 version: legacy.version,
                 issue: nil,
                 bundledPath: bundledPath,
+                bundledVersion: bundledInspection?.version,
+                bundledIssue: bundledInspection?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -196,6 +216,8 @@ class DependencyManager: ObservableObject {
                 version: system.version,
                 issue: nil,
                 bundledPath: bundledPath,
+                bundledVersion: bundledInspection?.version,
+                bundledIssue: bundledInspection?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -209,6 +231,8 @@ class DependencyManager: ObservableObject {
                 version: managed.version,
                 issue: managed.issue,
                 bundledPath: bundledPath,
+                bundledVersion: bundledInspection?.version,
+                bundledIssue: bundledInspection?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -222,6 +246,8 @@ class DependencyManager: ObservableObject {
                 version: nil,
                 issue: nil,
                 bundledPath: bundledPath,
+                bundledVersion: bundledInspection?.version,
+                bundledIssue: bundledInspection?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -234,6 +260,8 @@ class DependencyManager: ObservableObject {
             version: nil,
             issue: "App Bundle 中没有可用的 OpenClaw。",
             bundledPath: nil,
+            bundledVersion: nil,
+            bundledIssue: "App Bundle 中没有可用的 OpenClaw。",
             managedInstallPath: managedInstallPath,
             legacyInstallPath: legacyInstallPath,
             systemPath: systemPath
