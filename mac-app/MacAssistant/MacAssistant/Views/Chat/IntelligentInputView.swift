@@ -236,7 +236,7 @@ struct ChatInputTextView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.textContainerInset = NSSize(width: 8, height: 10)
-        textView.textColor = NSColor.textColor
+        textView.textColor = NSColor.labelColor
 
         if let textContainer = textView.textContainer {
             textContainer.widthTracksTextView = true
@@ -253,6 +253,9 @@ struct ChatInputTextView: NSViewRepresentable {
         if textView.string != text {
             textView.string = text
         }
+        
+        // 确保文字颜色正确（防止被系统重置）
+        textView.textColor = NSColor.labelColor
 
         textView.onSend = { [weak textView] in
             onSend(textView?.string ?? text)
