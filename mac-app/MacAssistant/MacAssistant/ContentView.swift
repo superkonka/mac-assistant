@@ -82,6 +82,9 @@ struct ContentView: View {
             
             Spacer()
             
+            // OpenClaw 状态指示器
+            OpenClawStatusView(compactMode: true)
+            
             // 添加 Agent 按钮
             Button(action: { showingAgentList = true }) {
                 Image(systemName: "plus")

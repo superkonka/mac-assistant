@@ -397,7 +397,7 @@ class OpenClawGatewayRuntimeManager {
         self.profileDirectory().appendingPathComponent("openclaw.json")
     }
 
-    private func gatewayLogPath() -> URL {
+    func gatewayLogPath() -> URL {
         self.profileDirectory().appendingPathComponent("gateway.log")
     }
 
@@ -412,7 +412,7 @@ class OpenClawGatewayRuntimeManager {
         LogInfo("🦞 已写入 OpenClaw wrapper 配置: \(self.configPath().path)")
     }
 
-    private func stopGatewayIfNeeded() async throws {
+    func stopGatewayIfNeeded() async throws {
         if let gatewayProcess, gatewayProcess.isRunning {
             gatewayProcess.terminate()
             gatewayProcess.waitUntilExit()
