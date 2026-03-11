@@ -10,5 +10,9 @@ mac-app/.build/
 mac-app/MacAssistant/.build/
 mac-app/MacAssistant/build/
 
+# Generated bundled OpenClaw runtime
+mac-app/MacAssistant/MacAssistant/Resources/openclaw-runtime/*
+!mac-app/MacAssistant/MacAssistant/Resources/openclaw-runtime/.gitkeep
+
 # Local runtime artifacts
 *.log

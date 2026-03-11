@@ -39,14 +39,14 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# 步骤 1: 打包 OpenClaw
-log_info "步骤 1/5: 打包 OpenClaw CLI..."
+# 步骤 1: 打包 OpenClaw 运行时
+log_info "步骤 1/5: 打包 OpenClaw 运行时..."
 cd "$PROJECT_ROOT"
 if [ -f "$BUILD_DIR/bundle_openclaw.sh" ]; then
     chmod +x "$BUILD_DIR/bundle_openclaw.sh"
     "$BUILD_DIR/bundle_openclaw.sh"
     if [ $? -eq 0 ]; then
-        log_success "OpenClaw 打包完成"
+        log_success "OpenClaw 运行时打包完成"
     else
         log_error "OpenClaw 打包失败"
         exit 1
@@ -103,20 +103,28 @@ log_success "应用构建完成: $APP_PATH"
 # 步骤 4: 验证应用
 log_info "步骤 4/5: 验证应用..."
 
-# 检查是否包含 OpenClaw
-if [ -f "$APP_PATH/Contents/Resources/openclaw" ]; then
-    log_success "✓ OpenClaw 已包含在应用中"
-    ls -lh "$APP_PATH/Contents/Resources/openclaw"
+# 检查是否包含 OpenClaw runtime
+if [ -x "$APP_PATH/Contents/Resources/openclaw-runtime/bin/openclaw" ]; then
+    log_success "✓ OpenClaw runtime 已包含在应用中"
+    ls -ld "$APP_PATH/Contents/Resources/openclaw-runtime"
 else
-    log_warn "⚠ OpenClaw 未找到在 Resources 中，尝试复制..."
-    if [ -f "$PROJECT_ROOT/mac-app/MacAssistant/MacAssistant/Resources/openclaw" ]; then
-        cp "$PROJECT_ROOT/mac-app/MacAssistant/MacAssistant/Resources/openclaw" "$APP_PATH/Contents/Resources/"
-        chmod +x "$APP_PATH/Contents/Resources/openclaw"
-        log_success "✓ OpenClaw 已复制到应用包"
+    log_warn "⚠ OpenClaw runtime 未找到在 Resources 中，尝试复制..."
+    if [ -x "$PROJECT_ROOT/mac-app/MacAssistant/MacAssistant/Resources/openclaw-runtime/bin/openclaw" ]; then
+        rm -rf "$APP_PATH/Contents/Resources/openclaw-runtime"
+        ditto "$PROJECT_ROOT/mac-app/MacAssistant/MacAssistant/Resources/openclaw-runtime" \
+            "$APP_PATH/Contents/Resources/openclaw-runtime"
+        log_success "✓ OpenClaw runtime 已复制到应用包"
     else
-        log_error "✗ 找不到 OpenClaw 可执行文件"
+        log_error "✗ 找不到 OpenClaw runtime"
         exit 1
     fi
+fi
+
+if "$APP_PATH/Contents/Resources/openclaw-runtime/bin/openclaw" --version >/dev/null 2>&1; then
+    log_success "✓ OpenClaw runtime 验证通过"
+else
+    log_error "✗ OpenClaw runtime 验证失败"
+    exit 1
 fi
 
 # 检查签名

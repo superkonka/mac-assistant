@@ -2,11 +2,11 @@
 //  DependencyManager.swift
 //  MacAssistant
 //
-//  管理外部依赖（OpenClaw CLI）的检测、安装和自动配置
+//  管理 OpenClaw 运行时的检测、安装和自动配置
 //
 
-import Foundation
 import AppKit
+import Foundation
 
 /// 依赖状态
 enum DependencyStatus: Equatable {
@@ -88,16 +88,22 @@ class DependencyManager: ObservableObject {
     @Published private(set) var openclawStatus: DependencyStatus = .notInstalled
     @Published private(set) var isInstalling: Bool = false
 
-    private let bundledOpenClawName = "openclaw"
-    private let managedInstallDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/MacAssistant/runtime/bin", isDirectory: true)
+    private let bundledRuntimeDirectoryName = "openclaw-runtime"
+    private let bundledExecutableRelativePath = "bin/openclaw"
+    private let managedRuntimeRoot = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/MacAssistant/runtime/openclaw", isDirectory: true)
+    private let managedBinDir: URL
+    private let managedNodeBinDir: URL
     private let legacyInstallDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".local/bin", isDirectory: true)
     private let managedInstallPath: String
     private let legacyInstallPath: String
 
     private init() {
-        self.managedInstallPath = managedInstallDir.appendingPathComponent("openclaw").path
+        self.managedBinDir = managedRuntimeRoot.appendingPathComponent("bin", isDirectory: true)
+        self.managedNodeBinDir = managedRuntimeRoot
+            .appendingPathComponent("tools/node/bin", isDirectory: true)
+        self.managedInstallPath = managedBinDir.appendingPathComponent("openclaw").path
         self.legacyInstallPath = legacyInstallDir.appendingPathComponent("openclaw").path
     }
 
@@ -115,20 +121,19 @@ class DependencyManager: ObservableObject {
         }
 
         var bundleInstallError: Error?
-        if let bundledPath = bundledOpenClawPath() {
-            let bundledCandidate = await inspectCandidate(at: bundledPath, source: .bundledOnly)
+        if let bundledCandidate = await inspectBundledCandidate() {
             self.openclawStatus = .bundledAvailable
-            if let bundledCandidate, bundledCandidate.isUsable {
+            if bundledCandidate.isUsable {
                 do {
-                    return try await installFromBundle(bundledPath: bundledPath)
+                    return try await installFromBundle()
                 } catch {
                     bundleInstallError = error
-                    LogError("安装 bundle 内 OpenClaw 失败，尝试外部回退", error: error)
+                    LogError("安装 bundle 内 OpenClaw runtime 失败，尝试外部回退", error: error)
                 }
             } else {
-                let reason = bundledCandidate?.issue ?? "无法验证 bundle 内 OpenClaw"
-                bundleInstallError = DependencyError.installFailed("App Bundle 内置 OpenClaw 不可用: \(reason)")
-                LogError("bundle 内 OpenClaw 不可用，尝试外部回退: \(reason)")
+                let reason = bundledCandidate.issue ?? "无法验证 bundle 内 OpenClaw runtime"
+                bundleInstallError = DependencyError.installFailed("App Bundle 内置 OpenClaw runtime 不可用: \(reason)")
+                LogError("bundle 内 OpenClaw runtime 不可用，尝试外部回退: \(reason)")
             }
         }
 
@@ -150,8 +155,8 @@ class DependencyManager: ObservableObject {
         let errorMessage: String
         if let bundleInstallError {
             errorMessage = bundleInstallError.localizedDescription
-        } else if bundledOpenClawPath() == nil {
-            errorMessage = "OpenClaw 未打包在 App Bundle 中"
+        } else if bundledRuntimeRootURL() == nil {
+            errorMessage = "OpenClaw runtime 未打包在 App Bundle 中"
         } else {
             errorMessage = "找不到可用的 OpenClaw 可执行文件"
         }
@@ -165,16 +170,10 @@ class DependencyManager: ObservableObject {
     }
 
     func inspectOpenClawInstallation() async -> OpenClawBinaryInspection {
-        let bundledPath = bundledOpenClawPath()
+        let bundledCandidate = await inspectBundledCandidate()
+        let bundledPath = bundledCandidate?.path
         let systemPath = await findSystemOpenClaw()
         let managed = await inspectCandidate(at: managedInstallPath, source: .managedInstall)
-
-        let bundledInspection: OpenClawCandidateInspection?
-        if let bundledPath {
-            bundledInspection = await inspectCandidate(at: bundledPath, source: .bundledOnly)
-        } else {
-            bundledInspection = nil
-        }
 
         if let managed, managed.isUsable {
             return OpenClawBinaryInspection(
@@ -183,8 +182,8 @@ class DependencyManager: ObservableObject {
                 version: managed.version,
                 issue: nil,
                 bundledPath: bundledPath,
-                bundledVersion: bundledInspection?.version,
-                bundledIssue: bundledInspection?.issue,
+                bundledVersion: bundledCandidate?.version,
+                bundledIssue: bundledCandidate?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -199,8 +198,8 @@ class DependencyManager: ObservableObject {
                 version: legacy.version,
                 issue: nil,
                 bundledPath: bundledPath,
-                bundledVersion: bundledInspection?.version,
-                bundledIssue: bundledInspection?.issue,
+                bundledVersion: bundledCandidate?.version,
+                bundledIssue: bundledCandidate?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -216,8 +215,8 @@ class DependencyManager: ObservableObject {
                 version: system.version,
                 issue: nil,
                 bundledPath: bundledPath,
-                bundledVersion: bundledInspection?.version,
-                bundledIssue: bundledInspection?.issue,
+                bundledVersion: bundledCandidate?.version,
+                bundledIssue: bundledCandidate?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -231,23 +230,23 @@ class DependencyManager: ObservableObject {
                 version: managed.version,
                 issue: managed.issue,
                 bundledPath: bundledPath,
-                bundledVersion: bundledInspection?.version,
-                bundledIssue: bundledInspection?.issue,
+                bundledVersion: bundledCandidate?.version,
+                bundledIssue: bundledCandidate?.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
             )
         }
 
-        if bundledPath != nil {
+        if let bundledCandidate {
             return OpenClawBinaryInspection(
                 source: .bundledOnly,
                 executablePath: nil,
                 version: nil,
                 issue: nil,
-                bundledPath: bundledPath,
-                bundledVersion: bundledInspection?.version,
-                bundledIssue: bundledInspection?.issue,
+                bundledPath: bundledCandidate.path,
+                bundledVersion: bundledCandidate.version,
+                bundledIssue: bundledCandidate.issue,
                 managedInstallPath: managedInstallPath,
                 legacyInstallPath: legacyInstallPath,
                 systemPath: systemPath
@@ -258,10 +257,10 @@ class DependencyManager: ObservableObject {
             source: .missing,
             executablePath: nil,
             version: nil,
-            issue: "App Bundle 中没有可用的 OpenClaw。",
+            issue: "App Bundle 中没有可用的 OpenClaw runtime。",
             bundledPath: nil,
             bundledVersion: nil,
-            bundledIssue: "App Bundle 中没有可用的 OpenClaw。",
+            bundledIssue: "App Bundle 中没有可用的 OpenClaw runtime。",
             managedInstallPath: managedInstallPath,
             legacyInstallPath: legacyInstallPath,
             systemPath: systemPath
@@ -269,17 +268,16 @@ class DependencyManager: ObservableObject {
     }
 
     func reinstallManagedOpenClaw() async throws -> String {
-        guard let bundledPath = bundledOpenClawPath() else {
-            self.openclawStatus = .error("OpenClaw 未打包在 App Bundle 中")
+        guard await inspectBundledCandidate() != nil else {
+            self.openclawStatus = .error("OpenClaw runtime 未打包在 App Bundle 中")
             throw DependencyError.bundledNotFound
         }
 
-        let managedURL = URL(fileURLWithPath: managedInstallPath)
-        if FileManager.default.fileExists(atPath: managedInstallPath) {
-            try? FileManager.default.removeItem(at: managedURL)
+        if FileManager.default.fileExists(atPath: managedRuntimeRoot.path) {
+            try? FileManager.default.removeItem(at: managedRuntimeRoot)
         }
 
-        return try await installFromBundle(bundledPath: bundledPath)
+        return try await installFromBundle()
     }
 
     /// 检查是否需要首次设置
@@ -335,27 +333,52 @@ class DependencyManager: ObservableObject {
         }
     }
 
+    private func bundledRuntimeRootURL() -> URL? {
+        guard let resourceURL = Bundle.main.resourceURL else {
+            return nil
+        }
+
+        let candidate = resourceURL.appendingPathComponent(bundledRuntimeDirectoryName, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: candidate.path) else {
+            return nil
+        }
+        return candidate
+    }
+
     /// 获取 Bundle 中的 openclaw 路径
     private func bundledOpenClawPath() -> String? {
-        if let resourcePath = Bundle.main.path(forResource: bundledOpenClawName, ofType: nil) {
-            return resourcePath
+        guard let bundledRuntimeRootURL = bundledRuntimeRootURL() else {
+            return nil
         }
 
-        if let auxiliaryPath = Bundle.main.url(forAuxiliaryExecutable: bundledOpenClawName)?.path {
-            return auxiliaryPath
+        return bundledRuntimeRootURL
+            .appendingPathComponent(bundledExecutableRelativePath)
+            .path
+    }
+
+    private func inspectBundledCandidate() async -> OpenClawCandidateInspection? {
+        guard let bundledRuntimeRootURL = bundledRuntimeRootURL() else {
+            return nil
         }
 
-        let frameworksPath = Bundle.main.privateFrameworksPath
-        let frameworkPath = frameworksPath?.appending("/\(bundledOpenClawName)")
-        if let path = frameworkPath, FileManager.default.fileExists(atPath: path) {
-            return path
+        let bundledPath = bundledRuntimeRootURL
+            .appendingPathComponent(bundledExecutableRelativePath)
+            .path
+
+        if let inspection = await inspectCandidate(at: bundledPath, source: .bundledOnly) {
+            return inspection
         }
 
-        return nil
+        return OpenClawCandidateInspection(
+            source: .bundledOnly,
+            path: bundledPath,
+            version: nil,
+            issue: "App Bundle 中的 openclaw-runtime 缺少 bin/openclaw。"
+        )
     }
 
     /// 从 Bundle 安装到应用管理目录
-    private func installFromBundle(bundledPath: String) async throws -> String {
+    private func installFromBundle() async throws -> String {
         self.isInstalling = true
         self.openclawStatus = .installing
 
@@ -363,41 +386,55 @@ class DependencyManager: ObservableObject {
             self.isInstalling = false
         }
 
-        LogInfo("📦 正在安装 OpenClaw...")
+        LogInfo("📦 正在安装 OpenClaw runtime...")
+
+        guard let bundledRuntimeRootURL = bundledRuntimeRootURL() else {
+            throw DependencyError.bundledNotFound
+        }
 
         do {
-            try FileManager.default.createDirectory(
-                at: managedInstallDir,
+            let fileManager = FileManager.default
+            let runtimeParent = managedRuntimeRoot.deletingLastPathComponent()
+
+            try fileManager.createDirectory(
+                at: runtimeParent,
                 withIntermediateDirectories: true,
                 attributes: nil
             )
 
-            let sourceURL = URL(fileURLWithPath: bundledPath)
-            let destURL = URL(fileURLWithPath: managedInstallPath)
-
-            if FileManager.default.fileExists(atPath: managedInstallPath) {
-                try FileManager.default.removeItem(at: destURL)
+            if fileManager.fileExists(atPath: managedRuntimeRoot.path) {
+                try fileManager.removeItem(at: managedRuntimeRoot)
             }
 
-            try FileManager.default.copyItem(at: sourceURL, to: destURL)
+            try fileManager.copyItem(at: bundledRuntimeRootURL, to: managedRuntimeRoot)
 
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o755],
-                ofItemAtPath: managedInstallPath
-            )
+            if fileManager.fileExists(atPath: managedInstallPath) {
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: managedInstallPath
+                )
+            }
 
-            guard FileManager.default.isExecutableFile(atPath: managedInstallPath) else {
-                throw DependencyError.installFailed("文件不可执行")
+            let managedNodePath = managedNodeBinDir.appendingPathComponent("node").path
+            if fileManager.fileExists(atPath: managedNodePath) {
+                try fileManager.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: managedNodePath
+                )
+            }
+
+            guard fileManager.isExecutableFile(atPath: managedInstallPath) else {
+                throw DependencyError.installFailed("openclaw-runtime/bin/openclaw 不可执行")
             }
 
             let version = try await verifyOpenClaw(at: managedInstallPath)
-            LogInfo("✅ OpenClaw 安装成功: v\(version)")
+            LogInfo("✅ OpenClaw runtime 安装成功: v\(version)")
 
             self.openclawStatus = .installed(path: managedInstallPath)
             return managedInstallPath
 
         } catch {
-            LogError("OpenClaw 安装失败", error: error)
+            LogError("OpenClaw runtime 安装失败", error: error)
             self.openclawStatus = .error(error.localizedDescription)
             throw DependencyError.installFailed(error.localizedDescription)
         }
@@ -460,9 +497,10 @@ class DependencyManager: ObservableObject {
 
     /// 获取 PATH 环境变量（包含我们的安装目录）
     func pathEnvironment() -> String {
-        let managedBin = managedInstallDir.path
+        let managedBin = managedBinDir.path
+        let managedNodeBin = managedNodeBinDir.path
         let legacyBin = legacyInstallDir.path
-        let defaultPath = "\(managedBin):\(legacyBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        let defaultPath = "\(managedBin):\(managedNodeBin):\(legacyBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         return ProcessInfo.processInfo.environment["PATH"].map { "\($0):\(defaultPath)" } ?? defaultPath
     }
 }
@@ -477,11 +515,11 @@ enum DependencyError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .bundledNotFound:
-            return "OpenClaw 未包含在应用中，请重新下载应用或联系支持。"
+            return "OpenClaw runtime 未包含在应用中，请重新下载应用或联系支持。"
         case .installFailed(let reason):
-            return "安装 OpenClaw 失败: \(reason)"
+            return "安装 OpenClaw runtime 失败: \(reason)"
         case .verificationFailed:
-            return "无法验证 OpenClaw 安装，文件可能损坏。"
+            return "无法验证 OpenClaw runtime，文件可能损坏。"
         }
     }
 
