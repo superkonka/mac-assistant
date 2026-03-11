@@ -228,7 +228,6 @@ struct ChatInputTextView: NSViewRepresentable {
             onSend(textView?.string ?? text)
         }
         textView.font = .systemFont(ofSize: 14)
-        textView.drawsBackground = false
         textView.isRichText = false
         textView.importsGraphics = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
@@ -236,7 +235,7 @@ struct ChatInputTextView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.textContainerInset = NSSize(width: 8, height: 10)
-        textView.textColor = NSColor.controlTextColor
+        applyInputAppearance(to: textView)
 
         if let textContainer = textView.textContainer {
             textContainer.widthTracksTextView = true
@@ -254,12 +253,40 @@ struct ChatInputTextView: NSViewRepresentable {
             textView.string = text
         }
 
+        applyInputAppearance(to: textView)
+
         textView.onSend = { [weak textView] in
             onSend(textView?.string ?? text)
         }
 
         if isFocused, scrollView.window?.firstResponder !== textView {
             scrollView.window?.makeFirstResponder(textView)
+        }
+    }
+
+    private func applyInputAppearance(to textView: ComposerTextView) {
+        let font = textView.font ?? .systemFont(ofSize: 14)
+        let foreground = NSColor.textColor
+
+        textView.drawsBackground = true
+        textView.backgroundColor = .textBackgroundColor
+        textView.textColor = foreground
+        textView.insertionPointColor = foreground
+        textView.typingAttributes = [
+            .font: font,
+            .foregroundColor: foreground
+        ]
+
+        if let textStorage = textView.textStorage, textStorage.length > 0 {
+            textStorage.beginEditing()
+            textStorage.setAttributes(
+                [
+                    .font: font,
+                    .foregroundColor: foreground
+                ],
+                range: NSRange(location: 0, length: textStorage.length)
+            )
+            textStorage.endEditing()
         }
     }
 
