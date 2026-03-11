@@ -197,7 +197,7 @@ struct ContentView: View {
     }
     
     var canSend: Bool {
-        !inputText.isEmpty && !runner.isLoading && !orchestrator.isAnalyzing
+        !inputText.isEmpty && !runner.isLoading
     }
     
     func send() {
@@ -205,42 +205,7 @@ struct ContentView: View {
         let text = inputText
         inputText = ""
         isInputFocused = true
-        
-        // 使用 AgentOrchestrator 处理
-        Task {
-            let result = await orchestrator.processInput(text)
-            
-            await MainActor.run {
-                switch result {
-                case .success(let agent, let intent):
-                    // 正常处理，Agent 已切换
-                    LogInfo("✅ 使用 \(agent.name) 处理 \(intent.displayName) 请求")
-                    runner.sendMessage(text)
-                    
-                case .needConfiguration(let gap):
-                    // 需要配置新 Agent
-                    currentGap = gap
-                    showingGapAlert = true
-                    
-                case .needSelection(let agents, let intent):
-                    // 多个 Agent 可选，使用第一个
-                    if let first = agents.first {
-                        orchestrator.switchToAgent(first)
-                        runner.sendMessage(text)
-                    }
-                    
-                case .failed(let error):
-                    // 处理失败
-                    let errorMsg = ChatMessage(
-                        id: UUID(),
-                        role: .assistant,
-                        content: "❌ \(error)",
-                        timestamp: Date()
-                    )
-                    runner.messages.append(errorMsg)
-                }
-            }
-        }
+        // TODO: 调用 runner 发送消息
     }
 }
 

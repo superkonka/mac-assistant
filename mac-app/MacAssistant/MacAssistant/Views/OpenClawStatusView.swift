@@ -122,15 +122,20 @@ struct OpenClawStatusView: View {
     
     private var statusButton: some View {
         Button(action: { isExpanded.toggle() }) {
-            HStack(spacing: 6) {
+            HStack(spacing: 4) {
                 Image(systemName: viewModel.status.icon)
-                    .font(.system(size: compactMode ? 12 : 14))
+                    .font(.system(size: compactMode ? 14 : 16, weight: .semibold))
                     .foregroundColor(viewModel.status.color)
-                    .symbolEffect(.pulse, options: .repeating, isActive: viewModel.status == .repairing)
+                    .symbolEffect(.pulse, options: .repeating, isActive: viewModel.status == .repairing || viewModel.status == .reinstalling)
                 
-                if !compactMode {
+                // compactMode 也显示简短文字
+                if compactMode {
+                    Text("Claw")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(viewModel.status.color)
+                } else {
                     Text("OpenClaw")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.system(size: 13, weight: .medium))
                     
                     Text(viewModel.status.title)
                         .font(.system(size: 11))
@@ -141,13 +146,13 @@ struct OpenClawStatusView: View {
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
             }
-            .padding(.horizontal, compactMode ? 6 : 10)
-            .padding(.vertical, compactMode ? 4 : 6)
-            .background(viewModel.status.color.opacity(0.1))
+            .padding(.horizontal, compactMode ? 8 : 12)
+            .padding(.vertical, compactMode ? 5 : 7)
+            .background(viewModel.status.color.opacity(compactMode ? 0.15 : 0.1))
             .cornerRadius(6)
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
-                    .stroke(viewModel.status.color.opacity(0.3), lineWidth: 1)
+                    .stroke(viewModel.status.color.opacity(compactMode ? 0.5 : 0.3), lineWidth: compactMode ? 1.5 : 1)
             )
         }
         .buttonStyle(PlainButtonStyle())
