@@ -236,7 +236,7 @@ struct ChatInputTextView: NSViewRepresentable {
         textView.isAutomaticTextReplacementEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
         textView.textContainerInset = NSSize(width: 8, height: 10)
-        textView.textColor = NSColor.controlTextColor
+        textView.textColor = NSColor.textColor
 
         if let textContainer = textView.textContainer {
             textContainer.widthTracksTextView = true
