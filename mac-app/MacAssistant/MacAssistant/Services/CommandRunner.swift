@@ -49,6 +49,7 @@ class CommandRunner: ObservableObject {
     private let toolSkillRegistry = SkillRegistry.shared
     private let skillEvolutionAdvisor = SkillEvolutionAdvisor.shared
     private let gatewayClient = OpenClawGatewayClient.shared
+    private let localKimiCLIService = LocalKimiCLIService.shared
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
@@ -1233,16 +1234,20 @@ class CommandRunner: ObservableObject {
 
             await maybeStartKimiCLILoginRecovery(after: error, for: agent)
 
-            if UserFacingErrorFormatter.isAuthenticationError(error) {
+            if UserFacingErrorFormatter.shouldTemporarilySuspendAgent(after: error) {
                 agentStore.markTemporarilyUnavailable(agent)
             }
 
-            for fallbackAgent in fallbackAgentsForAuthenticationFailure(
+            for fallbackAgent in fallbackAgentsForRecoverableFailure(
                 after: error,
                 failingAgent: agent,
                 images: images
             ) {
-                logger.logAgentSwitch(from: agent, to: fallbackAgent, reason: "远端鉴权失败后自动降级到可用 Agent")
+                logger.logAgentSwitch(
+                    from: agent,
+                    to: fallbackAgent,
+                    reason: "\(UserFacingErrorFormatter.recoveryFailureSummary(for: error))后自动切换到可用 Agent"
+                )
                 orchestrator.switchToAgent(fallbackAgent)
 
                 await MainActor.run {
@@ -1250,7 +1255,7 @@ class CommandRunner: ObservableObject {
                         state: .fallback,
                         agentName: fallbackAgent.displayName,
                         transitionLabel: "自动回退",
-                        summary: "\(agent.displayName) 不可用，已切换到 \(fallbackAgent.displayName)"
+                        summary: "\(agent.displayName) \(UserFacingErrorFormatter.recoveryFailureSummary(for: error))，已切换到 \(fallbackAgent.displayName)"
                     )
 
                     if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
@@ -1285,7 +1290,7 @@ class CommandRunner: ObservableObject {
                     terminalError = error
                     logger.logError(error, context: "远端鉴权失败后回退到本地 Agent")
 
-                    if UserFacingErrorFormatter.isAuthenticationError(error) {
+                    if UserFacingErrorFormatter.shouldTemporarilySuspendAgent(after: error) {
                         agentStore.markTemporarilyUnavailable(fallbackAgent)
                         continue
                     }
@@ -1322,12 +1327,12 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func fallbackAgentsForAuthenticationFailure(
+    private func fallbackAgentsForRecoverableFailure(
         after error: Error,
         failingAgent: Agent,
         images: [String]
     ) -> [Agent] {
-        guard UserFacingErrorFormatter.isAuthenticationError(error) else {
+        guard UserFacingErrorFormatter.shouldAttemptAutomaticAgentFallback(after: error) else {
             return []
         }
 
@@ -1405,7 +1410,8 @@ class CommandRunner: ObservableObject {
         text: String,
         images: [String]
     ) async -> String? {
-        guard UserFacingErrorFormatter.isAuthenticationError(error) else {
+        guard UserFacingErrorFormatter.isAuthenticationError(error) ||
+                UserFacingErrorFormatter.isMissingConfigurationError(error) else {
             return nil
         }
 
@@ -1445,7 +1451,7 @@ class CommandRunner: ObservableObject {
         return """
         ⚙️ 当前没有可用的 LLM 或 CLI Agent
 
-        \(failingAgent.displayName) 已因鉴权失败被暂时停用。我已经打开配置向导；只要配置任意一个可用的 LLM 或 CLI Agent，就可以继续。
+        \(failingAgent.displayName) 已因\(UserFacingErrorFormatter.isAuthenticationError(error) ? "认证失效" : "配置缺失")被暂时跳过。我已经打开配置向导；只要配置任意一个可用的 LLM 或 CLI Agent，就可以继续。
         """
     }
 
@@ -1571,42 +1577,115 @@ class CommandRunner: ObservableObject {
         taskSessionID: String? = nil,
         assistantMessageID: UUID
     ) async throws -> String {
-        let content = try await gatewayClient.sendMessage(
-            agent: agent,
-            sessionKey: sessionKey,
-            sessionLabel: sessionLabel,
-            text: text,
-            images: images,
-            onAssistantText: { [weak self] partialText in
-                guard let self else { return }
-                guard self.gatewayReturnedError(partialText) == nil else { return }
-                if let taskSessionID {
-                    await MainActor.run {
-                        self.updateTaskSessionMessage(
-                            sessionID: taskSessionID,
-                            messageID: assistantMessageID,
-                            content: partialText
-                        )
-                        self.updateTaskSessionStatus(
-                            sessionID: taskSessionID,
-                            status: .running,
-                            summary: "\(agent.displayName) 正在通过 OpenClaw 持续输出结果"
-                        )
-                    }
-                } else {
-                    await MainActor.run {
-                        self.updateAssistantMessage(id: assistantMessageID, content: partialText)
+        do {
+            let content = try await gatewayClient.sendMessage(
+                agent: agent,
+                sessionKey: sessionKey,
+                sessionLabel: sessionLabel,
+                text: text,
+                images: images,
+                onAssistantText: { [weak self] partialText in
+                    guard let self else { return }
+                    guard self.gatewayReturnedError(partialText) == nil else { return }
+                    if let taskSessionID {
+                        await MainActor.run {
+                            self.updateTaskSessionMessage(
+                                sessionID: taskSessionID,
+                                messageID: assistantMessageID,
+                                content: partialText
+                            )
+                            self.updateTaskSessionStatus(
+                                sessionID: taskSessionID,
+                                status: .running,
+                                summary: "\(agent.displayName) 正在通过 OpenClaw 持续输出结果"
+                            )
+                        }
+                    } else {
+                        await MainActor.run {
+                            self.updateAssistantMessage(id: assistantMessageID, content: partialText)
+                        }
                     }
                 }
-            }
-        )
+            )
 
-        if let surfacedError = gatewayReturnedError(content) {
-            throw surfacedError
+            if let surfacedError = gatewayReturnedError(content) {
+                throw surfacedError
+            }
+
+            let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "服务已返回，但没有拿到可显示的内容。"
+                : content
+
+            await MainActor.run {
+                if let taskSessionID {
+                    self.updateTaskSessionMessage(
+                        sessionID: taskSessionID,
+                        messageID: assistantMessageID,
+                        content: resolvedContent
+                    )
+                } else {
+                    self.updateAssistantMessage(id: assistantMessageID, content: resolvedContent)
+                }
+            }
+
+            return resolvedContent
+        } catch {
+            if let fallbackContent = try await fallbackToDirectKimiCLIIfNeeded(
+                after: error,
+                agent: agent,
+                sessionKey: sessionKey,
+                text: text,
+                images: images,
+                taskSessionID: taskSessionID,
+                assistantMessageID: assistantMessageID
+            ) {
+                return fallbackContent
+            }
+            throw error
+        }
+    }
+
+    private func fallbackToDirectKimiCLIIfNeeded(
+        after error: Error,
+        agent: Agent,
+        sessionKey: String,
+        text: String,
+        images: [String],
+        taskSessionID: String?,
+        assistantMessageID: UUID
+    ) async throws -> String? {
+        guard shouldFallbackToDirectKimiCLI(after: error, agent: agent) else {
+            return nil
         }
 
+        await MainActor.run {
+            if let taskSessionID {
+                self.updateTaskSessionStatus(
+                    sessionID: taskSessionID,
+                    status: .running,
+                    summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
+                )
+            } else {
+                self.updateExecutionTrace(
+                    state: .fallback,
+                    agentName: agent.displayName,
+                    transitionLabel: "直接 CLI",
+                    summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
+                )
+                self.updateAssistantMessage(
+                    id: assistantMessageID,
+                    content: "⏳ OpenClaw 当前不可用，正在直接调用 Kimi CLI..."
+                )
+            }
+        }
+
+        let content = try await localKimiCLIService.sendMessage(
+            text: text,
+            attachments: images,
+            sessionKey: sessionKey
+        )
         let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "服务已返回，但没有拿到可显示的内容。"
+            ? "本地 Kimi CLI 已执行，但没有返回可显示的内容。"
             : content
 
         await MainActor.run {
@@ -1622,6 +1701,29 @@ class CommandRunner: ObservableObject {
         }
 
         return resolvedContent
+    }
+
+    private func shouldFallbackToDirectKimiCLI(after error: Error, agent: Agent) -> Bool {
+        guard agent.provider == .ollama else {
+            return false
+        }
+
+        if UserFacingErrorFormatter.isAuthenticationError(error) {
+            return false
+        }
+
+        let description = (error as NSError).localizedDescription.lowercased()
+        let markers = [
+            "openclaw",
+            "gateway",
+            "bundlednotfound",
+            "未打包在 app bundle 中",
+            "未包含在应用中",
+            "安装 openclaw 失败",
+            "无法验证 openclaw",
+            "启动超时"
+        ]
+        return markers.contains { description.contains($0) }
     }
 
     private func delegateRequest(
@@ -2197,23 +2299,27 @@ class CommandRunner: ObservableObject {
 
             await maybeStartKimiCLILoginRecovery(after: error, for: agent)
 
-            if UserFacingErrorFormatter.isAuthenticationError(error) {
+            if UserFacingErrorFormatter.shouldTemporarilySuspendAgent(after: error) {
                 agentStore.markTemporarilyUnavailable(agent)
             }
 
-            for fallbackAgent in fallbackAgentsForAuthenticationFailure(
+            for fallbackAgent in fallbackAgentsForRecoverableFailure(
                 after: error,
                 failingAgent: agent,
                 images: images
             ) {
-                logger.logAgentSwitch(from: agent, to: fallbackAgent, reason: "子会话 Agent 鉴权失败后自动切换")
+                logger.logAgentSwitch(
+                    from: agent,
+                    to: fallbackAgent,
+                    reason: "子会话 \(UserFacingErrorFormatter.recoveryFailureSummary(for: error))后自动切换"
+                )
                 orchestrator.switchToAgent(fallbackAgent)
 
                 await MainActor.run {
                     updateTaskSessionStatus(
                         sessionID: sessionID,
                         status: .running,
-                        summary: "\(agent.displayName) 不可用，已切换到 \(fallbackAgent.displayName)",
+                        summary: "\(agent.displayName) \(UserFacingErrorFormatter.recoveryFailureSummary(for: error))，已切换到 \(fallbackAgent.displayName)",
                         isExpanded: true
                     )
                     updateTaskSessionDelegateAgent(sessionID: sessionID, agent: fallbackAgent)
@@ -2258,7 +2364,7 @@ class CommandRunner: ObservableObject {
                     terminalError = error
                     logger.logError(error, context: "子会话回退 Agent 失败")
 
-                    if UserFacingErrorFormatter.isAuthenticationError(error) {
+                    if UserFacingErrorFormatter.shouldTemporarilySuspendAgent(after: error) {
                         agentStore.markTemporarilyUnavailable(fallbackAgent)
                         continue
                     }

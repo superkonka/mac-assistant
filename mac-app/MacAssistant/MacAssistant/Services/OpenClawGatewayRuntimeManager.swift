@@ -47,33 +47,44 @@ class OpenClawGatewayRuntimeManager {
     @Published var readiness: GatewayReadiness = .notStarted
 
     func prepareGateway() async throws {
-        _ = try await ensureGatewayReady()
+        _ = try await ensureGatewayReadyWithDependencies()
     }
     
     /// 准备 Gateway（带依赖安装）
     func prepareGatewayWithDependencies() async throws -> ManagedState {
+        try await ensureGatewayReadyWithDependencies()
+    }
+
+    func ensureGatewayReadyWithDependencies() async throws -> ManagedState {
         // 1. 确保 OpenClaw CLI 可用
         await MainActor.run {
             self.readiness = .installingDependencies
         }
         
-        let openclawPath = try await dependencyManager.ensureOpenClawAvailable()
-        self.openclawExecutablePath = openclawPath
+        do {
+            let openclawPath = try await dependencyManager.ensureOpenClawAvailable()
+            self.openclawExecutablePath = openclawPath
         
-        LogInfo("🦞 使用 OpenClaw: \(openclawPath)")
+            LogInfo("🦞 使用 OpenClaw: \(openclawPath)")
         
-        // 2. 启动 Gateway
-        await MainActor.run {
-            self.readiness = .starting
+            // 2. 启动 Gateway
+            await MainActor.run {
+                self.readiness = .starting
+            }
+        
+            let state = try await ensureGatewayReady()
+        
+            await MainActor.run {
+                self.readiness = .ready(endpoint: state.endpoint)
+            }
+        
+            return state
+        } catch {
+            await MainActor.run {
+                self.readiness = .failed(error.localizedDescription)
+            }
+            throw error
         }
-        
-        let state = try await ensureGatewayReady()
-        
-        await MainActor.run {
-            self.readiness = .ready(endpoint: state.endpoint)
-        }
-        
-        return state
     }
 
     func ensureGatewayReady() async throws -> ManagedState {

@@ -27,6 +27,7 @@ actor OpenClawGatewayClient {
     private var nextPushOrdinal = 0
 
     func prepareGateway() async throws {
+        _ = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         _ = try await self.ensureChannel()
     }
 
@@ -38,7 +39,7 @@ actor OpenClawGatewayClient {
         images: [String],
         onAssistantText: (@Sendable (String) async -> Void)? = nil
     ) async throws -> String {
-        let state = try await self.runtimeManager.ensureGatewayReady()
+        let state = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         guard let modelRef = state.modelRefsByAgentID[agent.id] else {
             throw NSError(
                 domain: "OpenClawGatewayClient",
@@ -547,7 +548,7 @@ actor OpenClawGatewayClient {
     }
 
     private func ensureChannel() async throws -> GatewayChannelActor {
-        let state = try await self.runtimeManager.ensureGatewayReady()
+        let state = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         if let channel, self.connectionGeneration == state.endpoint.generation {
             return channel
         }

@@ -12,8 +12,53 @@ enum UserFacingErrorFormatter {
         classify(error: error).kind == .authentication
     }
 
+    static func isMissingConfigurationError(_ error: Error) -> Bool {
+        classify(error: error).kind == .missingConfiguration
+    }
+
     static func isStreamInterruptedError(_ error: Error) -> Bool {
         classify(error: error).kind == .streamInterrupted
+    }
+
+    static func isTransientServiceError(_ error: Error) -> Bool {
+        let kind = classify(error: error).kind
+        return kind == .timeout || kind == .network || kind == .serviceBusy
+    }
+
+    static func shouldAttemptAutomaticAgentFallback(after error: Error) -> Bool {
+        let kind = classify(error: error).kind
+        switch kind {
+        case .authentication, .missingConfiguration, .timeout, .network, .serviceBusy:
+            return true
+        case .invalidPrompt, .streamInterrupted, .unknown:
+            return false
+        }
+    }
+
+    static func shouldTemporarilySuspendAgent(after error: Error) -> Bool {
+        let kind = classify(error: error).kind
+        return kind == .authentication || kind == .missingConfiguration
+    }
+
+    static func recoveryFailureSummary(for error: Error) -> String {
+        switch classify(error: error).kind {
+        case .authentication:
+            return "认证失效"
+        case .missingConfiguration:
+            return "配置缺失"
+        case .timeout:
+            return "请求超时"
+        case .network:
+            return "网络异常"
+        case .serviceBusy:
+            return "服务繁忙"
+        case .invalidPrompt:
+            return "输入无效"
+        case .streamInterrupted:
+            return "流式中断"
+        case .unknown:
+            return "请求失败"
+        }
     }
 
     static func chatMessage(for error: Error, agentName: String, providerName: String) -> String {

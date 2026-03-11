@@ -14,6 +14,7 @@
 		000000000000000000000005 /* ConversationLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* ConversationLogger.swift */; };
 		000000000000000000000006 /* OpenClawHealthChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* OpenClawHealthChecker.swift */; };
 		000000000000000000000007 /* UserPreferenceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000105 /* UserPreferenceStore.swift */; };
+		000000000000000000000008 /* openclaw in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* openclaw */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -23,6 +24,7 @@
 		000000000000000000000103 /* ConversationLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationLogger.swift; sourceTree = "<group>"; };
 		000000000000000000000104 /* OpenClawHealthChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenClawHealthChecker.swift; sourceTree = "<group>"; };
 		000000000000000000000105 /* UserPreferenceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserPreferenceStore.swift; sourceTree = "<group>"; };
+		000000000000000000000106 /* openclaw */ = {isa = PBXFileReference; lastKnownFileType = compiled.mach-o.executable; path = Resources/openclaw; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -103,6 +105,7 @@
 				000000000000000000000206 /* Storage */,
 				000000000000000000000207 /* Utils */,
 				000000000000000000000208 /* Views */,
+				000000000000000000000106 /* openclaw */,
 				000000000000000000000102 /* Info.plist */,
 			);
 			path = MacAssistant;
@@ -204,6 +207,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				000000000000000000000008 /* openclaw in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

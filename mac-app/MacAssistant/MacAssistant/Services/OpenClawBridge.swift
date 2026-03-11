@@ -152,7 +152,8 @@ class OpenClawBridge {
         task.standardError = pipe
         
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/Users/konka/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        let localBin = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin").path
+        env["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         task.environment = env
         
         do {

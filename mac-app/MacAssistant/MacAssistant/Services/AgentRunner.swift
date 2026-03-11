@@ -161,7 +161,8 @@ class AgentRunner: ObservableObject {
         
         var environment = ProcessInfo.processInfo.environment
         environment["LANG"] = "zh_CN.UTF-8"
-        environment["PATH"] = "/Users/konka/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+        let localBin = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin").path
+        environment["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
         task.environment = environment
         
         // 流式输出处理
