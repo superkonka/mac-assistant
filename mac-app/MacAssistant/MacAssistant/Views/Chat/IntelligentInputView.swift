@@ -66,10 +66,10 @@ struct IntelligentInputView: View {
             
             // 智能输入框
             ZStack(alignment: .leading) {
-                TextEditor(text: $text)
+                TextField("", text: $text, axis: .vertical)
                     .font(.system(size: 14))
                     .foregroundColor(.black)
-                    .frame(height: 36)
+                    .lineLimit(1...5)
                     .scrollContentBackground(.hidden)
                     .background(Color.white)
                     .cornerRadius(8)
@@ -83,8 +83,6 @@ struct IntelligentInputView: View {
                     .onChange(of: text) { newValue in
                         handleTextChange(newValue)
                     }
-                    // 垂直居中对齐
-                    .multilineTextAlignment(.leading)
                 
                 // 提示文字（当输入框为空时）
                 if text.isEmpty {
