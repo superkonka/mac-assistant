@@ -34,6 +34,10 @@ struct ChatView: View {
             
             // 消息列表
             messageList
+
+            if shouldShowProcessingStatusDock {
+                processingStatusDock
+            }
             
             Divider()
             
@@ -158,31 +162,33 @@ struct ChatView: View {
                         }
 
                         ForEach(commandRunner.messages) { message in
-                            MessageBubble(
-                                message: message,
-                                availableWidth: availableBubbleWidth,
-                                taskSession: commandRunner.taskSession(for: message.linkedTaskSessionID),
-                                onToggleTaskSession: {
-                                    if let taskSessionID = message.linkedTaskSessionID {
-                                        commandRunner.toggleTaskSessionExpansion(taskSessionID)
-                                    }
-                                },
-                                onResumeTaskSession: {
-                                    if let taskSessionID = message.linkedTaskSessionID {
-                                        commandRunner.resumeTaskSession(taskSessionID)
-                                    }
-                                }
-                            )
-                            .equatable()
-                            .id(message.id)
+                            let trace = commandRunner.executionTrace(forMessageID: message.id)
+                            let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
 
-                            if let trace = commandRunner.currentExecutionTrace,
-                               trace.anchorMessageID == message.id {
+                            if !hidesPlaceholderBubble {
+                                MessageBubble(
+                                    message: message,
+                                    availableWidth: availableBubbleWidth,
+                                    taskSession: commandRunner.taskSession(for: message.linkedTaskSessionID),
+                                    onToggleTaskSession: {
+                                        if let taskSessionID = message.linkedTaskSessionID {
+                                            commandRunner.toggleTaskSessionExpansion(taskSessionID)
+                                        }
+                                    },
+                                    onResumeTaskSession: {
+                                        if let taskSessionID = message.linkedTaskSessionID {
+                                            commandRunner.resumeTaskSession(taskSessionID)
+                                        }
+                                    }
+                                )
+                                .id(messageRenderIdentity(for: message))
+                            }
+
+                            if let trace {
                                 TraceStripView(
                                     trace: trace,
                                     availableWidth: availableBubbleWidth
                                 )
-                                    .equatable()
                             }
                         }
 
@@ -190,6 +196,7 @@ struct ChatView: View {
                             TypingIndicator()
                         }
                     }
+                    .id(messageListRevision)
                     .padding(.vertical, 16)
                     .padding(.horizontal, 12)
                 }
@@ -235,8 +242,52 @@ struct ChatView: View {
         .padding(.vertical, 4)
         .background(AppColors.controlBackground.opacity(0.5))
     }
+
+    private var processingStatusDock: some View {
+        InlineProcessingBar(
+            trace: commandRunner.currentExecutionTrace,
+            fallbackAgentName: orchestrator.currentAgent?.displayName ?? "当前 Agent"
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(AppColors.controlBackground.opacity(0.62))
+    }
     
     // MARK: - 动作
+
+    private func messageRenderIdentity(for message: ChatMessage) -> String {
+        var hasher = Hasher()
+        hasher.combine(message.id)
+        hasher.combine(message.content)
+        hasher.combine(message.agentId)
+        hasher.combine(message.agentName)
+        hasher.combine(message.linkedTaskSessionID)
+        return "\(message.id.uuidString)-\(hasher.finalize())"
+    }
+
+    private var messageListRevision: String {
+        commandRunner.messages
+            .map { messageRenderIdentity(for: $0) }
+            .joined(separator: "|")
+    }
+
+    private var shouldShowProcessingStatusDock: Bool {
+        guard commandRunner.isProcessing else { return false }
+        guard let trace = commandRunner.currentExecutionTrace else { return true }
+
+        let inlineMessageID = trace.assistantMessageID ?? trace.anchorMessageID
+        return !commandRunner.messages.contains(where: { $0.id == inlineMessageID })
+    }
+
+    private func shouldHideAssistantPlaceholder(_ message: ChatMessage, trace: ExecutionTrace?) -> Bool {
+        guard trace != nil, message.role == .assistant else { return false }
+        let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard content.hasPrefix("⏳ ") else { return false }
+        return content.contains("正在思考") ||
+            content.contains("正在继续处理") ||
+            content.contains("正在连接") ||
+            content.contains("正在直接调用")
+    }
     
     private func sendMessage(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -401,6 +452,106 @@ struct TypingIndicator: View {
         .onAppear {
             offset = -4
         }
+    }
+}
+
+private struct InlineProcessingBar: View {
+    let trace: ExecutionTrace?
+    let fallbackAgentName: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text(subtitle)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(elapsedText(referenceDate: context.date))
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.75))
+                    .clipShape(Capsule())
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.blue.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.blue.opacity(0.16), lineWidth: 1)
+        )
+    }
+
+    private var title: String {
+        guard let trace else {
+            return "\(fallbackAgentName) 正在处理你的请求"
+        }
+        switch trace.state {
+        case .routing:
+            return "正在选择处理线路"
+        case .running:
+            return "\(trace.agentName) 正在执行"
+        case .fallback:
+            return "\(trace.agentName) 正在自动接管"
+        case .synthesizing:
+            return "正在整理最终回复"
+        case .completed:
+            return "结果已经返回"
+        case .failed:
+            return "这次请求没有顺利完成"
+        }
+    }
+
+    private var subtitle: String {
+        guard let trace else {
+            return "请求已提交，正在等待第一段有效结果返回到聊天窗口。"
+        }
+        switch trace.state {
+        case .routing:
+            return "系统正在判断能力和执行路线，接下来会把请求发送给目标 Agent。"
+        case .running:
+            return trace.summary.isEmpty ? "请求已发出，正在等待结果流写回聊天气泡。" : trace.summary
+        case .fallback:
+            return trace.summary.isEmpty ? "原线路不可用，系统正在自动切换到备用线路。" : trace.summary
+        case .synthesizing:
+            return trace.summary.isEmpty ? "执行已经结束，正在把结果整理成当前对话里的最终答复。" : trace.summary
+        case .completed:
+            return trace.summary
+        case .failed:
+            return trace.summary
+        }
+    }
+
+    private func elapsedText(referenceDate: Date) -> String {
+        let startDate = trace?.startedAt ?? referenceDate
+        let elapsed = max(0, Int(referenceDate.timeIntervalSince(startDate)))
+        let minutes = elapsed / 60
+        let seconds = elapsed % 60
+        if minutes > 0 {
+            return String(format: "已耗时 %d:%02d", minutes, seconds)
+        }
+        return "已耗时 \(seconds)s"
     }
 }
 

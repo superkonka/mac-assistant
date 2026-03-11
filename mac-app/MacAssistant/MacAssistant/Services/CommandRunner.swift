@@ -35,6 +35,7 @@ class CommandRunner: ObservableObject {
             executionJournal.saveTaskSessions(taskSessions)
         }
     }
+    @Published private(set) var messageExecutionTraces: [UUID: ExecutionTrace] = [:]
     @Published var currentExecutionTrace: ExecutionTrace?
     @Published var isProcessing = false
     
@@ -61,7 +62,8 @@ class CommandRunner: ObservableObject {
     private var isRestartingForScreenRecordingPermission = false
     private var isWaitingForKimiCLILogin = false
     private var pendingKimiCLILoginAgentID: String?
-    private var traceDismissTask: Task<Void, Never>?
+    private var traceDismissTasks: [UUID: Task<Void, Never>] = [:]
+    private var traceSettleTasks: [UUID: Task<Void, Never>] = [:]
     private var isRestoringPersistedState = false
     
     static let shared = CommandRunner()
@@ -228,7 +230,7 @@ class CommandRunner: ObservableObject {
         )
         let userMessageID = userMessage.id
         await MainActor.run {
-            clearExecutionTrace()
+            clearFinishedExecutionTraces()
             messages.append(userMessage)
             isProcessing = true
         }
@@ -1094,7 +1096,7 @@ class CommandRunner: ObservableObject {
         intent: Intent,
         anchorMessageID: UUID
     ) async {
-        await MainActor.run {
+        let traceID = await MainActor.run {
             startExecutionTrace(
                 anchorMessageID: anchorMessageID,
                 agentName: agent.displayName,
@@ -1104,7 +1106,7 @@ class CommandRunner: ObservableObject {
         }
         
         // 发送给 OpenClaw
-        await sendToOpenClaw(agent: agent, text: text, images: images)
+        await sendToOpenClaw(agent: agent, text: text, images: images, traceID: traceID)
     }
     
     /// 处理能力缺口（聊天内引导）
@@ -1186,7 +1188,12 @@ class CommandRunner: ObservableObject {
     
     // MARK: - OpenClaw 集成
     
-    private func sendToOpenClaw(agent: Agent, text: String, images: [String]) async {
+    private func sendToOpenClaw(
+        agent: Agent,
+        text: String,
+        images: [String],
+        traceID: UUID? = nil
+    ) async {
         let startTime = Date()
         let assistantMessage = ChatMessage(
             id: UUID(),
@@ -1200,12 +1207,15 @@ class CommandRunner: ObservableObject {
         do {
             await MainActor.run {
                 messages.append(assistantMessage)
-                attachExecutionTrace(to: assistantMessage.id)
-                updateExecutionTrace(
-                    state: .running,
-                    agentName: agent.displayName,
-                    summary: "\(agent.displayName) 正在返回结果"
-                )
+                if let traceID {
+                    attachExecutionTrace(traceID: traceID, to: assistantMessage.id)
+                    updateExecutionTrace(
+                        traceID: traceID,
+                        state: .running,
+                        agentName: agent.displayName,
+                        summary: "\(agent.displayName) 正在返回结果"
+                    )
+                }
             }
 
             let fullContent = try await sendViaGateway(
@@ -1222,7 +1232,13 @@ class CommandRunner: ObservableObject {
             logger.logPerformance(operation: "openclaw_request", duration: duration)
             
             await MainActor.run {
-                completeExecutionTrace(summary: "这次请求已处理完成")
+                upsertAssistantMessage(
+                    template: assistantMessage,
+                    content: fullContent
+                )
+                if let traceID {
+                    completeExecutionTrace(traceID: traceID, summary: "这次请求已处理完成")
+                }
                 isProcessing = false
             }
             
@@ -1251,18 +1267,31 @@ class CommandRunner: ObservableObject {
                 orchestrator.switchToAgent(fallbackAgent)
 
                 await MainActor.run {
-                    updateExecutionTrace(
-                        state: .fallback,
-                        agentName: fallbackAgent.displayName,
-                        transitionLabel: "自动回退",
-                        summary: "\(agent.displayName) \(UserFacingErrorFormatter.recoveryFailureSummary(for: error))，已切换到 \(fallbackAgent.displayName)"
-                    )
-
-                    if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
-                        messages[index].agentId = fallbackAgent.id
-                        messages[index].agentName = fallbackAgent.name
-                        messages[index].content = "⏳ \(fallbackAgent.name) 正在继续处理..."
+                    if let traceID {
+                        updateExecutionTrace(
+                            traceID: traceID,
+                            state: .fallback,
+                            agentName: fallbackAgent.displayName,
+                            transitionLabel: "自动回退",
+                            summary: "\(agent.displayName) \(UserFacingErrorFormatter.recoveryFailureSummary(for: error))，已切换到 \(fallbackAgent.displayName)"
+                        )
                     }
+                    updateAssistantIdentity(
+                        id: assistantMessage.id,
+                        agentId: fallbackAgent.id,
+                        agentName: fallbackAgent.name
+                    )
+                    upsertAssistantMessage(
+                        template: ChatMessage(
+                            id: assistantMessage.id,
+                            role: .assistant,
+                            content: "⏳ \(fallbackAgent.name) 正在继续处理...",
+                            timestamp: assistantMessage.timestamp,
+                            agentId: fallbackAgent.id,
+                            agentName: fallbackAgent.name
+                        ),
+                        content: "⏳ \(fallbackAgent.name) 正在继续处理..."
+                    )
                 }
 
                 do {
@@ -1282,7 +1311,20 @@ class CommandRunner: ObservableObject {
                     agentStore.restoreAvailability(for: fallbackAgent)
 
                     await MainActor.run {
-                        completeExecutionTrace(summary: "这次请求已处理完成")
+                        upsertAssistantMessage(
+                            template: ChatMessage(
+                                id: assistantMessage.id,
+                                role: .assistant,
+                                content: fallbackContent,
+                                timestamp: assistantMessage.timestamp,
+                                agentId: fallbackAgent.id,
+                                agentName: fallbackAgent.name
+                            ),
+                            content: fallbackContent
+                        )
+                        if let traceID {
+                            completeExecutionTrace(traceID: traceID, summary: "这次请求已处理完成")
+                        }
                         isProcessing = false
                     }
                     return
@@ -1308,20 +1350,24 @@ class CommandRunner: ObservableObject {
                 agentName: terminalAgent.displayName,
                 providerName: terminalAgent.provider.displayName
             )
+            let terminalAgentID = terminalAgent.id
+            let terminalAgentName = terminalAgent.name
             
             await MainActor.run {
-                failExecutionTrace(summary: "这次请求处理失败")
-                if let index = messages.firstIndex(where: { $0.id == assistantMessage.id }) {
-                    messages[index].content = userFacingMessage
-                } else {
-                    let errorMessage = ChatMessage(
-                        id: UUID(),
-                        role: MessageRole.assistant,
-                        content: userFacingMessage,
-                        timestamp: Date()
-                    )
-                    messages.append(errorMessage)
+                if let traceID {
+                    failExecutionTrace(traceID: traceID, summary: "这次请求处理失败")
                 }
+                upsertAssistantMessage(
+                    template: ChatMessage(
+                        id: assistantMessage.id,
+                        role: .assistant,
+                        content: userFacingMessage,
+                        timestamp: assistantMessage.timestamp,
+                        agentId: terminalAgentID,
+                        agentName: terminalAgentName
+                    ),
+                    content: userFacingMessage
+                )
                 isProcessing = false
             }
         }
@@ -1666,12 +1712,15 @@ class CommandRunner: ObservableObject {
                     summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
                 )
             } else {
-                self.updateExecutionTrace(
-                    state: .fallback,
-                    agentName: agent.displayName,
-                    transitionLabel: "直接 CLI",
-                    summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
-                )
+                if let traceID = self.currentExecutionTrace?.id {
+                    self.updateExecutionTrace(
+                        traceID: traceID,
+                        state: .fallback,
+                        agentName: agent.displayName,
+                        transitionLabel: "直接 CLI",
+                        summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
+                    )
+                }
                 self.updateAssistantMessage(
                     id: assistantMessageID,
                     content: "⏳ OpenClaw 当前不可用，正在直接调用 Kimi CLI..."
@@ -1870,11 +1919,13 @@ class CommandRunner: ObservableObject {
             return
         }
 
-        taskSessions[sessionIndex].messages[messageIndex].content = content
-        taskSessions[sessionIndex].updatedAt = Date()
-        if taskSessions[sessionIndex].messages[messageIndex].role == .assistant {
-            taskSessions[sessionIndex].latestAssistantText = content
+        var updatedSessions = taskSessions
+        updatedSessions[sessionIndex].messages[messageIndex].content = content
+        updatedSessions[sessionIndex].updatedAt = Date()
+        if updatedSessions[sessionIndex].messages[messageIndex].role == .assistant {
+            updatedSessions[sessionIndex].latestAssistantText = content
         }
+        taskSessions = updatedSessions
     }
 
     @MainActor
@@ -2474,9 +2525,9 @@ class CommandRunner: ObservableObject {
             return preferredAgent(for: .textChat)
         }
 
-        await MainActor.run {
+        let traceID = await MainActor.run { () -> UUID? in
             if let traceAnchorMessageID {
-                startExecutionTrace(
+                return startExecutionTrace(
                     anchorMessageID: traceAnchorMessageID,
                     agentName: reflectionAgent?.displayName ?? delegateAgent.displayName,
                     intentName: "结果整合",
@@ -2485,11 +2536,14 @@ class CommandRunner: ObservableObject {
                     transitionLabel: "子会话回流"
                 )
             }
+            return nil
         }
 
         guard let reflectionAgent else {
             await MainActor.run {
-                completeExecutionTrace(summary: "已直接回流子会话结果")
+                if let traceID {
+                    completeExecutionTrace(traceID: traceID, summary: "已直接回流子会话结果")
+                }
                 let fallbackMessage = ChatMessage(
                     id: UUID(),
                     role: .assistant,
@@ -2520,7 +2574,7 @@ class CommandRunner: ObservableObject {
         3. 如果信息不足，明确说明还缺什么。
         """
 
-        _ = await sendToOpenClaw(agent: reflectionAgent, text: reflectionPrompt, images: [])
+        _ = await sendToOpenClaw(agent: reflectionAgent, text: reflectionPrompt, images: [], traceID: traceID)
     }
 
     private func streamLocalBridgeForTask(
@@ -3197,9 +3251,39 @@ class CommandRunner: ObservableObject {
     @MainActor
     private func updateAssistantMessage(id: UUID, content: String) {
         if let index = messages.firstIndex(where: { $0.id == id }) {
-            guard messages[index].content != content else { return }
-            messages[index].content = content
+            if messages[index].content == content {
+                scheduleTraceSettlementIfNeeded(forAssistantMessageID: id, content: content)
+                return
+            }
+            var updatedMessages = messages
+            updatedMessages[index].content = content
+            messages = updatedMessages
+            scheduleTraceSettlementIfNeeded(forAssistantMessageID: id, content: content)
         }
+    }
+
+    @MainActor
+    private func updateAssistantIdentity(id: UUID, agentId: String?, agentName: String?) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        guard messages[index].agentId != agentId || messages[index].agentName != agentName else { return }
+        var updatedMessages = messages
+        updatedMessages[index].agentId = agentId
+        updatedMessages[index].agentName = agentName
+        messages = updatedMessages
+    }
+
+    @MainActor
+    private func upsertAssistantMessage(template: ChatMessage, content: String) {
+        if messages.contains(where: { $0.id == template.id }) {
+            updateAssistantMessage(id: template.id, content: content)
+            return
+        }
+
+        var recoveredMessage = template
+        recoveredMessage.content = content
+        messages.append(recoveredMessage)
+        scheduleTraceSettlementIfNeeded(forAssistantMessageID: template.id, content: content)
+        LogInfo("恢复缺失的 assistant 消息并补写最终内容: \(template.id.uuidString)")
     }
 
     @MainActor
@@ -3210,9 +3294,8 @@ class CommandRunner: ObservableObject {
         summary: String,
         state: ExecutionTraceState = .routing,
         transitionLabel: String? = nil
-    ) {
-        traceDismissTask?.cancel()
-        currentExecutionTrace = ExecutionTrace(
+    ) -> UUID {
+        let trace = ExecutionTrace(
             anchorMessageID: anchorMessageID,
             agentName: agentName,
             intentName: intentName,
@@ -3220,25 +3303,32 @@ class CommandRunner: ObservableObject {
             summary: summary,
             state: state
         )
+        traceDismissTasks[trace.id]?.cancel()
+        traceDismissTasks[trace.id] = nil
+        messageExecutionTraces[trace.id] = trace
+        refreshCurrentExecutionTrace()
+        return trace.id
     }
 
     @MainActor
-    private func attachExecutionTrace(to assistantMessageID: UUID) {
-        guard var trace = currentExecutionTrace else { return }
+    private func attachExecutionTrace(traceID: UUID, to assistantMessageID: UUID) {
+        guard var trace = messageExecutionTraces[traceID] else { return }
         trace.assistantMessageID = assistantMessageID
-        currentExecutionTrace = trace
+        messageExecutionTraces[traceID] = trace
+        refreshCurrentExecutionTrace()
     }
 
     @MainActor
     private func updateExecutionTrace(
+        traceID: UUID,
         state: ExecutionTraceState,
         agentName: String? = nil,
         intentName: String? = nil,
         transitionLabel: String? = nil,
         summary: String? = nil
     ) {
-        guard var trace = currentExecutionTrace else { return }
-        traceDismissTask?.cancel()
+        guard var trace = messageExecutionTraces[traceID] else { return }
+        traceDismissTasks[traceID]?.cancel()
         trace.state = state
         if let agentName {
             trace.agentName = agentName
@@ -3253,39 +3343,123 @@ class CommandRunner: ObservableObject {
         if !state.isActive {
             trace.finishedAt = Date()
         }
-        currentExecutionTrace = trace
+        messageExecutionTraces[traceID] = trace
+        refreshCurrentExecutionTrace()
     }
 
     @MainActor
-    private func completeExecutionTrace(summary: String) {
-        updateExecutionTrace(state: .completed, summary: summary)
-        scheduleExecutionTraceDismiss(after: 1.6)
+    private func completeExecutionTrace(traceID: UUID, summary: String) {
+        traceSettleTasks[traceID]?.cancel()
+        traceSettleTasks[traceID] = nil
+        updateExecutionTrace(traceID: traceID, state: .completed, summary: summary)
+        scheduleExecutionTraceDismiss(traceID: traceID, after: 1.6)
     }
 
     @MainActor
-    private func failExecutionTrace(summary: String) {
-        updateExecutionTrace(state: .failed, summary: summary)
-        scheduleExecutionTraceDismiss(after: 4)
+    private func failExecutionTrace(traceID: UUID, summary: String) {
+        traceSettleTasks[traceID]?.cancel()
+        traceSettleTasks[traceID] = nil
+        updateExecutionTrace(traceID: traceID, state: .failed, summary: summary)
+        scheduleExecutionTraceDismiss(traceID: traceID, after: 4)
     }
 
     @MainActor
-    private func clearExecutionTrace() {
-        traceDismissTask?.cancel()
-        traceDismissTask = nil
-        currentExecutionTrace = nil
+    private func clearFinishedExecutionTraces() {
+        let finishedIDs = messageExecutionTraces.values
+            .filter { !$0.state.isActive }
+            .map(\.id)
+
+        for traceID in finishedIDs {
+            traceDismissTasks[traceID]?.cancel()
+            traceDismissTasks[traceID] = nil
+            traceSettleTasks[traceID]?.cancel()
+            traceSettleTasks[traceID] = nil
+            messageExecutionTraces.removeValue(forKey: traceID)
+        }
+
+        refreshCurrentExecutionTrace()
     }
 
     @MainActor
-    private func scheduleExecutionTraceDismiss(after delay: TimeInterval) {
-        guard let traceID = currentExecutionTrace?.id else { return }
-        traceDismissTask?.cancel()
-        traceDismissTask = Task { @MainActor [weak self] in
+    private func scheduleExecutionTraceDismiss(traceID: UUID, after delay: TimeInterval) {
+        traceDismissTasks[traceID]?.cancel()
+        traceDismissTasks[traceID] = Task { @MainActor [weak self] in
             let duration = UInt64(max(delay, 0) * 1_000_000_000)
             try? await Task.sleep(nanoseconds: duration)
-            guard let self, self.currentExecutionTrace?.id == traceID else { return }
-            self.currentExecutionTrace = nil
-            self.traceDismissTask = nil
+            guard let self else { return }
+            self.messageExecutionTraces.removeValue(forKey: traceID)
+            self.traceDismissTasks[traceID] = nil
+            self.traceSettleTasks[traceID]?.cancel()
+            self.traceSettleTasks[traceID] = nil
+            self.refreshCurrentExecutionTrace()
         }
+    }
+
+    @MainActor
+    private func scheduleTraceSettlementIfNeeded(forAssistantMessageID messageID: UUID, content: String) {
+        guard let traceID = traceID(forAssistantMessageID: messageID),
+              let trace = messageExecutionTraces[traceID],
+              trace.state.isActive else {
+            return
+        }
+
+        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isProcessingPlaceholderContent(trimmed) else {
+            traceSettleTasks[traceID]?.cancel()
+            traceSettleTasks[traceID] = nil
+            return
+        }
+
+        traceSettleTasks[traceID]?.cancel()
+        traceSettleTasks[traceID] = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_200_000_000)
+            guard let self,
+                  let currentTrace = self.messageExecutionTraces[traceID],
+                  currentTrace.state.isActive else {
+                return
+            }
+            self.completeExecutionTrace(traceID: traceID, summary: "结果已经返回到聊天窗口")
+            LogInfo("Trace quiet-settled after assistant content stabilized: \(traceID.uuidString)")
+        }
+    }
+
+    @MainActor
+    private func traceID(forAssistantMessageID messageID: UUID) -> UUID? {
+        messageExecutionTraces.values.first { $0.assistantMessageID == messageID }?.id
+    }
+
+    private func isProcessingPlaceholderContent(_ content: String) -> Bool {
+        guard content.hasPrefix("⏳ ") else { return false }
+        return content.contains("正在思考") ||
+            content.contains("正在继续处理") ||
+            content.contains("正在连接") ||
+            content.contains("正在直接调用")
+    }
+
+    @MainActor
+    func executionTrace(forMessageID messageID: UUID) -> ExecutionTrace? {
+        messageExecutionTraces.values
+            .filter { trace in
+                if let assistantMessageID = trace.assistantMessageID {
+                    return assistantMessageID == messageID
+                }
+                return trace.anchorMessageID == messageID
+            }
+            .sorted { lhs, rhs in
+                if lhs.state.isActive != rhs.state.isActive {
+                    return lhs.state.isActive && !rhs.state.isActive
+                }
+                return lhs.startedAt > rhs.startedAt
+            }
+            .first
+    }
+
+    @MainActor
+    private func refreshCurrentExecutionTrace() {
+        currentExecutionTrace = messageExecutionTraces.values
+            .filter(\.state.isActive)
+            .sorted { $0.startedAt > $1.startedAt }
+            .first
     }
     
     // MARK: - 辅助方法
@@ -3461,7 +3635,6 @@ class CommandRunner: ObservableObject {
 
         messages = StorageManager.shared.getRecentMessages(limit: 50)
         taskSessions = normalizeRestoredTaskSessions(executionJournal.loadTaskSessions())
-        StorageManager.shared.replaceRecentMessages(messages)
         executionJournal.saveTaskSessions(taskSessions)
     }
 

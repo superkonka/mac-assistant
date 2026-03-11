@@ -15,14 +15,7 @@ class HotStorage {
     // MARK: - 消息存储
     
     func appendMessage(_ message: ChatMessage) {
-        var messages = getMessages()
-        messages.append(message)
-        
-        // 只保留最近的消息
-        if messages.count > maxMessages {
-            messages = Array(messages.suffix(maxMessages))
-        }
-        
+        let messages = normalizeMessages(getMessages() + [message], limit: maxMessages)
         saveMessages(messages)
     }
     
@@ -31,25 +24,16 @@ class HotStorage {
               let messages = try? JSONDecoder().decode([ChatMessage].self, from: data) else {
             return []
         }
-        return messages
+        return normalizeMessages(messages)
     }
 
     func replaceMessages(_ messages: [ChatMessage]) {
-        let trimmedMessages: [ChatMessage]
-        if messages.count > maxMessages {
-            trimmedMessages = Array(messages.suffix(maxMessages))
-        } else {
-            trimmedMessages = messages
-        }
-        saveMessages(trimmedMessages)
+        saveMessages(normalizeMessages(messages, limit: maxMessages))
     }
     
     func trimTo(limit: Int) {
-        var messages = getMessages()
-        if messages.count > limit {
-            messages = Array(messages.suffix(limit))
-            saveMessages(messages)
-        }
+        let messages = normalizeMessages(getMessages(), limit: limit)
+        saveMessages(messages)
     }
     
     func search(query: String) -> [ChatMessage] {
@@ -62,6 +46,25 @@ class HotStorage {
         if let data = try? JSONEncoder().encode(messages) {
             defaults.set(data, forKey: messagesKey)
         }
+    }
+
+    private func normalizeMessages(_ messages: [ChatMessage], limit: Int? = nil) -> [ChatMessage] {
+        var latestByID: [UUID: ChatMessage] = [:]
+        for message in messages {
+            latestByID[message.id] = message
+        }
+
+        let sorted = latestByID.values.sorted { lhs, rhs in
+            if lhs.timestamp == rhs.timestamp {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.timestamp < rhs.timestamp
+        }
+
+        if let limit, sorted.count > limit {
+            return Array(sorted.suffix(limit))
+        }
+        return sorted
     }
     
     // MARK: - 活跃技能管理

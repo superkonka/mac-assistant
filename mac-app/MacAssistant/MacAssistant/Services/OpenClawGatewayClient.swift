@@ -175,15 +175,19 @@ actor OpenClawGatewayClient {
 
                         switch payload.state {
                         case "final":
-                            let history = try await self.chatHistory(sessionKey: resolvedSessionKey)
-                            knownSessionID = self.normalizedSessionID(history.sessionId) ?? knownSessionID
-                            let finalText =
+                            let payloadText = self.extractAssistantText(from: payload.message)
+                            let history = payloadText == nil
+                                ? (try? await self.chatHistory(sessionKey: resolvedSessionKey))
+                                : nil
+                            knownSessionID = self.normalizedSessionID(history?.sessionId) ?? knownSessionID
+                            let historyText = history.flatMap {
                                 self.extractLatestAssistantText(
-                                    from: history,
+                                    from: $0,
                                     newerThan: requestStartedAtMs
-                                ) ??
-                                self.normalizedNonEmptyText(latestAssistantText) ??
-                                self.extractLatestAssistantText(from: history)
+                                ) ?? self.extractLatestAssistantText(from: $0)
+                            }
+                            let bufferedText = self.normalizedNonEmptyText(latestAssistantText)
+                            let finalText = payloadText ?? historyText ?? bufferedText
                             let resolvedFinalText = finalText ?? "服务已返回，但没有拿到可显示的内容。"
                             if let onAssistantText,
                                resolvedFinalText != lastForwardedAssistantText {
@@ -191,9 +195,19 @@ actor OpenClawGatewayClient {
                                 lastForwardedAssistantTextAt = Date()
                                 await onAssistantText(resolvedFinalText)
                             }
+                            let finalSource: String
+                            if payloadText != nil {
+                                finalSource = "payload"
+                            } else if historyText != nil {
+                                finalSource = "history"
+                            } else if bufferedText != nil {
+                                finalSource = "buffer"
+                            } else {
+                                finalSource = "fallback"
+                            }
                             LogInfo(
                                 "OpenClaw chat.final received agent=\(agent.id) " +
-                                "sessionKey=\(resolvedSessionKey)"
+                                "sessionKey=\(resolvedSessionKey) source=\(finalSource)"
                             )
                             return resolvedFinalText
 
@@ -422,6 +436,52 @@ actor OpenClawGatewayClient {
                 .compactMap(\.text)
                 .joined(separator: "\n")
         )
+    }
+
+    private func extractAssistantText(from payload: AnyCodable?) -> String? {
+        guard let payload else {
+            return nil
+        }
+
+        if let message = try? self.decodePayload(payload, as: OpenClawChatMessage.self),
+           let text = self.normalizedAssistantText(from: message) {
+            return text
+        }
+
+        return self.extractAssistantText(fromValue: payload.value)
+    }
+
+    private func extractAssistantText(fromValue value: Any) -> String? {
+        switch value {
+        case let text as String:
+            return self.normalizedNonEmptyText(text)
+
+        case let dict as [String: AnyCodable]:
+            if let text = dict["text"]?.value as? String,
+               let normalized = self.normalizedNonEmptyText(text) {
+                return normalized
+            }
+
+            if let message = dict["message"],
+               let nested = self.extractAssistantText(from: message) {
+                return nested
+            }
+
+            if let content = dict["content"],
+               let nested = self.extractAssistantText(from: content) {
+                return nested
+            }
+
+            return nil
+
+        case let array as [AnyCodable]:
+            let combined = array.compactMap { self.extractAssistantText(from: $0) }
+                .joined(separator: "\n")
+            return self.normalizedNonEmptyText(combined)
+
+        default:
+            return nil
+        }
     }
 
     private func recoverAssistantText(

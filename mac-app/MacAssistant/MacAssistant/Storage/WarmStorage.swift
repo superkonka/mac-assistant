@@ -109,7 +109,7 @@ class WarmStorage {
             message.id.uuidString,
             message.role.rawValue,
             message.content,
-            metadata.timestamp.timeIntervalSince1970,
+            message.timestamp.timeIntervalSince1970,
             metadata.priority.rawValue,
             metadata.lifetime.hashValue,
             metadata.accessCount,
@@ -117,6 +117,29 @@ class WarmStorage {
             tagsString,
             0
         ])
+    }
+
+    func upsertRecentMessages(_ messages: [ChatMessage]) {
+        for message in messages {
+            let sql = """
+                INSERT OR REPLACE INTO messages
+                (id, role, content, timestamp, priority, lifetime, access_count, last_access, tags, is_distilled)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE((SELECT is_distilled FROM messages WHERE id = ?), 0));
+            """
+
+            execute(sql, params: [
+                message.id.uuidString,
+                message.role.rawValue,
+                message.content,
+                message.timestamp.timeIntervalSince1970,
+                DataPriority.normal.rawValue,
+                DataLifetime.shortTerm.hashValue,
+                1,
+                message.timestamp.timeIntervalSince1970,
+                "",
+                message.id.uuidString
+            ])
+        }
     }
     
     func getRecentMessages(limit: Int) -> [ChatMessage] {

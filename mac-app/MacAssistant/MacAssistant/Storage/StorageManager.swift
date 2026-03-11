@@ -95,21 +95,41 @@ class StorageManager {
     // MARK: - 读取数据（智能检索）
     
     func getRecentMessages(limit: Int = 50) -> [ChatMessage] {
-        // 优先从热存储读取
         let hotMessages = hotStorage.getMessages()
-        if hotMessages.count >= limit {
-            return Array(hotMessages.prefix(limit))
+        let warmMessages = warmStorage.getRecentMessages(limit: max(limit * 3, limit))
+
+        var mergedByID: [UUID: ChatMessage] = [:]
+
+        for message in warmMessages {
+            mergedByID[message.id] = message
         }
-        
-        // 补充从温存储读取
-        let remaining = limit - hotMessages.count
-        let warmMessages = warmStorage.getRecentMessages(limit: remaining)
-        
-        return hotMessages + warmMessages
+
+        for message in hotMessages {
+            mergedByID[message.id] = message
+        }
+
+        let merged = mergedByID.values.sorted { lhs, rhs in
+            if lhs.timestamp == rhs.timestamp {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.timestamp < rhs.timestamp
+        }
+
+        if merged.count > limit {
+            return Array(merged.suffix(limit))
+        }
+        return merged
     }
 
     func replaceRecentMessages(_ messages: [ChatMessage]) {
-        hotStorage.replaceMessages(messages)
+        let normalized = messages.sorted { lhs, rhs in
+            if lhs.timestamp == rhs.timestamp {
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            return lhs.timestamp < rhs.timestamp
+        }
+        hotStorage.replaceMessages(normalized)
+        warmStorage.upsertRecentMessages(normalized)
     }
     
     func searchMessages(query: String) -> [ChatMessage] {
