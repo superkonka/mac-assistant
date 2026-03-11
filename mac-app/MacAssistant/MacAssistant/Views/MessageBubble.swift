@@ -257,34 +257,43 @@ struct BubbleShape: Shape {
         var path = Path()
         let cornerRadius: CGFloat = 16
         let tailSize: CGFloat = 8
+        let tailY: CGFloat = rect.minY + cornerRadius + 4 // 尾巴在顶部位置，指向头像
         
         if isUser {
-            // 用户气泡：右侧有小尾巴
+            // 用户气泡：右侧顶部有小尾巴
             path.move(to: CGPoint(x: rect.minX, y: rect.minY + cornerRadius))
             path.addQuadCurve(to: CGPoint(x: rect.minX + cornerRadius, y: rect.minY),
                               control: CGPoint(x: rect.minX, y: rect.minY))
             path.addLine(to: CGPoint(x: rect.maxX - cornerRadius - tailSize, y: rect.minY))
             path.addQuadCurve(to: CGPoint(x: rect.maxX - tailSize, y: rect.minY + cornerRadius),
                               control: CGPoint(x: rect.maxX - tailSize, y: rect.minY))
+            // 尾巴指向右上方的头像
+            path.addLine(to: CGPoint(x: rect.maxX - tailSize, y: tailY - 4))
+            path.addLine(to: CGPoint(x: rect.maxX, y: tailY - 8)) // 尾巴尖端
+            path.addLine(to: CGPoint(x: rect.maxX, y: tailY + 4))
+            path.addLine(to: CGPoint(x: rect.maxX - tailSize, y: tailY + 8))
             path.addLine(to: CGPoint(x: rect.maxX - tailSize, y: rect.maxY - cornerRadius))
-            path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.maxY),
-                              control: CGPoint(x: rect.maxX, y: rect.maxY))
-            path.addLine(to: CGPoint(x: rect.maxX - tailSize - 4, y: rect.maxY - 4))
+            path.addQuadCurve(to: CGPoint(x: rect.maxX - tailSize - cornerRadius, y: rect.maxY),
+                              control: CGPoint(x: rect.maxX - tailSize, y: rect.maxY))
             path.addLine(to: CGPoint(x: rect.minX + cornerRadius, y: rect.maxY))
             path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY - cornerRadius),
                               control: CGPoint(x: rect.minX, y: rect.maxY))
         } else {
-            // AI 气泡：左侧有小尾巴
+            // AI 气泡：左侧顶部有小尾巴
             path.move(to: CGPoint(x: rect.maxX, y: rect.minY + cornerRadius))
             path.addQuadCurve(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.minY),
                               control: CGPoint(x: rect.maxX, y: rect.minY))
             path.addLine(to: CGPoint(x: rect.minX + cornerRadius + tailSize, y: rect.minY))
             path.addQuadCurve(to: CGPoint(x: rect.minX + tailSize, y: rect.minY + cornerRadius),
                               control: CGPoint(x: rect.minX + tailSize, y: rect.minY))
+            // 尾巴指向左上方的头像
+            path.addLine(to: CGPoint(x: rect.minX + tailSize, y: tailY - 4))
+            path.addLine(to: CGPoint(x: rect.minX, y: tailY - 8)) // 尾巴尖端
+            path.addLine(to: CGPoint(x: rect.minX, y: tailY + 4))
+            path.addLine(to: CGPoint(x: rect.minX + tailSize, y: tailY + 8))
             path.addLine(to: CGPoint(x: rect.minX + tailSize, y: rect.maxY - cornerRadius))
-            path.addQuadCurve(to: CGPoint(x: rect.minX, y: rect.maxY),
-                              control: CGPoint(x: rect.minX, y: rect.maxY))
-            path.addLine(to: CGPoint(x: rect.minX + tailSize + 4, y: rect.maxY - 4))
+            path.addQuadCurve(to: CGPoint(x: rect.minX + tailSize + cornerRadius, y: rect.maxY),
+                              control: CGPoint(x: rect.minX + tailSize, y: rect.maxY))
             path.addLine(to: CGPoint(x: rect.maxX - cornerRadius, y: rect.maxY))
             path.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.maxY - cornerRadius),
                               control: CGPoint(x: rect.maxX, y: rect.maxY))
