@@ -9,7 +9,8 @@ final class LocalKimiCLIService {
         text: String,
         attachments: [String],
         sessionKey: String?,
-        timeout: TimeInterval = 180
+        timeout: TimeInterval = 180,
+        requestSource: String = "direct"
     ) async throws -> String {
         try await Task.detached(priority: .userInitiated) {
             if let attachmentError = self.unsupportedAttachmentMessage(for: attachments) {
@@ -29,12 +30,13 @@ final class LocalKimiCLIService {
             }
 
             let prompt = self.composePrompt(text: text, attachments: attachments)
+            let normalizedSessionKey = self.normalizedSessionKey(sessionKey)
             let process = Process()
             let inputPipe = Pipe()
             let outputPipe = Pipe()
 
             process.executableURL = URL(fileURLWithPath: executablePath)
-            process.arguments = self.arguments(sessionKey: sessionKey)
+            process.arguments = self.arguments(normalizedSessionKey: normalizedSessionKey)
             process.standardInput = inputPipe
             process.standardOutput = outputPipe
             process.standardError = outputPipe
@@ -44,6 +46,12 @@ final class LocalKimiCLIService {
             environment["KIMI_NO_COLOR"] = "1"
             environment["LANG"] = "zh_CN.UTF-8"
             process.environment = environment
+
+            LogInfo(
+                "LocalKimiCLI send start " +
+                "source=\(requestSource) sessionKey=\(normalizedSessionKey ?? "none") " +
+                "timeout=\(Int(timeout))s attachments=\(attachments.count)"
+            )
 
             let promptData = Data(prompt.utf8)
             var didTimeout = false
@@ -67,6 +75,11 @@ final class LocalKimiCLIService {
                 let output = self.sanitizedOutput(rawOutput)
 
                 if didTimeout {
+                    LogWarning(
+                        "LocalKimiCLI timed out " +
+                        "source=\(requestSource) sessionKey=\(normalizedSessionKey ?? "none") " +
+                        "timeout=\(Int(timeout))s"
+                    )
                     throw NSError(
                         domain: NSURLErrorDomain,
                         code: URLError.timedOut.rawValue,
@@ -96,15 +109,30 @@ final class LocalKimiCLIService {
                     )
                 }
 
-                return UserFacingErrorFormatter.normalizeCLIOutput(output.isEmpty ? rawOutput : output, providerName: "本地 Kimi CLI")
+                let normalizedOutput = UserFacingErrorFormatter.normalizeCLIOutput(
+                    output.isEmpty ? rawOutput : output,
+                    providerName: "本地 Kimi CLI"
+                )
+                LogInfo(
+                    "LocalKimiCLI send completed " +
+                    "source=\(requestSource) sessionKey=\(normalizedSessionKey ?? "none") " +
+                    "exitStatus=\(process.terminationStatus) outputLength=\(normalizedOutput.count)"
+                )
+                return normalizedOutput
             } catch {
                 timeoutWorkItem.cancel()
+                LogError(
+                    "LocalKimiCLI send failed " +
+                    "source=\(requestSource) sessionKey=\(normalizedSessionKey ?? "none") " +
+                    "timeout=\(Int(timeout))s",
+                    error: error
+                )
                 throw error
             }
         }.value
     }
 
-    private func arguments(sessionKey: String?) -> [String] {
+    private func arguments(normalizedSessionKey: String?) -> [String] {
         var arguments = [
             "--quiet",
             "-y",
@@ -114,8 +142,8 @@ final class LocalKimiCLIService {
             "--final-message-only",
         ]
 
-        if let sessionKey = normalizedSessionKey(sessionKey) {
-            arguments.append(contentsOf: ["--session", sessionKey])
+        if let normalizedSessionKey {
+            arguments.append(contentsOf: ["--session", normalizedSessionKey])
         }
 
         return arguments

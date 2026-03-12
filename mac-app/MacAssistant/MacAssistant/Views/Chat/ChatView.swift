@@ -22,6 +22,7 @@ struct ChatView: View {
     @State private var showWizard: Bool = false
     @State private var showSkills: Bool = false
     @State private var showClawDoctor: Bool = false
+    @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
     @State private var lastStreamingScrollAt: Date = .distantPast
@@ -35,7 +36,9 @@ struct ChatView: View {
         VStack(spacing: 0) {
             // 顶部工具栏
             topBar
-            
+
+            taskSessionPanel
+
             Divider()
             
             // 消息列表
@@ -66,6 +69,9 @@ struct ChatView: View {
         }
         .onChange(of: agentStore.usableAgents.count) { _ in
             presentInitialSetupIfNeeded()
+        }
+        .onChange(of: taskSessionIDs) { _ in
+            synchronizeSelectedTaskSession()
         }
         .sheet(isPresented: $showAgentList) {
             AgentListView()
@@ -109,7 +115,7 @@ struct ChatView: View {
     // MARK: - 子视图
     
     private var topBar: some View {
-        HStack {
+        HStack(spacing: 10) {
             // Agent 选择器
             Button(action: { showAgentList = true }) {
                 HStack(spacing: 4) {
@@ -130,19 +136,26 @@ struct ChatView: View {
             OpenClawStatusEntry(doctor: clawDoctor) {
                 showClawDoctor = true
             }
-            
-            Spacer()
-            
-            // 快速提示
+
+            if !taskSessionsForDisplay.isEmpty {
+                TaskSessionTabsView(
+                    sessions: taskSessionsForDisplay,
+                    selectedSessionID: selectedTaskSessionID,
+                    onToggleSelection: toggleTaskSessionPanel
+                )
+                .frame(maxWidth: 520)
+            }
+
+            Spacer(minLength: 12)
+
             if let suggestion = orchestrator.getSuggestion(for: inputText) {
                 Text(suggestion)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
+                    .frame(maxWidth: 220, alignment: .trailing)
             }
-            
-            Spacer()
-            
+
             // 设置按钮
             Button(action: { showSkills = true }) {
                 Image(systemName: "wand.and.stars")
@@ -163,14 +176,14 @@ struct ChatView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(spacing: 16) {
-                        if commandRunner.messages.isEmpty && agentStore.needsInitialSetup {
+                        if visibleMessages.isEmpty && agentStore.needsInitialSetup {
                             InitialSetupCard {
                                 currentGap = nil
                                 showWizard = true
                             }
                         }
 
-                        ForEach(commandRunner.messages) { message in
+                        ForEach(visibleMessages) { message in
                             let trace = commandRunner.executionTrace(forMessageID: message.id)
                             let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
                             let detectedSkillSuggestion = message.detectedSkillSuggestion
@@ -179,18 +192,8 @@ struct ChatView: View {
                                 MessageBubble(
                                     message: message,
                                     availableWidth: availableBubbleWidth,
-                                    taskSession: commandRunner.taskSession(for: message.linkedTaskSessionID),
+                                    taskSession: nil,
                                     detectedSkillSuggestion: detectedSkillSuggestion,
-                                    onToggleTaskSession: {
-                                        if let taskSessionID = message.linkedTaskSessionID {
-                                            commandRunner.toggleTaskSessionExpansion(taskSessionID)
-                                        }
-                                    },
-                                    onResumeTaskSession: {
-                                        if let taskSessionID = message.linkedTaskSessionID {
-                                            commandRunner.resumeTaskSession(taskSessionID)
-                                        }
-                                    },
                                     onDetectedSkillSuggestionAction: { action in
                                         Task {
                                             await commandRunner.handleDetectedSkillSuggestionAction(
@@ -299,6 +302,19 @@ struct ChatView: View {
         .background(AppColors.controlBackground.opacity(0.5))
     }
 
+    @ViewBuilder
+    private var taskSessionPanel: some View {
+        if let selectedTaskSession {
+            TaskSessionInspectorPanel(
+                session: selectedTaskSession,
+                onClose: { selectedTaskSessionID = nil },
+                onResume: {
+                    commandRunner.resumeTaskSession(selectedTaskSession.id)
+                }
+            )
+        }
+    }
+
     private var processingStatusDock: some View {
         InlineProcessingBar(
             trace: commandRunner.currentExecutionTrace,
@@ -321,14 +337,36 @@ struct ChatView: View {
         return "\(message.id.uuidString)-\(hasher.finalize())"
     }
 
+    private var visibleMessages: [ChatMessage] {
+        commandRunner.messages.filter { $0.linkedTaskSessionID == nil }
+    }
+
+    private var taskSessionsForDisplay: [AgentTaskSession] {
+        commandRunner.taskSessions.sorted {
+            if $0.updatedAt == $1.updatedAt {
+                return $0.createdAt > $1.createdAt
+            }
+            return $0.updatedAt > $1.updatedAt
+        }
+    }
+
+    private var taskSessionIDs: [String] {
+        taskSessionsForDisplay.map(\.id)
+    }
+
+    private var selectedTaskSession: AgentTaskSession? {
+        guard let selectedTaskSessionID else { return nil }
+        return commandRunner.taskSession(for: selectedTaskSessionID)
+    }
+
     private var messageListRevision: String {
-        commandRunner.messages
+        visibleMessages
             .map { messageRenderIdentity(for: $0) }
             .joined(separator: "|")
     }
 
     private var latestMessageRenderIdentity: String {
-        guard let message = commandRunner.messages.last else { return "empty" }
+        guard let message = visibleMessages.last else { return "empty" }
         return messageRenderIdentity(for: message)
     }
 
@@ -337,7 +375,7 @@ struct ChatView: View {
         guard let trace = commandRunner.currentExecutionTrace else { return true }
 
         let inlineMessageID = trace.assistantMessageID ?? trace.anchorMessageID
-        return !commandRunner.messages.contains(where: { $0.id == inlineMessageID })
+        return !visibleMessages.contains(where: { $0.id == inlineMessageID })
     }
 
     private func shouldHideAssistantPlaceholder(_ message: ChatMessage, trace: ExecutionTrace?) -> Bool {
@@ -453,7 +491,7 @@ struct ChatView: View {
     }
 
     private func handleMessageCountChange(using proxy: ScrollViewProxy) {
-        guard let latest = commandRunner.messages.last else { return }
+        guard let latest = visibleMessages.last else { return }
         let shouldForce = latest.role == .user
         if shouldForce {
             shouldFollowLatest = true
@@ -480,6 +518,20 @@ struct ChatView: View {
         currentGap = nil
         showWizard = true
         hasAutoPresentedInitialSetup = true
+    }
+
+    private func toggleTaskSessionPanel(_ sessionID: String) {
+        withAnimation(.easeInOut(duration: 0.18)) {
+            selectedTaskSessionID = selectedTaskSessionID == sessionID ? nil : sessionID
+        }
+    }
+
+    private func synchronizeSelectedTaskSession() {
+        guard let selectedTaskSessionID else { return }
+        guard taskSessionIDs.contains(selectedTaskSessionID) else {
+            self.selectedTaskSessionID = nil
+            return
+        }
     }
 }
 

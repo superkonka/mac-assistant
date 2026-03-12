@@ -124,6 +124,9 @@ class OpenClawGatewayRuntimeManager {
             self.lastGatewayHealthCheckAt = .distantPast
             self.lastGatewayHealthWasOK = false
             try await self.stopGatewayIfNeeded()
+            try self.startGatewayProcess()
+            try await self.waitUntilHealthy()
+            return self.managedState
         }
 
         if !self.gatewayHealthOK() {
@@ -383,11 +386,9 @@ class OpenClawGatewayRuntimeManager {
                 "enabled": true,
                 "maxChars": 50_000,
                 "maxCharsCap": 50_000,
-                "maxResponseBytes": 2_000_000,
                 "timeoutSeconds": 30,
                 "cacheTtlMinutes": 15,
                 "maxRedirects": 3,
-                "readability": true,
             ]
         ]
 
@@ -606,6 +607,7 @@ class OpenClawGatewayRuntimeManager {
             gatewayProcess.terminate()
             gatewayProcess.waitUntilExit()
         }
+        try self.terminateStaleGatewayListeners()
         self.gatewayProcess = nil
         self.lastGatewayHealthCheckAt = .distantPast
         self.lastGatewayHealthWasOK = false
@@ -645,6 +647,7 @@ class OpenClawGatewayRuntimeManager {
                 "gateway",
                 "run",
                 "--allow-unconfigured",
+                "--force",
                 "--bind", "loopback",
                 "--port", "\(self.gatewayPort)",
                 "--auth", "none",
@@ -658,6 +661,7 @@ class OpenClawGatewayRuntimeManager {
                 "gateway",
                 "run",
                 "--allow-unconfigured",
+                "--force",
                 "--bind", "loopback",
                 "--port", "\(self.gatewayPort)",
                 "--auth", "none",
@@ -714,6 +718,78 @@ class OpenClawGatewayRuntimeManager {
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = dependencyManager.pathEnvironment()
         return environment
+    }
+
+    private func terminateStaleGatewayListeners() throws {
+        let listenerLookup = Self.executeCommand(
+            executablePath: "/usr/sbin/lsof",
+            arguments: ["-tiTCP:\(self.gatewayPort)", "-sTCP:LISTEN"],
+            environment: self.processEnvironment()
+        )
+
+        let pids = listenerLookup.output
+            .split(whereSeparator: \.isNewline)
+            .compactMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+
+        for pid in pids {
+            if pid == self.gatewayProcess?.processIdentifier {
+                continue
+            }
+
+            let comm = Self.executeCommand(
+                executablePath: "/bin/ps",
+                arguments: ["-p", "\(pid)", "-o", "comm="],
+                environment: self.processEnvironment()
+            ).output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let command = Self.executeCommand(
+                executablePath: "/bin/ps",
+                arguments: ["-p", "\(pid)", "-o", "command="],
+                environment: self.processEnvironment()
+            ).output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let isGatewayProcess =
+                comm == "openclaw-gateway" ||
+                command.contains("openclaw-gateway") ||
+                (command.contains("openclaw") && command.contains("gateway"))
+
+            guard isGatewayProcess else { continue }
+
+            LogInfo("🦞 终止残留 OpenClaw gateway 进程，PID: \(pid)")
+            _ = Self.executeCommand(
+                executablePath: "/bin/kill",
+                arguments: ["-TERM", "\(pid)"],
+                environment: self.processEnvironment()
+            )
+
+            let deadline = Date().addingTimeInterval(3)
+            while Date() < deadline {
+                let status = Self.executeCommand(
+                    executablePath: "/bin/ps",
+                    arguments: ["-p", "\(pid)"],
+                    environment: self.processEnvironment()
+                ).status
+                if status != 0 {
+                    break
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+
+            let stillRunning = Self.executeCommand(
+                executablePath: "/bin/ps",
+                arguments: ["-p", "\(pid)"],
+                environment: self.processEnvironment()
+            ).status == 0
+
+            if stillRunning {
+                LogInfo("🦞 强制终止残留 OpenClaw gateway 进程，PID: \(pid)")
+                _ = Self.executeCommand(
+                    executablePath: "/bin/kill",
+                    arguments: ["-KILL", "\(pid)"],
+                    environment: self.processEnvironment()
+                )
+            }
+        }
     }
 
     private func runOpenClaw(arguments: [String]) -> (status: Int32, output: String) {
@@ -773,6 +849,31 @@ class OpenClawGatewayRuntimeManager {
                 1,
                 (error as NSError).localizedDescription
             )
+        }
+    }
+
+    nonisolated private static func executeCommand(
+        executablePath: String,
+        arguments: [String],
+        environment: [String: String]
+    ) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+        process.environment = environment
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (process.terminationStatus, output)
+        } catch {
+            return (1, "")
         }
     }
 }

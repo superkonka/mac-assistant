@@ -31,6 +31,10 @@ final class RequestPlanner {
     }
 
     func plan(_ envelope: RequestEnvelope) async -> RequestPlan {
+        if let preflightPlan = RuleBasedRequestPlannerProvider.shared.priorityLocalPlan(envelope) {
+            return preflightPlan.withPlannerID(ruleProvider.providerID)
+        }
+
         switch preferences.plannerPrimaryStrategy {
         case .ruleBased:
             async let primary = ruleProvider.plan(envelope)
@@ -95,7 +99,141 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
 
     private init() {}
 
+    func priorityLocalPlan(_ envelope: RequestEnvelope) -> RequestPlan? {
+        let normalized = RequestPlanningHeuristics.normalized(envelope.originalText)
+        let parsed = intelligence.analyzeInput(envelope.originalText)
+
+        if envelope.creationFlowActive {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .continueAgentCreationFlow(input: envelope.originalText),
+                confidence: .high,
+                reason: "当前正在 Agent 创建流程中，优先把输入交给创建向导。"
+            )
+        }
+
+        if let sessionID = envelope.resumableTaskSessionID,
+           RequestPlanningHeuristics.shouldTreatAsResumeCommand(normalized) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .resumeInterruptedTask(sessionID: sessionID),
+                confidence: .high,
+                reason: "识别到继续/恢复命令，优先恢复最近的可续跑任务。"
+            )
+        }
+
+        if let lastMessage = envelope.lastMessage,
+           let pendingProposalID = lastMessage.metadata?["pending_skill_evolution_id"],
+           let accepted = RequestPlanningHeuristics.acceptanceDecision(from: normalized) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .respondToSkillEvolution(proposalID: pendingProposalID, accepted: accepted),
+                confidence: .high,
+                reason: "当前输入是在响应 Skill 迭代提案确认。"
+            )
+        }
+
+        if let lastMessage = envelope.lastMessage,
+           lastMessage.metadata?["pending_workflow_design"] == "true",
+           let originalInput = lastMessage.metadata?["workflow_original_input"],
+           let accepted = RequestPlanningHeuristics.workflowGuidanceDecision(from: envelope.originalText) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .respondToWorkflowDesignGuidance(
+                    originalInput: originalInput,
+                    followUpInput: envelope.originalText,
+                    accepted: accepted
+                ),
+                confidence: .high,
+                reason: "当前输入是在响应业务工作流设计引导，优先继续本地工作流设计链。"
+            )
+        }
+
+        if let workflowContext = envelope.activeWorkflowDesignContext,
+           RequestPlanningHeuristics.shouldContinueWorkflowDesign(
+            with: envelope.originalText,
+            context: workflowContext
+           ) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .continueWorkflowDesignSession(
+                    sessionID: workflowContext.sessionID,
+                    originalInput: workflowContext.originalInput,
+                    followUpInput: envelope.originalText
+                ),
+                confidence: .medium,
+                reason: "检测到当前仍在补充同一条业务工作流设计，继续复用现有工作流 session。"
+            )
+        }
+
+        if let lastMessage = envelope.lastMessage,
+           let pendingSuggestion = lastMessage.detectedSkillSuggestion,
+           let accepted = RequestPlanningHeuristics.acceptanceDecision(from: normalized) {
+            let action: DetectedSkillSuggestionAction = accepted ? .runOnce : .dismissOnce
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .respondToDetectedSkillSuggestion(
+                    messageID: pendingSuggestion.messageID,
+                    action: action
+                ),
+                confidence: .high,
+                reason: "当前输入是在响应检测到的 Skill 建议卡片。"
+            )
+        }
+
+        if let lastMessage = envelope.lastMessage,
+           let pendingSkill = lastMessage.metadata?["pending_skill"],
+           let skillInput = lastMessage.metadata?["skill_input"],
+           let skill = AISkill(rawValue: pendingSkill),
+           let accepted = RequestPlanningHeuristics.acceptanceDecision(from: normalized) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .respondToLegacySkillSuggestion(
+                    skill: skill,
+                    input: skillInput,
+                    accepted: accepted
+                ),
+                confidence: .high,
+                reason: "当前输入是在响应旧版 Skill 建议确认消息。"
+            )
+        }
+
+        return nil
+    }
+
     func plan(_ envelope: RequestEnvelope) async -> RequestPlan {
+        if let priorityPlan = priorityLocalPlan(envelope) {
+            return priorityPlan
+        }
+
         let normalized = RequestPlanningHeuristics.normalized(envelope.originalText)
         let parsed = intelligence.analyzeInput(envelope.originalText)
         let hasLinkRequest = WebContextAgent.shared.hasLinkRequest(for: envelope.originalText, images: envelope.images)
@@ -144,6 +282,26 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
                 primaryAction: .respondToSkillEvolution(proposalID: pendingProposalID, accepted: accepted),
                 confidence: .high,
                 reason: "当前输入是在响应 Skill 迭代提案确认。"
+            )
+        }
+
+        if let lastMessage = envelope.lastMessage,
+           lastMessage.metadata?["pending_workflow_design"] == "true",
+           let originalInput = lastMessage.metadata?["workflow_original_input"],
+           let accepted = RequestPlanningHeuristics.workflowGuidanceDecision(from: envelope.originalText) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: parsed.cleanText,
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .respondToWorkflowDesignGuidance(
+                    originalInput: originalInput,
+                    followUpInput: envelope.originalText,
+                    accepted: accepted
+                ),
+                confidence: .high,
+                reason: "当前输入是在响应业务工作流设计引导，优先继续本地工作流设计链。"
             )
         }
 
@@ -259,13 +417,20 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
         }
 
         if let kind = RequestPlanningHeuristics.classifyAgentCreationRequest(envelope.originalText) {
+            let primaryAction: RequestPlannerPrimaryAction
+            switch kind {
+            case .workflowDesign:
+                primaryAction = .startWorkflowDesignSession(input: envelope.originalText)
+            case .runtimeSetup:
+                primaryAction = .showAgentCreationGuidance(kind: kind)
+            }
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
                 preparedInput: parsed.cleanText,
                 notices: [],
                 requestedAgentSwitch: nil,
-                primaryAction: .showAgentCreationGuidance(kind: kind),
+                primaryAction: primaryAction,
                 confidence: .medium,
                 reason: "用户请求创建 Agent，需要先区分模型接入与业务工作流。"
             )

@@ -18,6 +18,12 @@ class CommandRunner: ObservableObject {
         let failed: Bool
     }
 
+    private struct DirectKimiCLIFallbackPolicy {
+        let timeout: TimeInterval
+        let statusSummary: String
+        let logReason: String
+    }
+
     @Published var messages: [ChatMessage] = [] {
         didSet {
             guard !isRestoringPersistedState else { return }
@@ -51,6 +57,11 @@ class CommandRunner: ObservableObject {
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
     private let initialSetupPromptKey = "initial_setup_prompt"
+    private let pendingWorkflowDesignKey = "pending_workflow_design"
+    private let workflowOriginalInputKey = "workflow_original_input"
+    private let workflowTaskSessionIDKey = "workflow_task_session_id"
+    private let directKimiCLIFallbackTimeout: TimeInterval = 90
+    private let directKimiCLIInterruptedStreamFallbackTimeout: TimeInterval = 60
     private let screenRecordingSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     
     private var cancellables: Set<AnyCancellable> = []
@@ -122,7 +133,8 @@ class CommandRunner: ObservableObject {
                 needsInitialSetup: agentStore.needsInitialSetup,
                 lastMessage: messages.last,
                 creationFlowActive: creationSkill.isInCreationFlow,
-                resumableTaskSessionID: latestResumableTaskSessionID()
+                resumableTaskSessionID: latestResumableTaskSessionID(),
+                activeWorkflowDesignContext: activeWorkflowDesignContext()
             )
         }
         let plan = await requestPlanner.plan(envelope)
@@ -196,6 +208,38 @@ class CommandRunner: ObservableObject {
                     )
                 )
                 isProcessing = false
+            }
+
+        case .startWorkflowDesignSession(let input):
+            await startWorkflowDesignInSideSession(originalInput: input)
+
+        case .continueWorkflowDesignSession(let sessionID, let originalInput, let followUpInput):
+            await continueWorkflowDesignTaskSession(
+                sessionID: sessionID,
+                originalInput: originalInput,
+                followUpInput: followUpInput
+            )
+
+        case .respondToWorkflowDesignGuidance(let originalInput, let followUpInput, let accepted):
+            if accepted {
+                await continueWorkflowDesignInSideSession(
+                    originalInput: originalInput,
+                    followUpInput: followUpInput
+                )
+            } else {
+                await MainActor.run {
+                    messages.append(
+                        ChatMessage(
+                            id: UUID(),
+                            role: .assistant,
+                            content: "好，这次我先不继续展开这条业务工作流设计。后面你也可以直接告诉我要继续细化哪个环节，例如目标、触发方式、定时规则或交付形式。",
+                            timestamp: Date(),
+                            agentId: "builtin-agent-creation-guard",
+                            agentName: "Agent 创建顾问"
+                        )
+                    )
+                    isProcessing = false
+                }
             }
 
         case .respondToDetectedSkillSuggestion(let messageID, let action):
@@ -625,7 +669,13 @@ class CommandRunner: ObservableObject {
             content: agentCreationGuidanceMessage(for: kind, originalInput: originalInput),
             timestamp: Date(),
             agentId: "builtin-agent-creation-guard",
-            agentName: "Agent 创建顾问"
+            agentName: "Agent 创建顾问",
+            metadata: kind == .workflowDesign
+                ? [
+                    pendingWorkflowDesignKey: "true",
+                    workflowOriginalInputKey: originalInput
+                ]
+                : nil
         )
 
         await MainActor.run {
@@ -677,11 +727,268 @@ class CommandRunner: ObservableObject {
 
             更合理的落法是：
             1. 先保留一个可用的基础模型 Agent
-            2. 再把这类股票监控 / 定时分析 / 通知逻辑沉淀成 Skill 或 AutoAgent 工作流
+            2. 再把这类业务规则 / 定时触发 / 通知逻辑沉淀成 Skill 或 AutoAgent 工作流
 
-            如果你愿意，我下一步可以直接把这类“业务 Agent”整理成一份可落地的 Skill / AutoAgent 方案，而不是继续走当前这条伪创建流程。
+            如果你愿意，我下一步会把这类业务工作流拆成一个**独立设计子任务**继续整理，不影响当前主会话，也不会再串回别的话题。
+            你直接回复“可以 / 继续 / 按这个来”就行。
             """
         }
+    }
+
+    private func continueWorkflowDesignInSideSession(
+        originalInput: String,
+        followUpInput: String
+    ) async {
+        await startWorkflowDesignInSideSession(
+            originalInput: originalInput,
+            supplementalInput: followUpInput,
+            startedFromConfirmation: true
+        )
+    }
+
+    private func continueWorkflowDesignTaskSession(
+        sessionID: String,
+        originalInput: String,
+        followUpInput: String
+    ) async {
+        let trimmedFollowUp = followUpInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFollowUp.isEmpty else {
+            await MainActor.run {
+                isProcessing = false
+            }
+            return
+        }
+
+        let preferredExistingAgent = await MainActor.run { () -> Agent? in
+            guard let existing = taskSession(for: sessionID),
+                  let delegateAgentID = existing.delegateAgentID else {
+                return nil
+            }
+            return agentStore.usableAgents.first(where: { $0.id == delegateAgentID })
+        }
+
+        guard let worker = preferredExistingAgent ?? workflowDesignWorkerAgent() else {
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        我准备继续细化这条业务工作流，但当前没有可用的文本 Agent 可以接手原来的设计任务。
+
+                        先配置或恢复一个可用的文本 Agent 后，我就能继续沿这条工作流设计 session 往下补。
+                        """,
+                        timestamp: Date(),
+                        agentId: "builtin-agent-creation-guard",
+                        agentName: "Agent 创建顾问"
+                    )
+                )
+                isProcessing = false
+            }
+            return
+        }
+
+        let request = workflowDesignPrompt(
+            originalInput: originalInput,
+            followUpInput: followUpInput,
+            continuingExistingSession: true
+        )
+
+        await MainActor.run {
+            appendTaskSessionMessage(
+                sessionID: sessionID,
+                role: .user,
+                content: "继续补充：\(trimmedFollowUp)",
+                agentName: orchestrator.currentAgent?.name
+            )
+        }
+
+        let result = await runTaskSession(
+            sessionID: sessionID,
+            agent: worker,
+            text: request,
+            images: []
+        )
+
+        await MainActor.run {
+            if result.failed {
+                isProcessing = false
+                return
+            }
+
+            appendAssistantConversationMessage(
+                """
+                我继续把这条业务工作流细化完善了一轮：
+
+                \(result.content)
+                """,
+                metadata: [
+                    workflowTaskSessionIDKey: sessionID,
+                    workflowOriginalInputKey: originalInput
+                ]
+            )
+            isProcessing = false
+        }
+    }
+
+    private func startWorkflowDesignInSideSession(
+        originalInput: String,
+        supplementalInput: String? = nil,
+        startedFromConfirmation: Bool = false
+    ) async {
+        guard let worker = workflowDesignWorkerAgent() else {
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        我准备继续整理这条业务工作流方案了，但当前没有可用的文本 Agent 可接手这个独立子任务。
+
+                        先配置一个可用的文本 Agent 后，我就能把这类“工作流设计”拆成后台独立任务继续处理。
+                        """,
+                        timestamp: Date(),
+                        agentId: "builtin-agent-creation-guard",
+                        agentName: "Agent 创建顾问"
+                    )
+                )
+                isProcessing = false
+            }
+            return
+        }
+
+        let request = workflowDesignPrompt(
+            originalInput: originalInput,
+            followUpInput: supplementalInput,
+            continuingExistingSession: false
+        )
+        let sessionID = await MainActor.run {
+            createWorkflowDesignTaskSession(
+                originalInput: originalInput,
+                followUpInput: supplementalInput,
+                worker: worker
+            )
+        }
+
+        let result = await runTaskSession(
+            sessionID: sessionID,
+            agent: worker,
+            text: request,
+            images: []
+        )
+
+        await MainActor.run {
+            if result.failed {
+                isProcessing = false
+                return
+            }
+
+            appendAssistantConversationMessage(
+                """
+                \(startedFromConfirmation ? "我继续把这条业务工作流整理成了一版可落地方案：" : "我已经直接把这条业务工作流拆成独立设计任务，并整理出一版可落地方案：")
+
+                \(result.content)
+                """,
+                metadata: [
+                    workflowTaskSessionIDKey: sessionID,
+                    workflowOriginalInputKey: originalInput
+                ]
+            )
+            isProcessing = false
+        }
+    }
+
+    private func workflowDesignWorkerAgent() -> Agent? {
+        if let worker = agentStore.workflowDesignerPreferredAgent {
+            return worker
+        }
+
+        return preferredAgent(for: .textChat)
+    }
+
+    private func workflowDesignPrompt(
+        originalInput: String,
+        followUpInput: String?,
+        continuingExistingSession: Bool
+    ) -> String {
+        """
+        你正在执行一个“业务工作流设计”独立子任务。目标是把用户想要的业务 Agent / Skill / AutoAgent 工作流整理成一版可落地的方案，而不是创建模型接入型 Agent。
+
+        用户最初需求：
+        \(originalInput)
+
+        用户刚才的确认或补充：
+        \(followUpInput?.isEmpty == false ? followUpInput! : "无，直接根据原始需求先给出第一版方案。")
+
+        请直接给出面向用户的结果，结构尽量清晰，至少包含：
+        1. 目标定义
+        2. 触发方式（手动 / 定时 / 事件）
+        3. 关键步骤
+        4. 需要哪些能力或依赖
+        5. 适合拆成哪些 Skill / AutoAgent / MCP / 定时任务
+        6. 第一版最小可行方案
+        7. 还需要用户补充的关键信息
+
+        要求：
+        - 只围绕当前用户需求，不要默认股票、富途、交易等旧场景。
+        - 不要提内部路由、主会话、子会话、OpenClaw 等实现细节。
+        - 用中文直接输出可读方案。
+        \(continuingExistingSession ? "- 这次是在继续细化已有方案，请吸收用户这次补充，输出更新后的完整版本，避免只给零散补丁。" : "")
+        """
+    }
+
+    @MainActor
+    private func createWorkflowDesignTaskSession(
+        originalInput: String,
+        followUpInput: String?,
+        worker: Agent
+    ) -> String {
+        var session = AgentTaskSession(
+            title: "🧭 业务工作流设计 · 独立规划",
+            originalRequest: originalInput,
+            status: .queued,
+            statusSummary: "已拆出工作流设计子任务，正在后台规划",
+            mainAgentName: orchestrator.currentAgent?.name,
+            delegateAgentID: worker.id,
+            delegateAgentName: worker.name,
+            intentName: "业务工作流设计",
+            isExpanded: true,
+            inputImages: [],
+            canResume: false
+        )
+        session.gatewaySessionKey = gatewaySessionKey(forTaskSessionID: session.id)
+
+        let taskCardMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: "已将业务工作流设计拆到独立子任务，不影响主会话。",
+            timestamp: Date(),
+            linkedTaskSessionID: session.id,
+            metadata: [
+                workflowTaskSessionIDKey: session.id,
+                workflowOriginalInputKey: originalInput
+            ]
+        )
+        session.linkedMainMessageID = taskCardMessage.id
+        session.messages = [
+            TaskSessionMessage(role: .system, content: "这条工作流设计会在独立上下文里继续整理，避免串回旧主会话话题。"),
+            TaskSessionMessage(role: .user, content: originalInput, agentName: orchestrator.currentAgent?.name)
+        ]
+
+        if let followUpInput,
+           !followUpInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            session.messages.append(
+                TaskSessionMessage(
+                    role: .user,
+                    content: "继续说明：\(followUpInput)",
+                    agentName: orchestrator.currentAgent?.name
+                )
+            )
+        }
+
+        messages.append(taskCardMessage)
+        taskSessions.append(session)
+        return session.id
     }
 
     private func preferredOpenClawToolAgent(for images: [String]) -> Agent? {
@@ -2006,6 +2313,48 @@ class CommandRunner: ObservableObject {
         return "agent:desktop:subagent:\(sanitized)"
     }
 
+    private func gatewaySessionLabel(forTaskSessionID sessionID: String, baseLabel: String?) -> String? {
+        guard let baseLabel = baseLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !baseLabel.isEmpty else {
+            return nil
+        }
+        return OpenClawGatewayClient.uniqueSessionLabel(base: baseLabel, uniqueSource: sessionID)
+    }
+
+    private func directKimiCLIFallbackPolicy(after error: Error) -> DirectKimiCLIFallbackPolicy {
+        if UserFacingErrorFormatter.isStreamInterruptedError(error) {
+            return DirectKimiCLIFallbackPolicy(
+                timeout: directKimiCLIInterruptedStreamFallbackTimeout,
+                statusSummary: "OpenClaw 长时间没有回传完整结果，已切换到直连 Kimi CLI 快速补结果",
+                logReason: "stream_interrupted"
+            )
+        }
+
+        if UserFacingErrorFormatter.isTransientServiceError(error) {
+            return DirectKimiCLIFallbackPolicy(
+                timeout: directKimiCLIFallbackTimeout,
+                statusSummary: "OpenClaw 当前不可用，已切换到直连 Kimi CLI",
+                logReason: "transient_gateway_failure"
+            )
+        }
+
+        return DirectKimiCLIFallbackPolicy(
+            timeout: directKimiCLIFallbackTimeout,
+            statusSummary: "OpenClaw 请求失败，已切换到直连 Kimi CLI",
+            logReason: "gateway_failure"
+        )
+    }
+
+    private func compactErrorDescription(_ error: Error, maxLength: Int = 220) -> String {
+        let collapsed = (error as NSError).localizedDescription
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard collapsed.count > maxLength else {
+            return collapsed
+        }
+        return String(collapsed.prefix(maxLength)) + "..."
+    }
+
     private func sendViaGateway(
         agent: Agent,
         sessionKey: String,
@@ -2096,12 +2445,22 @@ class CommandRunner: ObservableObject {
             return nil
         }
 
+        let policy = directKimiCLIFallbackPolicy(after: error)
+        let fallbackTarget = taskSessionID ?? "main"
+        let upstreamError = compactErrorDescription(error)
+
+        LogWarning(
+            "OpenClaw fallback -> direct Kimi CLI start " +
+            "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
+            "timeout=\(Int(policy.timeout))s reason=\(policy.logReason) upstreamError=\(upstreamError)"
+        )
+
         await MainActor.run {
             if let taskSessionID {
                 self.updateTaskSessionStatus(
                     sessionID: taskSessionID,
                     status: .running,
-                    summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
+                    summary: policy.statusSummary
                 )
             } else {
                 if let traceID = self.currentExecutionTrace?.id {
@@ -2110,38 +2469,56 @@ class CommandRunner: ObservableObject {
                         state: .fallback,
                         agentName: agent.displayName,
                         transitionLabel: "直接 CLI",
-                        summary: "OpenClaw 当前不可用，已直接切换到 Kimi CLI"
+                        summary: policy.statusSummary
                     )
                 }
                 self.updateAssistantMessage(
                     id: assistantMessageID,
-                    content: "⏳ OpenClaw 当前不可用，正在直接调用 Kimi CLI..."
+                    content: "⏳ \(policy.statusSummary)..."
                 )
             }
         }
 
-        let content = try await localKimiCLIService.sendMessage(
-            text: text,
-            attachments: images,
-            sessionKey: sessionKey
-        )
-        let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "本地 Kimi CLI 已执行，但没有返回可显示的内容。"
-            : content
+        do {
+            let content = try await localKimiCLIService.sendMessage(
+                text: text,
+                attachments: images,
+                sessionKey: sessionKey,
+                timeout: policy.timeout,
+                requestSource: "openclaw-fallback:\(policy.logReason)"
+            )
+            let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "本地 Kimi CLI 已执行，但没有返回可显示的内容。"
+                : content
 
-        await MainActor.run {
-            if let taskSessionID {
-                self.updateTaskSessionMessage(
-                    sessionID: taskSessionID,
-                    messageID: assistantMessageID,
-                    content: resolvedContent
-                )
-            } else {
-                self.updateAssistantMessage(id: assistantMessageID, content: resolvedContent)
+            LogInfo(
+                "OpenClaw fallback -> direct Kimi CLI success " +
+                "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
+                "timeout=\(Int(policy.timeout))s contentLength=\(resolvedContent.count)"
+            )
+
+            await MainActor.run {
+                if let taskSessionID {
+                    self.updateTaskSessionMessage(
+                        sessionID: taskSessionID,
+                        messageID: assistantMessageID,
+                        content: resolvedContent
+                    )
+                } else {
+                    self.updateAssistantMessage(id: assistantMessageID, content: resolvedContent)
+                }
             }
-        }
 
-        return resolvedContent
+            return resolvedContent
+        } catch {
+            LogError(
+                "OpenClaw fallback -> direct Kimi CLI failed " +
+                "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
+                "timeout=\(Int(policy.timeout))s reason=\(policy.logReason) upstreamError=\(upstreamError)",
+                error: error
+            )
+            throw error
+        }
     }
 
     private func shouldFallbackToDirectKimiCLI(after error: Error, agent: Agent) -> Bool {
@@ -2157,6 +2534,9 @@ class CommandRunner: ObservableObject {
         let markers = [
             "openclaw",
             "gateway",
+            "事件流意外结束",
+            "stream ended unexpectedly",
+            "recoverable assistant output",
             "bundlednotfound",
             "未打包在 app bundle 中",
             "未包含在应用中",
@@ -2583,7 +2963,7 @@ class CommandRunner: ObservableObject {
             let continuedContent = try await sendViaGateway(
                 agent: agent,
                 sessionKey: sessionKey,
-                sessionLabel: snapshot.title,
+                sessionLabel: gatewaySessionLabel(forTaskSessionID: sessionID, baseLabel: snapshot.title),
                 text: snapshot.originalRequest,
                 images: snapshot.inputImages ?? [],
                 taskSessionID: sessionID,
@@ -2683,7 +3063,10 @@ class CommandRunner: ObservableObject {
             let content = try await sendViaGateway(
                 agent: agent,
                 sessionKey: sessionKey,
-                sessionLabel: taskSession(for: sessionID)?.title,
+                sessionLabel: gatewaySessionLabel(
+                    forTaskSessionID: sessionID,
+                    baseLabel: taskSession(for: sessionID)?.title
+                ),
                 text: text,
                 images: images,
                 taskSessionID: sessionID,
@@ -2752,7 +3135,10 @@ class CommandRunner: ObservableObject {
                     let fallbackContent = try await sendViaGateway(
                         agent: fallbackAgent,
                         sessionKey: sessionKey,
-                        sessionLabel: taskSession(for: sessionID)?.title,
+                        sessionLabel: gatewaySessionLabel(
+                            forTaskSessionID: sessionID,
+                            baseLabel: taskSession(for: sessionID)?.title
+                        ),
                         text: text,
                         images: images,
                         taskSessionID: sessionID,
@@ -3985,14 +4371,49 @@ class CommandRunner: ObservableObject {
     }
 
     @MainActor
-    private func appendAssistantConversationMessage(_ content: String) {
+    private func appendAssistantConversationMessage(
+        _ content: String,
+        metadata: [String: String]? = nil
+    ) {
         let assistantMessage = ChatMessage(
             id: UUID(),
             role: .assistant,
             content: content,
-            timestamp: Date()
+            timestamp: Date(),
+            metadata: metadata
         )
         messages.append(assistantMessage)
+    }
+
+    @MainActor
+    private func activeWorkflowDesignContext() -> WorkflowDesignContinuationContext? {
+        if let lastMessage = messages.last,
+           let sessionID = lastMessage.metadata?[workflowTaskSessionIDKey] ?? lastMessage.linkedTaskSessionID,
+           let session = taskSessions.first(where: { $0.id == sessionID && $0.intentName == "业务工作流设计" }) {
+            let originalInput = lastMessage.metadata?[workflowOriginalInputKey] ?? session.originalRequest
+            return WorkflowDesignContinuationContext(sessionID: sessionID, originalInput: originalInput)
+        }
+
+        let cutoff = Date().addingTimeInterval(-15 * 60)
+        let likelyWorkflowFollowUp = messages.last.map { lastMessage in
+            let normalized = lastMessage.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            return lastMessage.role != .user &&
+                (normalized.contains("工作流") || normalized.contains("方案") || normalized.contains("设计"))
+        } ?? false
+
+        if likelyWorkflowFollowUp,
+           let session = taskSessions.reversed().first(where: {
+               $0.intentName == "业务工作流设计" &&
+               $0.updatedAt >= cutoff &&
+               $0.status != .failed
+           }) {
+            return WorkflowDesignContinuationContext(
+                sessionID: session.id,
+                originalInput: session.originalRequest
+            )
+        }
+
+        return nil
     }
 
     private func deliverCollectedParallelSummaryIfReady(groupID: String) async {

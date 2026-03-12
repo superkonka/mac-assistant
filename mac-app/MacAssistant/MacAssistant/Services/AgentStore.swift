@@ -251,6 +251,30 @@ class AgentStore: ObservableObject {
         return plannerAgents(usableOnly: true).first ?? defaultAgent
     }
 
+    var workflowDesignerPreferredAgent: Agent? {
+        if let plannerPreferredAgent,
+           isAutoRoutable(plannerPreferredAgent),
+           plannerPreferredAgent.supports(.textChat) {
+            return plannerPreferredAgent
+        }
+
+        if let plannerWorker = plannerAgents(usableOnly: true).first(where: { candidate in
+            isAutoRoutable(candidate) && candidate.supports(.textChat)
+        }) {
+            return plannerWorker
+        }
+
+        if let subtaskWorker = subtaskWorkerAgents(usableOnly: true).first(where: { candidate in
+            isAutoRoutable(candidate) && candidate.supports(.textChat)
+        }) {
+            return subtaskWorker
+        }
+
+        return usableAgents.first(where: { candidate in
+            isAutoRoutable(candidate) && candidate.supports(.textChat)
+        })
+    }
+
     func primaryChatAgents(usableOnly: Bool) -> [Agent] {
         agents(for: .primaryChat, usableOnly: usableOnly)
     }

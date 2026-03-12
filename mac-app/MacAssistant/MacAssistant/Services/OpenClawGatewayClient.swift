@@ -9,6 +9,7 @@ actor OpenClawGatewayClient {
     private static let gatewayAgentID = "desktop"
     private static let assistantUpdateMinimumInterval: TimeInterval = 0.25
     private static let assistantUpdateMinimumDelta = 80
+    private static let sessionLabelMaxLength = 64
 
     private struct GatewayPushEnvelope {
         let ordinal: Int
@@ -29,6 +30,19 @@ actor OpenClawGatewayClient {
     func prepareGateway() async throws {
         _ = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         _ = try await self.ensureChannel()
+    }
+
+    nonisolated static func uniqueSessionLabel(base: String, uniqueSource: String) -> String {
+        let trimmedBase = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBase.isEmpty else {
+            return Self.sessionLabelSuffix(from: uniqueSource)
+        }
+
+        let suffix = Self.sessionLabelSuffix(from: uniqueSource)
+        let separator = " #"
+        let maxBaseLength = max(1, Self.sessionLabelMaxLength - separator.count - suffix.count)
+        let normalizedBase = String(trimmedBase.prefix(maxBaseLength))
+        return "\(normalizedBase)\(separator)\(suffix)"
     }
 
     func sendMessage(
@@ -90,7 +104,8 @@ actor OpenClawGatewayClient {
                     if let recovery = await self.recoverAssistantText(
                         sessionKey: resolvedSessionKey,
                         requestStartedAtMs: requestStartedAtMs,
-                        latestAssistantText: latestAssistantText
+                        latestAssistantText: latestAssistantText,
+                        requireCompletedHistory: true
                     ) {
                         knownSessionID = recovery.sessionID ?? knownSessionID
                         LogInfo(
@@ -107,7 +122,8 @@ actor OpenClawGatewayClient {
                     if let recovery = await self.recoverAssistantText(
                         sessionKey: resolvedSessionKey,
                         requestStartedAtMs: requestStartedAtMs,
-                        latestAssistantText: latestAssistantText
+                        latestAssistantText: latestAssistantText,
+                        requireCompletedHistory: true
                     ) {
                         knownSessionID = recovery.sessionID ?? knownSessionID
                         LogInfo(
@@ -304,10 +320,33 @@ actor OpenClawGatewayClient {
             "key": AnyCodable(key),
             "model": AnyCodable(modelRef),
         ]
-        if let label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            params["label"] = AnyCodable(label)
+        let normalizedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedLabel, !normalizedLabel.isEmpty {
+            params["label"] = AnyCodable(normalizedLabel)
         }
-        _ = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+
+        do {
+            _ = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+        } catch let error as GatewayResponseError {
+            guard error.code == "INVALID_REQUEST",
+                  error.message.localizedCaseInsensitiveContains("label already in use"),
+                  let normalizedLabel,
+                  !normalizedLabel.isEmpty else {
+                throw error
+            }
+
+            let fallbackLabel = Self.uniqueSessionLabel(base: normalizedLabel, uniqueSource: key)
+            guard fallbackLabel != normalizedLabel else {
+                throw error
+            }
+
+            LogWarning(
+                "OpenClaw session label collision, retrying with unique label " +
+                "sessionKey=\(key) originalLabel=\(normalizedLabel) fallbackLabel=\(fallbackLabel)"
+            )
+            params["label"] = AnyCodable(fallbackLabel)
+            _ = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+        }
     }
 
     private func chatHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
@@ -410,6 +449,16 @@ actor OpenClawGatewayClient {
         from history: OpenClawChatHistoryPayload,
         newerThan minimumTimestamp: Double? = nil
     ) -> String? {
+        guard let message = self.latestAssistantMessage(from: history, newerThan: minimumTimestamp) else {
+            return nil
+        }
+        return self.normalizedAssistantText(from: message)
+    }
+
+    private func latestAssistantMessage(
+        from history: OpenClawChatHistoryPayload,
+        newerThan minimumTimestamp: Double? = nil
+    ) -> OpenClawChatMessage? {
         let messages = (history.messages ?? []).compactMap { payload in
             try? self.decodePayload(payload, as: OpenClawChatMessage.self)
         }
@@ -422,12 +471,19 @@ actor OpenClawGatewayClient {
                 }
             }
 
-            if let text = self.normalizedAssistantText(from: message) {
-                return text
+            if self.normalizedAssistantText(from: message) != nil {
+                return message
             }
         }
 
         return nil
+    }
+
+    private func isCompletedAssistantMessage(_ message: OpenClawChatMessage) -> Bool {
+        guard let stopReason = self.normalizedNonEmptyText(message.stopReason) else {
+            return false
+        }
+        return !stopReason.isEmpty
     }
 
     private func normalizedAssistantText(from message: OpenClawChatMessage) -> String? {
@@ -487,14 +543,17 @@ actor OpenClawGatewayClient {
     private func recoverAssistantText(
         sessionKey: String,
         requestStartedAtMs: Double,
-        latestAssistantText: String
+        latestAssistantText: String,
+        requireCompletedHistory: Bool = false
     ) async -> OpenClawRecoveredOutput? {
         if let history = try? await self.chatHistory(sessionKey: sessionKey) {
             let sessionID = self.normalizedSessionID(history.sessionId)
-            if let recoveredText = self.extractLatestAssistantText(
+            if let latestMessage = self.latestAssistantMessage(
                 from: history,
                 newerThan: requestStartedAtMs
-            ) {
+            ),
+               let recoveredText = self.normalizedAssistantText(from: latestMessage),
+               !requireCompletedHistory || self.isCompletedAssistantMessage(latestMessage) {
                 return OpenClawRecoveredOutput(text: recoveredText, sessionID: sessionID, source: .history)
             }
             if let bufferedText = self.normalizedNonEmptyText(latestAssistantText) {
@@ -596,15 +655,47 @@ actor OpenClawGatewayClient {
 
         do {
             return try await channel.request(method: method, params: params, timeoutMs: timeoutMs)
+        } catch let error as GatewayResponseError {
+            guard !self.shouldSkipGatewayRestart(for: error) else {
+                LogWarning(
+                    "OpenClaw request failed without runtime restart " +
+                    "method=\(method) code=\(error.code) message=\(error.message)"
+                )
+                throw error
+            }
+            return try await self.restartGatewayAndRetry(
+                after: channel,
+                method: method,
+                params: params,
+                timeoutMs: timeoutMs
+            )
         } catch {
-            await channel.shutdown()
-            self.channel = nil
-            self.connectionGeneration = -1
-
-            _ = try await self.runtimeManager.forceRestart()
-            let retriedChannel = try await self.ensureChannel()
-            return try await retriedChannel.request(method: method, params: params, timeoutMs: timeoutMs)
+            return try await self.restartGatewayAndRetry(
+                after: channel,
+                method: method,
+                params: params,
+                timeoutMs: timeoutMs
+            )
         }
+    }
+
+    private func restartGatewayAndRetry(
+        after channel: GatewayChannelActor,
+        method: String,
+        params: [String: AnyCodable]?,
+        timeoutMs: Double
+    ) async throws -> Data {
+        await channel.shutdown()
+        self.channel = nil
+        self.connectionGeneration = -1
+
+        _ = try await self.runtimeManager.forceRestart()
+        let retriedChannel = try await self.ensureChannel()
+        return try await retriedChannel.request(method: method, params: params, timeoutMs: timeoutMs)
+    }
+
+    private func shouldSkipGatewayRestart(for error: GatewayResponseError) -> Bool {
+        error.code == "INVALID_REQUEST"
     }
 
     private func ensureChannel() async throws -> GatewayChannelActor {
@@ -670,6 +761,12 @@ actor OpenClawGatewayClient {
 
     private func removeSubscriber(_ id: UUID) {
         self.subscribers[id] = nil
+    }
+
+    nonisolated private static func sessionLabelSuffix(from uniqueSource: String) -> String {
+        let alphanumerics = uniqueSource.uppercased().filter { $0.isLetter || $0.isNumber }
+        let suffix = String(alphanumerics.suffix(12))
+        return suffix.isEmpty ? "SESSION" : suffix
     }
 }
 

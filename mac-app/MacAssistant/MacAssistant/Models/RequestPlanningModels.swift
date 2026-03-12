@@ -68,6 +68,11 @@ struct PlannedTaskSpec: Identifiable, Hashable {
     let returnsToMainConversation: Bool
 }
 
+struct WorkflowDesignContinuationContext {
+    let sessionID: String
+    let originalInput: String
+}
+
 struct RequestEnvelope {
     let id: UUID
     let originalText: String
@@ -78,6 +83,7 @@ struct RequestEnvelope {
     let lastMessage: ChatMessage?
     let creationFlowActive: Bool
     let resumableTaskSessionID: String?
+    let activeWorkflowDesignContext: WorkflowDesignContinuationContext?
 
     init(
         id: UUID = UUID(),
@@ -88,7 +94,8 @@ struct RequestEnvelope {
         needsInitialSetup: Bool,
         lastMessage: ChatMessage?,
         creationFlowActive: Bool,
-        resumableTaskSessionID: String?
+        resumableTaskSessionID: String?,
+        activeWorkflowDesignContext: WorkflowDesignContinuationContext?
     ) {
         self.id = id
         self.originalText = originalText
@@ -99,6 +106,7 @@ struct RequestEnvelope {
         self.lastMessage = lastMessage
         self.creationFlowActive = creationFlowActive
         self.resumableTaskSessionID = resumableTaskSessionID
+        self.activeWorkflowDesignContext = activeWorkflowDesignContext
     }
 }
 
@@ -112,6 +120,9 @@ enum RequestPlannerPrimaryAction {
     case continueAgentCreationFlow(input: String)
     case resumeInterruptedTask(sessionID: String)
     case respondToSkillEvolution(proposalID: String, accepted: Bool)
+    case startWorkflowDesignSession(input: String)
+    case continueWorkflowDesignSession(sessionID: String, originalInput: String, followUpInput: String)
+    case respondToWorkflowDesignGuidance(originalInput: String, followUpInput: String, accepted: Bool)
     case respondToDetectedSkillSuggestion(messageID: UUID, action: DetectedSkillSuggestionAction)
     case respondToLegacySkillSuggestion(skill: AISkill, input: String, accepted: Bool)
     case requestInitialSetup
@@ -166,6 +177,7 @@ struct RequestPlan {
         case .continueAgentCreationFlow,
                 .resumeInterruptedTask,
                 .respondToSkillEvolution,
+                .respondToWorkflowDesignGuidance,
                 .respondToDetectedSkillSuggestion,
                 .respondToLegacySkillSuggestion:
             return false
@@ -176,6 +188,12 @@ struct RequestPlan {
 
     var executionMode: RequestExecutionMode {
         switch primaryAction {
+        case .respondToWorkflowDesignGuidance(_, _, let accepted):
+            return accepted ? .sideSession : .mainSession
+        case .startWorkflowDesignSession:
+            return .sideSession
+        case .continueWorkflowDesignSession:
+            return .sideSession
         case .handleDetectedSkill:
             return .sideSession
         case .routeParallelLinkResearch:
@@ -217,6 +235,41 @@ struct RequestPlan {
                     title: "处理 Skill 迭代确认",
                     executorLabel: "Skill 迭代顾问",
                     summary: "应用或忽略当前 Skill 优化提案。",
+                    returnsToMainConversation: true
+                )
+            ]
+        case .startWorkflowDesignSession:
+            return [
+                PlannedTaskSpec(
+                    id: "workflow-design-start",
+                    kind: .agentSuggestion,
+                    title: "启动业务工作流设计",
+                    executorLabel: "工作流设计子任务",
+                    summary: "立即拆出独立工作流设计任务，避免先停在纯说明文案。",
+                    returnsToMainConversation: true
+                )
+            ]
+        case .continueWorkflowDesignSession(let sessionID, _, _):
+            return [
+                PlannedTaskSpec(
+                    id: "workflow-design-continue-\(sessionID)",
+                    kind: .agentSuggestion,
+                    title: "继续业务工作流设计",
+                    executorLabel: "工作流设计子任务",
+                    summary: "把新的补充信息续写到现有工作流设计 session，不再回落到主会话自由发挥。",
+                    returnsToMainConversation: true
+                )
+            ]
+        case .respondToWorkflowDesignGuidance(_, _, let accepted):
+            return [
+                PlannedTaskSpec(
+                    id: "workflow-design-guidance",
+                    kind: accepted ? .agentSuggestion : .conversationControl,
+                    title: accepted ? "继续业务工作流设计" : "结束业务工作流设计引导",
+                    executorLabel: accepted ? "工作流设计子任务" : "Agent 创建顾问",
+                    summary: accepted
+                        ? "拆出独立工作流设计子任务，避免旧主会话上下文串题。"
+                        : "结束这次业务工作流设计引导，回到普通对话。",
                     returnsToMainConversation: true
                 )
             ]
@@ -401,6 +454,12 @@ struct RequestPlan {
             return "resume_interrupted_task:\(sessionID)"
         case .respondToSkillEvolution(let proposalID, let accepted):
             return "respond_skill_evolution:\(proposalID):\(accepted)"
+        case .startWorkflowDesignSession:
+            return "start_workflow_design_session"
+        case .continueWorkflowDesignSession(let sessionID, _, _):
+            return "continue_workflow_design_session:\(sessionID)"
+        case .respondToWorkflowDesignGuidance(_, _, let accepted):
+            return "respond_workflow_design_guidance:\(accepted)"
         case .respondToDetectedSkillSuggestion(let messageID, let action):
             return "respond_detected_skill:\(messageID.uuidString):\(String(describing: action))"
         case .respondToLegacySkillSuggestion(let skill, _, let accepted):

@@ -37,6 +37,89 @@ enum RequestPlanningHeuristics {
         return nil
     }
 
+    static func workflowGuidanceDecision(from text: String) -> Bool? {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        let rejectMarkers = [
+            "不用", "先不用", "算了", "不需要", "不继续", "先别", "不是这个", "换个方向", "不要"
+        ]
+        if rejectMarkers.contains(where: { normalized.contains($0) }) {
+            return false
+        }
+
+        if acceptanceDecision(from: normalized) == true {
+            return true
+        }
+
+        let acceptMarkers = [
+            "可以", "好", "好的", "行", "没问题", "同意", "合理",
+            "按这个", "就这样", "开始", "继续", "来吧", "试试", "做吧"
+        ]
+        if acceptMarkers.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        return nil
+    }
+
+    static func shouldContinueWorkflowDesign(
+        with text: String,
+        context: WorkflowDesignContinuationContext
+    ) -> Bool {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !normalized.isEmpty else {
+            return false
+        }
+
+        if workflowGuidanceDecision(from: text) == true {
+            return true
+        }
+
+        let negativeMarkers = [
+            "不用", "算了", "暂停", "先停", "不继续", "不用做", "不用继续"
+        ]
+        if negativeMarkers.contains(where: { normalized.contains($0) }) {
+            return false
+        }
+
+        let continuationMarkers = [
+            "补充", "另外", "还要", "再加", "增加", "主要是", "重点是", "我希望",
+            "需要", "要求", "最好", "每天", "每周", "定时", "提醒", "通知", "推送",
+            "流程", "步骤", "触发", "条件", "任务", "灵感", "字数", "章节", "写作",
+            "小说", "发布", "完成后", "如果", "当", "然后", "并且"
+        ]
+        if continuationMarkers.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        let metaSwitchMarkers = [
+            "意图分析", "planner", "skills", "skill", "agent 列表", "切换 agent",
+            "打开", "启动", "退出", "关闭", "截图", "天气", "github", "mcp 服务"
+        ]
+        if metaSwitchMarkers.contains(where: { normalized.contains($0) }) {
+            return false
+        }
+
+        let interruptionMarkers = [
+            "中断", "断了", "没说完", "没写完", "写完", "继续写", "继续完善", "继续展开",
+            "继续这个", "继续刚才", "为什么文本中断", "文本中断"
+        ]
+        if interruptionMarkers.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        let original = RequestPlanningHeuristics.normalized(context.originalInput)
+        if !original.isEmpty,
+           !Set(normalized.split(separator: " ")).isDisjoint(with: Set(original.split(separator: " "))) {
+            return true
+        }
+
+        return normalized.count >= 18
+    }
+
     static func shouldShowSkillEvolutionOverview(for normalized: String) -> Bool {
         let keywords = [
             "skill优化", "优化skill", "技能优化", "skill 迭代", "技能迭代",

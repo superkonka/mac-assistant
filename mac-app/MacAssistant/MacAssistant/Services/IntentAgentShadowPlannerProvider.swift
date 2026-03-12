@@ -79,12 +79,16 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         let parsed = intelligence.analyzeInput(envelope.originalText)
         let prompt = buildPrompt(envelope: envelope, parsed: parsed)
         let sessionKey = "\(sessionPrefix)-\(envelope.id.uuidString.lowercased())"
+        let resolvedSessionLabel = OpenClawGatewayClient.uniqueSessionLabel(
+            base: sessionLabel,
+            uniqueSource: sessionKey
+        )
 
         do {
             let raw = try await gatewayClient.sendMessage(
                 agent: agent,
                 sessionKey: sessionKey,
-                sessionLabel: sessionLabel,
+                sessionLabel: resolvedSessionLabel,
                 text: prompt,
                 images: []
             )
@@ -345,7 +349,9 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
                 preparedInput: preparedInput,
                 notices: [],
                 requestedAgentSwitch: nil,
-                primaryAction: .showAgentCreationGuidance(kind: kind),
+                primaryAction: kind == .workflowDesign
+                    ? .startWorkflowDesignSession(input: envelope.originalText)
+                    : .showAgentCreationGuidance(kind: kind),
                 confidence: confidence,
                 reason: decision.reason
             )
