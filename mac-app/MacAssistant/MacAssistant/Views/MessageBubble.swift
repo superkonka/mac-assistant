@@ -11,8 +11,10 @@ struct MessageBubble: View, Equatable {
     let message: ChatMessage
     var availableWidth: CGFloat? = nil
     var taskSession: AgentTaskSession? = nil
+    var detectedSkillSuggestion: DetectedSkillSuggestion? = nil
     var onToggleTaskSession: (() -> Void)? = nil
     var onResumeTaskSession: (() -> Void)? = nil
+    var onDetectedSkillSuggestionAction: ((DetectedSkillSuggestionAction) -> Void)? = nil
     @State private var showCopied = false
 
     private static let timeFormatter: DateFormatter = {
@@ -24,6 +26,7 @@ struct MessageBubble: View, Equatable {
     static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
         lhs.message == rhs.message &&
         lhs.taskSession == rhs.taskSession &&
+        lhs.detectedSkillSuggestion == rhs.detectedSkillSuggestion &&
         lhs.availableWidth == rhs.availableWidth
     }
     
@@ -56,7 +59,7 @@ struct MessageBubble: View, Equatable {
                             .font(.system(size: 10))
                             .foregroundColor(.secondary.opacity(0.7))
 
-                        if taskSession == nil && message.role != .user {
+                        if taskSession == nil && detectedSkillSuggestion == nil && message.role != .user {
                             copyButton
                         }
 
@@ -96,7 +99,7 @@ struct MessageBubble: View, Equatable {
             }
         }
         .contextMenu {
-            if taskSession == nil {
+            if taskSession == nil && detectedSkillSuggestion == nil {
                 Button("复制") {
                     copyToClipboard()
                 }
@@ -129,8 +132,17 @@ struct MessageBubble: View, Equatable {
                     onResume: onResumeTaskSession
                 )
                 .padding(8)
+            } else if let detectedSkillSuggestion {
+                DetectedSkillSuggestionCardView(
+                    suggestion: detectedSkillSuggestion,
+                    onAction: onDetectedSkillSuggestionAction
+                )
+                .padding(8)
             } else {
-                RichTextView(text: message.content)
+                RichTextView(
+                    text: message.content,
+                    availableWidth: richContentWidth
+                )
                     .equatable()
                     .padding(.horizontal, message.role == .user ? 14 : 16)
                     .padding(.vertical, message.role == .user ? 10 : 12)
@@ -228,6 +240,11 @@ struct MessageBubble: View, Equatable {
         let safeWidth = max(safeAvailableWidth - reservedChrome, 280)
         let preferredWidth = safeAvailableWidth * preferredFraction
         return min(safeWidth, preferredWidth, hardCap)
+    }
+
+    private var richContentWidth: CGFloat {
+        let horizontalPadding: CGFloat = message.role == .user ? 28 : 32
+        return max(bubbleMaxWidth - horizontalPadding, 240)
     }
     
     private var formattedTime: String {

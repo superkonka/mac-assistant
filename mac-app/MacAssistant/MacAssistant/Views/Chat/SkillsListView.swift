@@ -9,6 +9,7 @@ struct SkillsListView: View {
     private enum Panel: String, CaseIterable, Identifiable {
         case builtIn = "内置"
         case marketplace = "市场"
+        case settings = "设置"
 
         var id: String { rawValue }
 
@@ -18,6 +19,8 @@ struct SkillsListView: View {
                 return "sparkles"
             case .marketplace:
                 return "shippingbox"
+            case .settings:
+                return "slider.horizontal.3"
             }
         }
     }
@@ -25,6 +28,7 @@ struct SkillsListView: View {
     @ObservedObject private var registry = AISkillRegistry.shared
     @ObservedObject private var orchestrator = AgentOrchestrator.shared
     @StateObject private var marketplace = ClawHubMarketplaceService.shared
+    @StateObject private var browserState = SkillsBrowserState.shared
 
     @State private var selectedPanel: Panel = .builtIn
     @State private var selectedCategory: SkillCategory? = nil
@@ -41,8 +45,10 @@ struct SkillsListView: View {
 
             if selectedPanel == .builtIn {
                 builtInContent
-            } else {
+            } else if selectedPanel == .marketplace {
                 marketplaceContent
+            } else {
+                SkillIntentSettingsView()
             }
         }
         .frame(width: 760, height: 540)
@@ -50,8 +56,12 @@ struct SkillsListView: View {
         .task {
             guard !hasLoadedMarketplace else { return }
             hasLoadedMarketplace = true
+            selectedPanel = Panel(rawValue: browserState.selectedPanelRawValue) ?? .builtIn
             await marketplace.refreshInstalledSkills()
             await marketplace.refreshAuthState()
+        }
+        .onChange(of: browserState.selectedPanelRawValue) { newValue in
+            selectedPanel = Panel(rawValue: newValue) ?? selectedPanel
         }
     }
 
@@ -64,7 +74,9 @@ struct SkillsListView: View {
 
             Spacer()
 
-            searchField
+            if selectedPanel != .settings {
+                searchField
+            }
 
             if selectedPanel == .marketplace {
                 Button {
@@ -88,6 +100,7 @@ struct SkillsListView: View {
             ForEach(Panel.allCases) { panel in
                 Button {
                     selectedPanel = panel
+                    browserState.selectedPanelRawValue = panel.rawValue
                     if panel == .marketplace {
                         Task {
                             await marketplace.refreshInstalledSkills()

@@ -132,6 +132,8 @@ struct AgentConfigurationWizard: View {
             TestConnectionStep(viewModel: viewModel)
         case .customizeSettings:
             CustomizeSettingsStep(viewModel: viewModel)
+        case .assignRoles:
+            RoleAssignmentStep(viewModel: viewModel, isInitialSetup: isInitialSetup)
         case .complete:
             CompletionStep(viewModel: viewModel, onFinish: { agent in
                 onComplete?(agent)
@@ -152,7 +154,7 @@ struct AgentConfigurationWizard: View {
             Spacer()
             
             if viewModel.currentStep != .complete {
-                Button(viewModel.currentStep == .customizeSettings ? "创建 Agent" : "下一步") {
+                Button(viewModel.currentStep == .assignRoles ? "创建 Agent" : "下一步") {
                     viewModel.nextStep()
                 }
                 .buttonStyle(PrimaryButtonStyle())
@@ -250,6 +252,28 @@ struct APIKeyInputStep: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
+                }
+
+                if let setupHint = provider.setupHint {
+                    Text(setupHint)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(provider.modelLabel)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    TextField(
+                        provider.modelPlaceholder,
+                        text: Binding(
+                            get: { viewModel.selectedModel ?? provider.recommendedModel },
+                            set: { viewModel.selectedModel = $0 }
+                        )
+                    )
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
                 
                 Divider()
@@ -382,18 +406,7 @@ struct APIKeyInputStep: View {
     }
     
     private func apiKeyHelperURL(for provider: ProviderType) -> URL {
-        switch provider {
-        case .openai:
-            return URL(string: "https://platform.openai.com/api-keys")!
-        case .anthropic:
-            return URL(string: "https://console.anthropic.com/settings/keys")!
-        case .google:
-            return URL(string: "https://makersuite.google.com/app/apikey")!
-        case .moonshot:
-            return URL(string: "https://platform.moonshot.cn/console/api-keys")!
-        case .ollama:
-            return URL(string: "https://ollama.ai")!
-        }
+        URL(string: provider.apiDocsURL)!
     }
 }
 
@@ -489,6 +502,30 @@ struct CustomizeSettingsStep: View {
             
             TextField("描述", text: $viewModel.agentDescription)
                 .textFieldStyle(RoundedBorderTextFieldStyle())
+
+            if let provider = viewModel.selectedProvider {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(provider.modelLabel)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    TextField(
+                        provider.modelPlaceholder,
+                        text: Binding(
+                            get: { viewModel.selectedModel ?? provider.recommendedModel },
+                            set: { viewModel.selectedModel = $0 }
+                        )
+                    )
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+
+                    if let setupHint = provider.setupHint {
+                        Text(setupHint)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
             
             Divider()
             
@@ -524,6 +561,82 @@ struct CustomizeSettingsStep: View {
     }
 }
 
+struct RoleAssignmentStep: View {
+    @ObservedObject var viewModel: WizardViewModel
+    var isInitialSetup: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("分配 Agent 角色")
+                .font(.system(size: 14, weight: .medium))
+
+            Text(
+                isInitialSetup
+                ? "首次配置至少需要一个能承接主会话的 Agent。后台子任务、Planner、回退角色可以继续补充。"
+                : "一个 Agent 可以承担多个角色。主会话、Planner、子任务和回退会分开协作，不再互相抢入口。"
+            )
+            .font(.caption)
+            .foregroundColor(.secondary)
+
+            VStack(spacing: 10) {
+                ForEach(AgentRole.allCases) { role in
+                    roleToggle(role)
+                }
+            }
+
+            Text(roleHint)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func roleToggle(_ role: AgentRole) -> some View {
+        Toggle(
+            isOn: Binding(
+                get: { viewModel.roleProfile.contains(role) },
+                set: { viewModel.setRole(role, enabled: $0) }
+            )
+        ) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Image(systemName: role.icon)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.blue)
+                    Text(role.displayName)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+
+                Text(role.summary)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .toggleStyle(.switch)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.black.opacity(0.03))
+        )
+    }
+
+    private var roleHint: String {
+        if viewModel.roleProfile.contains(.manualOnly) {
+            return "当前设置为仅手动：它不会参与自动路由，也不会抢走主会话。"
+        }
+
+        if viewModel.roleProfile.contains(.primaryChat) && viewModel.roleProfile.contains(.subtaskWorker) {
+            return "当前这个 Agent 既能作为主会话，也能在后台承担独立子任务。"
+        }
+
+        if viewModel.roleProfile.contains(.planner) {
+            return "当前这个 Agent 也会进入 Planner 候选池，可用于意图分析和调度。"
+        }
+
+        return "建议至少给常用聊天 Agent 勾选“主会话”，给稳定 API Agent 勾选“Planner / 子任务 / 回退”。"
+    }
+}
+
 struct CompletionStep: View {
     @ObservedObject var viewModel: WizardViewModel
     var onFinish: (Agent) -> Void
@@ -553,6 +666,12 @@ struct CompletionStep: View {
                 .padding()
                 .background(Color.gray.opacity(0.1))
                 .cornerRadius(8)
+
+                FlowLayout(spacing: 6) {
+                    ForEach(viewModel.roleProfile.sortedRoles) { role in
+                        AgentRoleBadge(role: role)
+                    }
+                }
             }
             
             Button("开始使用") {

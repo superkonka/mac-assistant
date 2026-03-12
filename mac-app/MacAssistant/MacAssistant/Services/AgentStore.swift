@@ -20,6 +20,7 @@ class AgentStore: ObservableObject {
     @Published var agents: [Agent] = []
     @Published var currentAgent: Agent?
     @Published private(set) var usableAgents: [Agent] = []
+    @Published private(set) var roleProfilesByAgentID: [String: AgentRoleProfile] = [:]
     @Published private(set) var temporarilyUnavailableAgentIDs: Set<String> = []
     
     static let shared = AgentStore()
@@ -27,12 +28,15 @@ class AgentStore: ObservableObject {
     private let userDefaults = UserDefaults.standard
     private let agentsKey = "macassistant.agents.v2"
     private let currentAgentIdKey = "macassistant.current_agent_id"
+    private let agentRoleProfilesKey = "macassistant.agent_role_profiles.v1"
     private let temporarilyUnavailableAgentsKey = "macassistant.temporarily_unavailable_agents.v1"
     private let openClawDir = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".openclaw")
+    private let preferences = UserPreferenceStore.shared
     
     init() {
         loadAgents()
+        loadRoleProfiles()
         loadTemporarilyUnavailableAgentIDs()
         refreshAvailability()
     }
@@ -47,10 +51,18 @@ class AgentStore: ObservableObject {
         provider: ProviderType,
         model: String,
         apiKey: String,
-        config: AgentConfig
+        config: AgentConfig,
+        roleProfile: AgentRoleProfile? = nil
     ) async throws -> Agent {
         // 1. 确定能力
         let capabilities = determineCapabilities(provider: provider, model: model)
+        let isFirstAgent = await MainActor.run { self.agents.isEmpty }
+        let resolvedRoleProfile = roleProfile ?? AgentRoleProfile.suggested(
+            provider: provider,
+            capabilities: capabilities,
+            isFirstAgent: isFirstAgent
+        )
+        let shouldBecomeDefault = resolvedRoleProfile.contains(.primaryChat) && isFirstAgent
         
         // 2. 创建 Agent 对象
         let agent = Agent(
@@ -61,7 +73,7 @@ class AgentStore: ObservableObject {
             model: model,
             capabilities: capabilities,
             config: config,
-            isDefault: true
+            isDefault: shouldBecomeDefault
         )
         
         // 3. 同步到 OpenClaw 配置
@@ -76,7 +88,12 @@ class AgentStore: ObservableObject {
                 agents.indices.forEach { agents[$0].isDefault = false }
             }
             agents.append(agent)
-            currentAgent = agent
+            roleProfilesByAgentID[agent.id] = resolvedRoleProfile
+            applyRoleSideEffects(afterSetting: resolvedRoleProfile, for: agent, previousProfile: nil)
+            if currentAgent == nil && shouldAutoAdoptAsCurrent(agent) {
+                currentAgent = agent
+            }
+            saveRoleProfiles()
             saveAgents()
             refreshAvailability()
         }
@@ -100,7 +117,8 @@ class AgentStore: ObservableObject {
             provider: provider,
             model: selectedModel,
             apiKey: apiKey,
-            config: AgentConfig(temperature: 0.7, maxTokens: 4096)
+            config: AgentConfig(temperature: 0.7, maxTokens: 4096),
+            roleProfile: AgentRoleProfile(roles: [.subtaskWorker, .fallback])
         )
     }
     
@@ -121,8 +139,11 @@ class AgentStore: ObservableObject {
     /// 删除 Agent
     func deleteAgent(_ agent: Agent) {
         agents.removeAll { $0.id == agent.id }
+        roleProfilesByAgentID.removeValue(forKey: agent.id)
         temporarilyUnavailableAgentIDs.remove(agent.id)
         saveTemporarilyUnavailableAgentIDs()
+        applyRoleRemovalSideEffects(for: agent)
+        saveRoleProfiles()
 
         // 清理 OpenClaw 配置
         cleanupOpenClawConfig(agent: agent)
@@ -137,6 +158,10 @@ class AgentStore: ObservableObject {
             agents[index].isDefault = (agents[index].id == agent.id)
         }
         currentAgent = agent
+        var profile = roleProfile(for: agent)
+        profile.set(.primaryChat, enabled: true)
+        roleProfilesByAgentID[agent.id] = profile
+        saveRoleProfiles()
         saveAgents()
         refreshAvailability()
     }
@@ -156,10 +181,52 @@ class AgentStore: ObservableObject {
     }
     
     // MARK: - 查询方法
+
+    func roleProfile(for agent: Agent) -> AgentRoleProfile {
+        roleProfilesByAgentID[agent.id] ?? AgentRoleProfile.suggested(
+            provider: agent.provider,
+            capabilities: agent.capabilities,
+            isFirstAgent: agent.isDefault || agents.count == 1
+        )
+    }
+
+    func roles(for agent: Agent) -> Set<AgentRole> {
+        roleProfile(for: agent).roles
+    }
+
+    func hasRole(_ role: AgentRole, for agent: Agent) -> Bool {
+        roles(for: agent).contains(role)
+    }
+
+    func setRoleProfile(_ profile: AgentRoleProfile, for agent: Agent) {
+        let normalized = normalizeRoleProfile(profile, for: agent)
+        let previous = roleProfilesByAgentID[agent.id]
+        roleProfilesByAgentID[agent.id] = normalized
+        applyRoleSideEffects(afterSetting: normalized, for: agent, previousProfile: previous)
+        saveRoleProfiles()
+        refreshAvailability()
+    }
+
+    func setRole(_ role: AgentRole, enabled: Bool, for agent: Agent) {
+        var profile = roleProfile(for: agent)
+        profile.set(role, enabled: enabled)
+        setRoleProfile(profile, for: agent)
+    }
+
+    func setPlannerPreferredAgent(_ agent: Agent?) {
+        preferences.plannerPreferredAgentID = agent?.id
+        objectWillChange.send()
+    }
     
     /// 查找支持特定能力的 Agents
     func agentsSupporting(_ capability: Capability) -> [Agent] {
         usableAgents.filter { $0.supports(capability) }
+    }
+
+    func autoRoutableAgentsSupporting(_ capability: Capability) -> [Agent] {
+        usableAgents.filter { candidate in
+            isAutoRoutable(candidate) && candidate.supports(capability)
+        }
     }
     
     /// 查找支持图片分析的 Agents
@@ -169,7 +236,39 @@ class AgentStore: ObservableObject {
     
     /// 获取默认 Agent
     var defaultAgent: Agent? {
-        usableAgents.first { $0.isDefault } ?? usableAgents.first
+        let primary = primaryChatAgents(usableOnly: true)
+        return primary.first { $0.isDefault } ??
+            primary.first ??
+            usableAgents.first { $0.isDefault } ??
+            usableAgents.first
+    }
+
+    var plannerPreferredAgent: Agent? {
+        if let preferredID = preferences.plannerPreferredAgentID,
+           let preferred = usableAgents.first(where: { $0.id == preferredID && hasRole(.planner, for: $0) }) {
+            return preferred
+        }
+        return plannerAgents(usableOnly: true).first ?? defaultAgent
+    }
+
+    func primaryChatAgents(usableOnly: Bool) -> [Agent] {
+        agents(for: .primaryChat, usableOnly: usableOnly)
+    }
+
+    func plannerAgents(usableOnly: Bool) -> [Agent] {
+        agents(for: .planner, usableOnly: usableOnly)
+    }
+
+    func subtaskWorkerAgents(usableOnly: Bool) -> [Agent] {
+        agents(for: .subtaskWorker, usableOnly: usableOnly)
+    }
+
+    func fallbackAgents(usableOnly: Bool) -> [Agent] {
+        agents(for: .fallback, usableOnly: usableOnly)
+    }
+
+    func manualOnlyAgents(usableOnly: Bool) -> [Agent] {
+        agents(for: .manualOnly, usableOnly: usableOnly)
     }
 
     var allCapabilities: [Capability] {
@@ -186,6 +285,78 @@ class AgentStore: ObservableObject {
 
     func canUse(_ agent: Agent) -> Bool {
         usableAgents.contains { $0.id == agent.id }
+    }
+
+    func isAutoRoutable(_ agent: Agent) -> Bool {
+        !hasRole(.manualOnly, for: agent)
+    }
+
+    func preferredSubtaskWorker(
+        for capability: Capability,
+        requireToolSupport: Bool = false,
+        excluding excludedIDs: Set<String> = []
+    ) -> Agent? {
+        let candidates = subtaskWorkerAgents(usableOnly: true).filter { agent in
+            !excludedIDs.contains(agent.id) &&
+            agent.supports(capability) &&
+            (!requireToolSupport || agent.provider != .ollama)
+        }
+
+        if let current = currentAgent,
+           candidates.contains(where: { $0.id == current.id }) {
+            return current
+        }
+
+        return candidates.first ?? usableAgents.first(where: { agent in
+            !excludedIDs.contains(agent.id) &&
+            isAutoRoutable(agent) &&
+            agent.supports(capability) &&
+            (!requireToolSupport || agent.provider != .ollama)
+        })
+    }
+
+    func fallbackCandidates(
+        for capability: Capability,
+        excluding excludedIDs: Set<String> = [],
+        preferredCurrent: Agent? = nil
+    ) -> [Agent] {
+        let pool = usableAgents.filter { agent in
+            !excludedIDs.contains(agent.id) &&
+            isAutoRoutable(agent) &&
+            agent.supports(capability)
+        }
+
+        var ordered: [Agent] = []
+        var seenIDs = Set<String>()
+
+        func append(_ candidate: Agent?) {
+            guard let candidate,
+                  seenIDs.insert(candidate.id).inserted,
+                  pool.contains(where: { $0.id == candidate.id }) else {
+                return
+            }
+            ordered.append(candidate)
+        }
+
+        if let preferredCurrent {
+            append(preferredCurrent)
+        }
+
+        fallbackAgents(usableOnly: true)
+            .filter { $0.supports(capability) && !excludedIDs.contains($0.id) }
+            .forEach { append($0) }
+
+        append(defaultAgent)
+        pool.forEach { append($0) }
+        return ordered
+    }
+
+    func shouldAutoAdoptAsCurrent(_ agent: Agent) -> Bool {
+        let assignedRoles = roles(for: agent)
+        if currentAgent == nil {
+            return !assignedRoles.contains(.manualOnly)
+        }
+        return assignedRoles.contains(.primaryChat)
     }
 
     func markTemporarilyUnavailable(_ agent: Agent) {
@@ -292,7 +463,7 @@ class AgentStore: ObservableObject {
         
         do {
             switch provider {
-            case .moonshot, .openai:
+            case .deepseek, .doubao, .zhipu, .moonshot, .openai:
                 return try await validateOpenAICompatible(urlString: urlString, apiKey: cleanKey, provider: provider)
             case .anthropic:
                 return try await validateAnthropic(urlString: urlString, apiKey: cleanKey)
@@ -308,15 +479,27 @@ class AgentStore: ObservableObject {
     }
     
     private func validateOpenAICompatible(urlString: String, apiKey: String, provider: ProviderType) async throws -> ValidationResult {
-        guard let url = URL(string: "\(urlString)/models") else {
+        guard let url = URL(string: "\(urlString)/chat/completions") else {
             return .invalid("无效的 API 地址")
         }
         
         var request = URLRequest(url: url)
+        request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
+        let body: [String: Any] = [
+            "model": provider.recommendedModel,
+            "messages": [
+                ["role": "user", "content": "Reply with OK."]
+            ],
+            "stream": false,
+            "max_tokens": 8,
+            "temperature": 0
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         
-        let (_, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await URLSession.shared.data(for: request)
         
         guard let httpResponse = response as? HTTPURLResponse else {
             return .invalid("网络响应无效")
@@ -333,6 +516,12 @@ class AgentStore: ObservableObject {
         case 429:
             return .rateLimited("请求过于频繁，请稍后再试")
         default:
+            if let message = extractValidationErrorMessage(from: data), !message.isEmpty {
+                if httpResponse.statusCode >= 500 {
+                    return .serverError(message)
+                }
+                return .invalid(message)
+            }
             return .invalid("HTTP 错误 \(httpResponse.statusCode)")
         }
     }
@@ -413,6 +602,26 @@ class AgentStore: ObservableObject {
             return .invalid("HTTP 错误 \(httpResponse.statusCode)")
         }
     }
+
+    private func extractValidationErrorMessage(from data: Data) -> String? {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let error = json["error"] as? String, !error.isEmpty {
+                return error
+            }
+            if let error = json["error"] as? [String: Any],
+               let message = error["message"] as? String,
+               !message.isEmpty {
+                return message
+            }
+            if let message = json["message"] as? String, !message.isEmpty {
+                return message
+            }
+        }
+
+        let raw = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw?.isEmpty == false ? raw : nil
+    }
     
     enum ValidationResult {
         case valid
@@ -456,6 +665,14 @@ class AgentStore: ObservableObject {
             userDefaults.removeObject(forKey: currentAgentIdKey)
         }
     }
+
+    private func saveRoleProfiles() {
+        if let data = try? JSONEncoder().encode(roleProfilesByAgentID) {
+            userDefaults.set(data, forKey: agentRoleProfilesKey)
+        } else {
+            userDefaults.removeObject(forKey: agentRoleProfilesKey)
+        }
+    }
     
     private func loadAgents() {
         if let data = userDefaults.data(forKey: agentsKey),
@@ -471,6 +688,15 @@ class AgentStore: ObservableObject {
         } else {
             currentAgent = agents.first { $0.isDefault }
         }
+    }
+
+    private func loadRoleProfiles() {
+        guard let data = userDefaults.data(forKey: agentRoleProfilesKey),
+              let decoded = try? JSONDecoder().decode([String: AgentRoleProfile].self, from: data) else {
+            roleProfilesByAgentID = [:]
+            return
+        }
+        roleProfilesByAgentID = decoded
     }
 
     private func loadTemporarilyUnavailableAgentIDs() {
@@ -686,7 +912,7 @@ class AgentStore: ObservableObject {
         switch provider {
         case .ollama:
             capabilities.append(.codeAnalysis)
-        case .openai, .anthropic, .google, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])
         }
         
@@ -696,8 +922,11 @@ class AgentStore: ObservableObject {
         }
         
         // 文档分析（长上下文模型）
-        if model.contains("32k") || model.contains("100k") || 
-           model.contains("claude") || model.contains("gemini") {
+        let normalizedModel = model.lowercased()
+        if normalizedModel.contains("32k") || normalizedModel.contains("100k") ||
+           normalizedModel.contains("claude") || normalizedModel.contains("gemini") ||
+           normalizedModel.contains("deepseek") || normalizedModel.contains("glm") ||
+           normalizedModel.contains("doubao") {
             capabilities.append(.documentAnalysis)
         }
         
@@ -707,6 +936,9 @@ class AgentStore: ObservableObject {
     private func getEmojiForProvider(_ provider: ProviderType) -> String {
         switch provider {
         case .ollama: return "🦙"
+        case .deepseek: return "🧠"
+        case .doubao: return "🎯"
+        case .zhipu: return "🟣"
         case .openai: return "🅾️"
         case .anthropic: return "🅰️"
         case .google: return "🇬"
@@ -783,18 +1015,7 @@ class AgentStore: ObservableObject {
     
     /// 获取提供商的基础 URL
     private func getBaseURL(for provider: ProviderType) -> String {
-        switch provider {
-        case .ollama:
-            return "http://localhost:11434"
-        case .openai:
-            return "https://api.openai.com/v1"
-        case .anthropic:
-            return "https://api.anthropic.com/v1"
-        case .google:
-            return "https://generativelanguage.googleapis.com/v1"
-        case .moonshot:
-            return "https://api.moonshot.cn/v1"
-        }
+        provider.defaultBaseURL
     }
 
     private func refreshAvailability() {
@@ -811,6 +1032,7 @@ class AgentStore: ObservableObject {
         usableAgents = agents.filter { agent in
             isAgentConfigured(agent) && !temporarilyUnavailableAgentIDs.contains(agent.id)
         }
+        normalizeRoleProfiles()
 
         if !temporarilyUnavailableAgentIDs.isEmpty {
             let usableSummary = usableAgents.map(\.id).joined(separator: ", ")
@@ -821,11 +1043,88 @@ class AgentStore: ObservableObject {
            usableAgents.contains(where: { $0.id == current.id }) {
             currentAgent = usableAgents.first(where: { $0.id == current.id })
         } else {
-            currentAgent = usableAgents.first(where: { $0.isDefault }) ?? usableAgents.first
+            currentAgent = defaultAgent
         }
 
         if agents != originalAgents || currentAgent?.id != originalCurrentId {
             saveAgents()
+        }
+    }
+
+    private func agents(for role: AgentRole, usableOnly: Bool) -> [Agent] {
+        let source = usableOnly ? usableAgents : agents
+        return source.filter { hasRole(role, for: $0) }
+    }
+
+    private func normalizeRoleProfiles() {
+        let existingIDs = Set(agents.map(\.id))
+        var normalized = roleProfilesByAgentID.filter { existingIDs.contains($0.key) }
+        var didChange = normalized.count != roleProfilesByAgentID.count
+
+        for agent in agents {
+            let profile = normalized[agent.id] ?? AgentRoleProfile.suggested(
+                provider: agent.provider,
+                capabilities: agent.capabilities,
+                isFirstAgent: agent.isDefault || agents.count == 1
+            )
+            let sanitized = normalizeRoleProfile(profile, for: agent)
+            if normalized[agent.id] != sanitized {
+                normalized[agent.id] = sanitized
+                didChange = true
+            }
+        }
+
+        if roleProfilesByAgentID != normalized {
+            roleProfilesByAgentID = normalized
+            didChange = true
+        }
+
+        if let preferredID = preferences.plannerPreferredAgentID,
+           !(roleProfilesByAgentID[preferredID]?.contains(.planner) ?? false) {
+            preferences.plannerPreferredAgentID = normalized.first(where: { $0.value.contains(.planner) })?.key
+        }
+
+        if didChange {
+            saveRoleProfiles()
+        }
+    }
+
+    private func normalizeRoleProfile(_ profile: AgentRoleProfile, for agent: Agent) -> AgentRoleProfile {
+        var normalized = profile
+        if agent.isDefault {
+            normalized.set(.primaryChat, enabled: true)
+        }
+        if normalized.roles.isEmpty {
+            normalized = AgentRoleProfile.suggested(
+                provider: agent.provider,
+                capabilities: agent.capabilities,
+                isFirstAgent: agent.isDefault || agents.count == 1
+            )
+        }
+        return normalized
+    }
+
+    private func applyRoleSideEffects(
+        afterSetting profile: AgentRoleProfile,
+        for agent: Agent,
+        previousProfile: AgentRoleProfile?
+    ) {
+        if profile.contains(.planner) {
+            if preferences.plannerPreferredAgentID == nil ||
+                preferences.plannerPreferredAgentID == agent.id ||
+                previousProfile?.contains(.planner) != true {
+                preferences.plannerPreferredAgentID = agent.id
+            }
+        } else if preferences.plannerPreferredAgentID == agent.id {
+            preferences.plannerPreferredAgentID = plannerAgents(usableOnly: true)
+                .first(where: { $0.id != agent.id })?
+                .id
+        }
+    }
+
+    private func applyRoleRemovalSideEffects(for agent: Agent) {
+        if preferences.plannerPreferredAgentID == agent.id {
+            preferences.plannerPreferredAgentID = nil
         }
     }
 

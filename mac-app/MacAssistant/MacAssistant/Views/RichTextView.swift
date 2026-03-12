@@ -10,32 +10,36 @@ import SwiftUI
 
 struct RichTextView: View, Equatable {
     let text: String
+    let availableWidth: CGFloat?
     private let blocks: [MarkdownBlock]
 
-    init(text: String) {
+    init(text: String, availableWidth: CGFloat? = nil) {
         self.text = text
+        self.availableWidth = availableWidth
         self.blocks = MarkdownBlockParser.parse(text)
     }
 
     static func == (lhs: RichTextView, rhs: RichTextView) -> Bool {
-        lhs.text == rhs.text
+        lhs.text == rhs.text && lhs.availableWidth == rhs.availableWidth
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             ForEach(blocks) { block in
-                MarkdownBlockView(block: block)
+                MarkdownBlockView(block: block, availableWidth: availableWidth)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .textSelection(.enabled)
     }
 }
 
 private struct MarkdownBlockView: View, Equatable {
     let block: MarkdownBlock
+    let availableWidth: CGFloat?
 
     static func == (lhs: MarkdownBlockView, rhs: MarkdownBlockView) -> Bool {
-        lhs.block == rhs.block
+        lhs.block == rhs.block && lhs.availableWidth == rhs.availableWidth
     }
 
     var body: some View {
@@ -51,9 +55,9 @@ private struct MarkdownBlockView: View, Equatable {
         case let .orderedList(items):
             OrderedListBlock(items: items)
         case let .table(table):
-            MarkdownTableView(table: table)
+            MarkdownTableView(table: table, availableWidth: availableWidth)
         case let .codeBlock(code, language):
-            CodeBlockView(code: code, language: language)
+            CodeBlockView(code: code, language: language, availableWidth: availableWidth)
         case .divider:
             Rectangle()
                 .fill(Color.gray.opacity(0.14))
@@ -185,48 +189,54 @@ private struct OrderedListBlock: View, Equatable {
 
 private struct MarkdownTableView: View, Equatable {
     let table: MarkdownTable
+    let availableWidth: CGFloat?
 
     static func == (lhs: MarkdownTableView, rhs: MarkdownTableView) -> Bool {
-        lhs.table == rhs.table
+        lhs.table == rhs.table && lhs.availableWidth == rhs.availableWidth
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
-            Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow {
-                    ForEach(Array(table.headers.enumerated()), id: \.offset) { index, header in
-                        TableCellView(
-                            text: header,
-                            role: .header,
-                            alignment: columnAlignment(at: index),
-                            showsTrailingDivider: index < table.headers.count - 1
-                        )
-                    }
-                }
+        ScrollView(.horizontal, showsIndicators: needsHorizontalScroll) {
+            VStack(alignment: .leading, spacing: 0) {
+                tableRow(
+                    cells: table.headers,
+                    role: .header
+                )
 
                 ForEach(Array(table.rows.enumerated()), id: \.offset) { rowIndex, row in
-                    GridRow {
-                        ForEach(Array(normalizedRow(row).enumerated()), id: \.offset) { columnIndex, cell in
-                            TableCellView(
-                                text: cell,
-                                role: .body(rowIndex: rowIndex),
-                                alignment: columnAlignment(at: columnIndex),
-                                showsTrailingDivider: columnIndex < table.headers.count - 1
-                            )
-                        }
-                    }
+                    tableRow(
+                        cells: normalizedRow(row),
+                        role: .body(rowIndex: rowIndex)
+                    )
                 }
             }
-            .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color(NSColor.windowBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.gray.opacity(0.12), lineWidth: 1)
-            )
+            .frame(minWidth: max(displayWidth, contentWidth), alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(NSColor.windowBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.gray.opacity(0.12), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func tableRow(cells: [String], role: TableCellView.Role) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            ForEach(Array(cells.enumerated()), id: \.offset) { columnIndex, cell in
+                TableCellView(
+                    text: cell,
+                    role: role,
+                    alignment: columnAlignment(at: columnIndex),
+                    width: columnWidth(at: columnIndex),
+                    showsTrailingDivider: columnIndex < table.headers.count - 1
+                )
+            }
+        }
     }
 
     private func normalizedRow(_ row: [String]) -> [String] {
@@ -249,6 +259,75 @@ private struct MarkdownTableView: View, Equatable {
 
         guard !values.isEmpty else { return .leading }
         return values.allSatisfy(MarkdownTableView.looksNumeric) ? .trailing : .leading
+    }
+
+    private func columnWidth(at index: Int) -> CGFloat {
+        columnWidths[safe: index] ?? 120
+    }
+
+    private var columnWidths: [CGFloat] {
+        let baseWidths = baseColumnWidths
+        guard !baseWidths.isEmpty else { return [] }
+
+        let currentTotal = totalWidth(for: baseWidths)
+        guard displayWidth > currentTotal else { return baseWidths }
+
+        let extra = displayWidth - currentTotal
+        let totalBase = max(baseWidths.reduce(0, +), 1)
+
+        return baseWidths.map { width in
+            width + extra * (width / totalBase)
+        }
+    }
+
+    private func baseColumnWidth(at index: Int) -> CGFloat {
+        let values = [table.headers[safe: index] ?? ""] + table.rows.compactMap { row in
+            guard index < row.count else { return nil }
+            return row[index]
+        }
+
+        let containsStructuredCodeLikeText = values.contains { value in
+            value.contains("_") || value.contains(",") || value.count > 18
+        }
+
+        let isNumericColumn = columnAlignment(at: index) == .trailing
+        let longestLength = values.map { $0.count }.max() ?? 0
+        let estimatedWidth = CGFloat(longestLength) * (isNumericColumn ? 7.2 : 6.6) + 28
+
+        if isNumericColumn {
+            return min(max(estimatedWidth, 96), 150)
+        }
+
+        if containsStructuredCodeLikeText {
+            let structuredCap: CGFloat = displayWidth > 640 ? 360 : 320
+            return min(max(estimatedWidth, 180), structuredCap)
+        }
+
+        return min(max(estimatedWidth, 130), 220)
+    }
+
+    private var contentWidth: CGFloat {
+        totalWidth(for: columnWidths)
+    }
+
+    private var baseColumnWidths: [CGFloat] {
+        table.headers.indices.map(baseColumnWidth(at:))
+    }
+
+    private var baseContentWidth: CGFloat {
+        totalWidth(for: baseColumnWidths)
+    }
+
+    private var displayWidth: CGFloat {
+        max(availableWidth ?? baseContentWidth, 260)
+    }
+
+    private var needsHorizontalScroll: Bool {
+        contentWidth > displayWidth + 1
+    }
+
+    private func totalWidth(for widths: [CGFloat]) -> CGFloat {
+        widths.reduce(0, +)
     }
 
     private static func looksNumeric(_ value: String) -> Bool {
@@ -274,12 +353,14 @@ private struct TableCellView: View, Equatable {
     let text: String
     let role: Role
     let alignment: TableColumnAlignment
+    let width: CGFloat
     let showsTrailingDivider: Bool
 
     static func == (lhs: TableCellView, rhs: TableCellView) -> Bool {
         lhs.text == rhs.text &&
         lhs.role == rhs.role &&
         lhs.alignment == rhs.alignment &&
+        lhs.width == rhs.width &&
         lhs.showsTrailingDivider == rhs.showsTrailingDivider
     }
 
@@ -288,8 +369,7 @@ private struct TableCellView: View, Equatable {
             .padding(.horizontal, 12)
             .padding(.vertical, role == .header ? 10 : 9)
             .frame(
-                minWidth: alignment == .trailing ? 92 : 120,
-                maxWidth: 220,
+                width: width,
                 alignment: alignment.swiftUIAlignment
             )
             .background(backgroundColor)
@@ -312,8 +392,10 @@ private struct TableCellView: View, Equatable {
         if alignment == .trailing {
             MarkdownInlineText(text, style: role == .header ? .tableHeader : .tableCell)
                 .monospacedDigit()
+                .frame(maxWidth: .infinity, alignment: alignment.swiftUIAlignment)
         } else {
             MarkdownInlineText(text, style: role == .header ? .tableHeader : .tableCell)
+                .frame(maxWidth: .infinity, alignment: alignment.swiftUIAlignment)
         }
     }
 
@@ -326,6 +408,13 @@ private struct TableCellView: View, Equatable {
                 ? AppColors.inputBackground
                 : Color.gray.opacity(0.04)
         }
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        guard indices.contains(index) else { return nil }
+        return self[index]
     }
 }
 
@@ -775,6 +864,7 @@ private enum MarkdownBlockParser {
 struct CodeBlockView: View {
     let code: String
     let language: String
+    let availableWidth: CGFloat?
     @State private var isCopied = false
 
     var body: some View {
@@ -807,10 +897,12 @@ struct CodeBlockView: View {
                 Text(code)
                     .font(.system(size: 12.5, design: .monospaced))
                     .lineSpacing(3)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minWidth: max((availableWidth ?? 0) - 24, 0), alignment: .leading)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(10)
         .overlay(

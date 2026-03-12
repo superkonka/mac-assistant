@@ -68,6 +68,15 @@ class AgentOrchestrator: ObservableObject {
     
     /// 路由请求到合适的 Agent
     func route(_ input: String, images: [String] = [], intent: Intent? = nil) async -> RoutingResult {
+        await route(input, images: images, intent: intent, preferCurrentAgent: false)
+    }
+
+    func route(
+        _ input: String,
+        images: [String] = [],
+        intent: Intent? = nil,
+        preferCurrentAgent: Bool
+    ) async -> RoutingResult {
         let targetIntent: Intent
         if let intent {
             targetIntent = intent
@@ -75,6 +84,15 @@ class AgentOrchestrator: ObservableObject {
             targetIntent = await analyzeIntent(input)
         }
         let requiredCapability = targetIntent.requiredCapability
+
+        if preferCurrentAgent,
+           images.isEmpty,
+           let current = currentAgent,
+           current.supports(.textChat),
+           targetIntent != .imageAnalysis,
+           targetIntent != .voiceCommand {
+            return .agentSelected(current)
+        }
         
         // 1. 检查当前 Agent
         if let current = currentAgent {
@@ -85,7 +103,7 @@ class AgentOrchestrator: ObservableObject {
         }
         
         // 2. 查找支持该能力的 Agents
-        let suitableAgents = agentStore.agentsSupporting(requiredCapability)
+        let suitableAgents = agentStore.autoRoutableAgentsSupporting(requiredCapability)
         
         if suitableAgents.isEmpty {
             // 3. 无可用 Agent，检测能力缺口
@@ -129,7 +147,7 @@ class AgentOrchestrator: ObservableObject {
     
     /// 根据能力自动切换 Agent
     func autoSwitch(for capability: Capability) -> Agent? {
-        let suitable = agentStore.agentsSupporting(capability)
+        let suitable = agentStore.autoRoutableAgentsSupporting(capability)
         
         if let first = suitable.first {
             switchToAgent(first)
@@ -170,16 +188,16 @@ class AgentOrchestrator: ObservableObject {
         
         switch requiredCapability {
         case .vision, .imageAnalysis:
-            suggestedProviders = [.openai, .anthropic, .moonshot]
+            suggestedProviders = [.openai, .anthropic, .moonshot, .doubao, .zhipu]
             description = "需要图片分析能力来分析图像内容"
         case .codeAnalysis:
-            suggestedProviders = [.openai, .anthropic, .moonshot]
+            suggestedProviders = [.deepseek, .doubao, .anthropic, .openai, .moonshot]
             description = "需要代码分析能力来处理编程相关请求"
         case .documentAnalysis:
-            suggestedProviders = [.anthropic, .moonshot, .openai]
+            suggestedProviders = [.anthropic, .moonshot, .deepseek, .zhipu, .openai, .doubao]
             description = "需要文档分析能力来处理长文本"
         case .webSearch:
-            suggestedProviders = [.openai, .google]
+            suggestedProviders = [.google, .moonshot, .openai, .zhipu]
             description = "需要网络搜索能力来获取实时信息"
         default:
             suggestedProviders = ProviderType.allCases.filter { $0 != .ollama }

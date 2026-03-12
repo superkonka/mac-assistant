@@ -14,6 +14,7 @@ struct ChatView: View {
     @StateObject private var orchestrator = AgentOrchestrator.shared
     @StateObject private var intelligence = ConversationIntelligence.shared
     @StateObject private var clawDoctor = OpenClawDoctor.shared
+    @StateObject private var skillsBrowserState = SkillsBrowserState.shared
     
     @State private var inputText: String = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
@@ -24,6 +25,11 @@ struct ChatView: View {
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
     @State private var lastStreamingScrollAt: Date = .distantPast
+    @State private var shouldFollowLatest = true
+    @State private var isNearBottom = true
+    @State private var hasPerformedInitialBottomAlignment = false
+
+    private let bottomAnchorID = "chat-bottom-anchor"
     
     var body: some View {
         VStack(spacing: 0) {
@@ -70,7 +76,10 @@ struct ChatView: View {
                 isInitialSetup: currentGap == nil && agentStore.needsInitialSetup,
                 onComplete: { agent in
                     showWizard = false
-                    orchestrator.switchToAgent(agent)
+                    let adoptedAsCurrent = agentStore.shouldAutoAdoptAsCurrent(agent)
+                    if adoptedAsCurrent {
+                        orchestrator.switchToAgent(agent)
+                    }
                     hasAutoPresentedInitialSetup = false
                     
                     let successMessage = ChatMessage(
@@ -79,7 +88,7 @@ struct ChatView: View {
                         content: """
                         ✅ Agent 创建成功！
                         
-                        \(agent.displayName) 已就绪，已自动切换。
+                        \(agent.displayName) 已就绪，\(adoptedAsCurrent ? "已加入主会话并自动切换。" : "已加入角色池，不会打断当前主会话。")
                         现在可以重新发送您的请求了。
                         """,
                         timestamp: Date()
@@ -164,12 +173,14 @@ struct ChatView: View {
                         ForEach(commandRunner.messages) { message in
                             let trace = commandRunner.executionTrace(forMessageID: message.id)
                             let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
+                            let detectedSkillSuggestion = message.detectedSkillSuggestion
 
                             if !hidesPlaceholderBubble {
                                 MessageBubble(
                                     message: message,
                                     availableWidth: availableBubbleWidth,
                                     taskSession: commandRunner.taskSession(for: message.linkedTaskSessionID),
+                                    detectedSkillSuggestion: detectedSkillSuggestion,
                                     onToggleTaskSession: {
                                         if let taskSessionID = message.linkedTaskSessionID {
                                             commandRunner.toggleTaskSessionExpansion(taskSessionID)
@@ -178,6 +189,14 @@ struct ChatView: View {
                                     onResumeTaskSession: {
                                         if let taskSessionID = message.linkedTaskSessionID {
                                             commandRunner.resumeTaskSession(taskSessionID)
+                                        }
+                                    },
+                                    onDetectedSkillSuggestionAction: { action in
+                                        Task {
+                                            await commandRunner.handleDetectedSkillSuggestionAction(
+                                                messageID: message.id,
+                                                action: action
+                                            )
                                         }
                                     }
                                 )
@@ -195,17 +214,54 @@ struct ChatView: View {
                         if commandRunner.isProcessing && commandRunner.currentExecutionTrace == nil {
                             TypingIndicator()
                         }
+
+                        Color.clear
+                            .frame(height: 1)
+                            .id(bottomAnchorID)
+                            .background(
+                                GeometryReader { anchorGeometry in
+                                    Color.clear.preference(
+                                        key: ChatBottomAnchorPreferenceKey.self,
+                                        value: anchorGeometry.frame(in: .named("chat-scroll")).maxY
+                                    )
+                                }
+                            )
                     }
                     .id(messageListRevision)
                     .padding(.vertical, 16)
                     .padding(.horizontal, 12)
                 }
+                .coordinateSpace(name: "chat-scroll")
+                .onAppear {
+                    scrollProxy = proxy
+                    performInitialBottomAlignment(using: proxy)
+                }
+                .onPreferenceChange(ChatBottomAnchorPreferenceKey.self) { bottomMaxY in
+                    let nearBottom = bottomMaxY <= geometry.size.height + 32
+                    isNearBottom = nearBottom
+                    if nearBottom {
+                        shouldFollowLatest = true
+                    }
+                }
                 .onChange(of: commandRunner.messages.count) { _ in
-                    scrollToBottom(proxy: proxy, animated: true)
+                    handleMessageCountChange(using: proxy)
+                }
+                .onChange(of: latestMessageRenderIdentity) { _ in
+                    handleLatestMessageMutation(using: proxy)
                 }
                 .onChange(of: commandRunner.currentExecutionTrace?.id) { _ in
-                    scrollToBottom(proxy: proxy, animated: false)
+                    if shouldFollowLatest {
+                        scrollToBottom(proxy: proxy, animated: false)
+                    }
                 }
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 4)
+                        .onEnded { _ in
+                            if !isNearBottom {
+                                shouldFollowLatest = false
+                            }
+                        }
+                )
             }
         }
     }
@@ -271,6 +327,11 @@ struct ChatView: View {
             .joined(separator: "|")
     }
 
+    private var latestMessageRenderIdentity: String {
+        guard let message = commandRunner.messages.last else { return "empty" }
+        return messageRenderIdentity(for: message)
+    }
+
     private var shouldShowProcessingStatusDock: Bool {
         guard commandRunner.isProcessing else { return false }
         guard let trace = commandRunner.currentExecutionTrace else { return true }
@@ -301,6 +362,11 @@ struct ChatView: View {
         }
 
         inputText = ""
+        shouldFollowLatest = true
+
+        if let scrollProxy {
+            scrollToBottom(proxy: scrollProxy, animated: true, force: true)
+        }
         
         Task {
             await commandRunner.processInput(text)
@@ -336,7 +402,10 @@ struct ChatView: View {
             forName: NSNotification.Name("ShowSkillsBrowser"),
             object: nil,
             queue: .main
-        ) { _ in
+        ) { notification in
+            if let panel = notification.object as? String {
+                skillsBrowserState.selectedPanelRawValue = panel
+            }
             showSkills = true
         }
     }
@@ -346,8 +415,11 @@ struct ChatView: View {
     private func scrollToBottom(
         proxy: ScrollViewProxy,
         animated: Bool,
-        throttleInterval: TimeInterval? = nil
+        throttleInterval: TimeInterval? = nil,
+        force: Bool = false
     ) {
+        guard force || shouldFollowLatest else { return }
+
         let now = Date()
         if let throttleInterval,
            now.timeIntervalSince(lastStreamingScrollAt) < throttleInterval {
@@ -355,18 +427,47 @@ struct ChatView: View {
         }
         lastStreamingScrollAt = now
 
-        if let lastMessage = commandRunner.messages.last {
-            let action = {
-                proxy.scrollTo(lastMessage.id, anchor: .bottom)
-            }
-            if animated {
-                withAnimation(.easeOut(duration: 0.2)) {
-                    action()
-                }
-            } else {
+        let action = {
+            proxy.scrollTo(bottomAnchorID, anchor: .bottom)
+        }
+        if animated {
+            withAnimation(.easeOut(duration: 0.2)) {
                 action()
             }
+        } else {
+            action()
         }
+    }
+
+    private func performInitialBottomAlignment(using proxy: ScrollViewProxy) {
+        guard !hasPerformedInitialBottomAlignment else { return }
+        hasPerformedInitialBottomAlignment = true
+        shouldFollowLatest = true
+
+        DispatchQueue.main.async {
+            scrollToBottom(proxy: proxy, animated: false, force: true)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            scrollToBottom(proxy: proxy, animated: false, force: true)
+        }
+    }
+
+    private func handleMessageCountChange(using proxy: ScrollViewProxy) {
+        guard let latest = commandRunner.messages.last else { return }
+        let shouldForce = latest.role == .user
+        if shouldForce {
+            shouldFollowLatest = true
+        }
+        scrollToBottom(proxy: proxy, animated: true, force: shouldForce)
+    }
+
+    private func handleLatestMessageMutation(using proxy: ScrollViewProxy) {
+        guard shouldFollowLatest else { return }
+        scrollToBottom(
+            proxy: proxy,
+            animated: false,
+            throttleInterval: commandRunner.isProcessing ? 0.2 : nil
+        )
     }
 
     private func presentInitialSetupIfNeeded(force: Bool = false) {
@@ -379,6 +480,14 @@ struct ChatView: View {
         currentGap = nil
         showWizard = true
         hasAutoPresentedInitialSetup = true
+    }
+}
+
+private struct ChatBottomAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = .greatestFiniteMagnitude
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

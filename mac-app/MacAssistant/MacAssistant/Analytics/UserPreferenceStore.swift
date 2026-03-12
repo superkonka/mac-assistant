@@ -13,6 +13,11 @@ class UserPreferenceStore: ObservableObject {
     
     private let userDefaults = UserDefaults.standard
     private let preferencesKey = "macassistant.user_preferences.v1"
+    private let detectionPoliciesKey = "macassistant.user_preferences.v1.skill_detection_policies"
+    private let plannerShadowEnabledKey = "macassistant.user_preferences.v1.planner_shadow_enabled"
+    private let plannerShadowPreferredAgentKey = "macassistant.user_preferences.v1.planner_shadow_agent_id"
+    private let plannerPrimaryStrategyKey = "macassistant.user_preferences.v1.planner_primary_strategy"
+    private let plannerPreferredAgentKey = "macassistant.user_preferences.v1.planner_agent_id"
     
     // MARK: - 偏好类型
     
@@ -22,6 +27,7 @@ class UserPreferenceStore: ObservableObject {
             Set(userDefaults.stringArray(forKey: "\(preferencesKey).rejected_skills") ?? [])
         }
         set {
+            objectWillChange.send()
             userDefaults.set(Array(newValue), forKey: "\(preferencesKey).rejected_skills")
         }
     }
@@ -32,6 +38,7 @@ class UserPreferenceStore: ObservableObject {
             Set(userDefaults.stringArray(forKey: "\(preferencesKey).auto_confirm_skills") ?? [])
         }
         set {
+            objectWillChange.send()
             userDefaults.set(Array(newValue), forKey: "\(preferencesKey).auto_confirm_skills")
         }
     }
@@ -42,6 +49,7 @@ class UserPreferenceStore: ObservableObject {
             userDefaults.string(forKey: "\(preferencesKey).preferred_agent")
         }
         set {
+            objectWillChange.send()
             userDefaults.set(newValue, forKey: "\(preferencesKey).preferred_agent")
         }
     }
@@ -52,6 +60,7 @@ class UserPreferenceStore: ObservableObject {
             userDefaults.dictionary(forKey: "\(preferencesKey).task_agents") as? [String: String] ?? [:]
         }
         set {
+            objectWillChange.send()
             userDefaults.set(newValue, forKey: "\(preferencesKey).task_agents")
         }
     }
@@ -62,6 +71,7 @@ class UserPreferenceStore: ObservableObject {
             userDefaults.bool(forKey: "\(preferencesKey).disable_natural_intent")
         }
         set {
+            objectWillChange.send()
             userDefaults.set(newValue, forKey: "\(preferencesKey).disable_natural_intent")
         }
     }
@@ -72,13 +82,8 @@ class UserPreferenceStore: ObservableObject {
             userDefaults.integer(forKey: "\(preferencesKey).consecutive_rejections")
         }
         set {
+            objectWillChange.send()
             userDefaults.set(newValue, forKey: "\(preferencesKey).consecutive_rejections")
-            
-            // 如果连续拒绝超过3次，自动禁用自然语言检测
-            if newValue >= 3 && !disableNaturalIntentDetection {
-                disableNaturalIntentDetection = true
-                print("⚠️ 连续拒绝 \(newValue) 次意图检测，已自动禁用自然语言检测")
-            }
         }
     }
     
@@ -92,9 +97,64 @@ class UserPreferenceStore: ObservableObject {
             return stats
         }
         set {
+            objectWillChange.send()
             if let data = try? JSONEncoder().encode(newValue) {
                 userDefaults.set(data, forKey: "\(preferencesKey).session_stats")
             }
+        }
+    }
+
+    var skillDetectionPolicies: [String: String] {
+        get {
+            userDefaults.dictionary(forKey: detectionPoliciesKey) as? [String: String] ?? [:]
+        }
+        set {
+            objectWillChange.send()
+            userDefaults.set(newValue, forKey: detectionPoliciesKey)
+        }
+    }
+
+    var plannerShadowEnabled: Bool {
+        get {
+            userDefaults.bool(forKey: plannerShadowEnabledKey)
+        }
+        set {
+            objectWillChange.send()
+            userDefaults.set(newValue, forKey: plannerShadowEnabledKey)
+        }
+    }
+
+    var plannerShadowPreferredAgentID: String? {
+        get {
+            userDefaults.string(forKey: plannerShadowPreferredAgentKey)
+        }
+        set {
+            objectWillChange.send()
+            userDefaults.set(newValue, forKey: plannerShadowPreferredAgentKey)
+        }
+    }
+
+    var plannerPrimaryStrategy: PlannerPrimaryStrategy {
+        get {
+            guard let rawValue = userDefaults.string(forKey: plannerPrimaryStrategyKey),
+                  let strategy = PlannerPrimaryStrategy(rawValue: rawValue) else {
+                return .ruleBased
+            }
+            return strategy
+        }
+        set {
+            objectWillChange.send()
+            userDefaults.set(newValue.rawValue, forKey: plannerPrimaryStrategyKey)
+        }
+    }
+
+    var plannerPreferredAgentID: String? {
+        get {
+            userDefaults.string(forKey: plannerPreferredAgentKey) ?? userDefaults.string(forKey: plannerShadowPreferredAgentKey)
+        }
+        set {
+            objectWillChange.send()
+            userDefaults.set(newValue, forKey: plannerPreferredAgentKey)
         }
     }
     
@@ -102,7 +162,6 @@ class UserPreferenceStore: ObservableObject {
     
     /// 记录拒绝的 Skill
     func recordSkillRejection(_ skill: AISkill) {
-        rejectedSkills.insert(skill.rawValue)
         consecutiveRejections += 1
         
         print("📊 记录拒绝 Skill: \(skill.name) (连续拒绝: \(consecutiveRejections))")
@@ -116,24 +175,56 @@ class UserPreferenceStore: ObservableObject {
         // 记录使用次数
         var stats = sessionStats
         stats.skillUsageCount[skill.rawValue, default: 0] += 1
-        
-        // 如果使用超过3次，添加到自动确认列表
-        if stats.skillUsageCount[skill.rawValue, default: 0] >= 3 {
-            autoConfirmSkills.insert(skill.rawValue)
-            print("✅ Skill '\(skill.name)' 已添加到自动确认列表")
-        }
-        
         sessionStats = stats
+    }
+
+    func detectionPreference(for skill: AISkill) -> SkillDetectionPreference {
+        if let rawValue = skillDetectionPolicies[skill.rawValue],
+           let preference = SkillDetectionPreference(rawValue: rawValue) {
+            return preference
+        }
+
+        if rejectedSkills.contains(skill.rawValue) {
+            return .neverSuggest
+        }
+
+        if autoConfirmSkills.contains(skill.rawValue) {
+            return .autoRun
+        }
+
+        return .askEveryTime
+    }
+
+    func setDetectionPreference(_ preference: SkillDetectionPreference, for skill: AISkill) {
+        var policies = skillDetectionPolicies
+        policies[skill.rawValue] = preference.rawValue
+        skillDetectionPolicies = policies
+
+        var rejected = rejectedSkills
+        var autoConfirm = autoConfirmSkills
+
+        switch preference {
+        case .askEveryTime:
+            rejected.remove(skill.rawValue)
+            autoConfirm.remove(skill.rawValue)
+        case .autoRun:
+            rejected.remove(skill.rawValue)
+            autoConfirm.insert(skill.rawValue)
+        case .neverSuggest:
+            autoConfirm.remove(skill.rawValue)
+            rejected.insert(skill.rawValue)
+        }
+
+        rejectedSkills = rejected
+        autoConfirmSkills = autoConfirm
     }
     
     /// 检查是否应该跳过检测
     func shouldSkipDetection(_ skill: AISkill) -> Bool {
-        // 如果用户明确拒绝了该 Skill
-        if rejectedSkills.contains(skill.rawValue) {
+        if detectionPreference(for: skill) == .neverSuggest {
             return true
         }
         
-        // 如果自然语言检测被禁用
         if disableNaturalIntentDetection {
             return true
         }
@@ -143,7 +234,7 @@ class UserPreferenceStore: ObservableObject {
     
     /// 检查是否应该自动确认
     func shouldAutoConfirm(_ skill: AISkill) -> Bool {
-        return autoConfirmSkills.contains(skill.rawValue)
+        detectionPreference(for: skill) == .autoRun
     }
     
     /// 记录 Agent 偏好
@@ -178,9 +269,14 @@ class UserPreferenceStore: ObservableObject {
     func resetAllPreferences() {
         rejectedSkills.removeAll()
         autoConfirmSkills.removeAll()
+        skillDetectionPolicies.removeAll()
         preferredAgent = nil
         taskPreferredAgents.removeAll()
         disableNaturalIntentDetection = false
+        plannerPrimaryStrategy = .ruleBased
+        plannerPreferredAgentID = nil
+        plannerShadowEnabled = false
+        plannerShadowPreferredAgentID = nil
         consecutiveRejections = 0
         sessionStats = SessionPreferences()
         
@@ -192,9 +288,14 @@ class UserPreferenceStore: ObservableObject {
         return [
             "rejected_skills": Array(rejectedSkills),
             "auto_confirm_skills": Array(autoConfirmSkills),
+            "skill_detection_policies": skillDetectionPolicies,
             "preferred_agent": preferredAgent as Any,
             "task_agents": taskPreferredAgents,
             "disable_natural_intent": disableNaturalIntentDetection,
+            "planner_primary_strategy": plannerPrimaryStrategy.rawValue,
+            "planner_preferred_agent_id": plannerPreferredAgentID as Any,
+            "planner_shadow_enabled": plannerShadowEnabled,
+            "planner_shadow_preferred_agent_id": plannerShadowPreferredAgentID as Any,
             "consecutive_rejections": consecutiveRejections,
             "session_stats": try? JSONEncoder().encode(sessionStats)
         ]

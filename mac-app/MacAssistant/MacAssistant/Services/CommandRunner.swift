@@ -18,11 +18,6 @@ class CommandRunner: ObservableObject {
         let failed: Bool
     }
 
-    private enum AgentCreationRequestKind {
-        case runtimeSetup
-        case workflowDesign
-    }
-
     @Published var messages: [ChatMessage] = [] {
         didSet {
             guard !isRestoringPersistedState else { return }
@@ -45,12 +40,13 @@ class CommandRunner: ObservableObject {
     private let agentStore = AgentStore.shared
     private let orchestrator = AgentOrchestrator.shared
     private let creationSkill = AgentCreationSkill.shared
-    private let intelligence = ConversationIntelligence.shared
     private let skillRegistry = AISkillRegistry.shared
     private let toolSkillRegistry = SkillRegistry.shared
     private let skillEvolutionAdvisor = SkillEvolutionAdvisor.shared
     private let gatewayClient = OpenClawGatewayClient.shared
     private let localKimiCLIService = LocalKimiCLIService.shared
+    private let requestPlanner = RequestPlanner.shared
+    private let resultCollector = ResultCollector.shared
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
@@ -118,109 +114,30 @@ class CommandRunner: ObservableObject {
     func processInput(_ text: String, images: [String] = []) async {
         let contextualImages = resolveImagesForRequest(text: text, explicitImages: images)
 
-        // 1. 检查是否在 Agent 创建流程中
-        if creationSkill.isInCreationFlow {
-            await creationSkill.handleInput(text, runner: self)
-            return
-        }
-
-        if await handleResumeRequestIfNeeded(text) {
-            return
-        }
-
-        if let lastMessage = messages.last,
-           let pendingProposalID = lastMessage.metadata?["pending_skill_evolution_id"] {
-            let lowercased = text.lowercased().trimmingCharacters(in: .whitespaces)
-
-            if lowercased == "是" || lowercased == "y" || lowercased == "yes" {
-                let response = skillEvolutionAdvisor.acceptProposal(id: pendingProposalID)
-                let message = ChatMessage(
-                    id: UUID(),
-                    role: .assistant,
-                    content: response,
-                    timestamp: Date(),
-                    agentId: "builtin-skill-evolution-advisor",
-                    agentName: "Skill 迭代顾问"
-                )
-                await MainActor.run {
-                    messages.append(message)
-                    isProcessing = false
-                }
-                return
-            } else if lowercased == "否" || lowercased == "n" || lowercased == "no" {
-                let response = skillEvolutionAdvisor.rejectProposal(id: pendingProposalID)
-                let message = ChatMessage(
-                    id: UUID(),
-                    role: .assistant,
-                    content: response,
-                    timestamp: Date(),
-                    agentId: "builtin-skill-evolution-advisor",
-                    agentName: "Skill 迭代顾问"
-                )
-                await MainActor.run {
-                    messages.append(message)
-                    isProcessing = false
-                }
-                return
-            }
-        }
-        
-        // 2. 检查是否是 Skill 确认回复
-        if let lastMessage = messages.last,
-           let pendingSkill = lastMessage.metadata?["pending_skill"],
-           let skillInput = lastMessage.metadata?["skill_input"] {
-            let lowercased = text.lowercased().trimmingCharacters(in: .whitespaces)
-            
-            if lowercased == "是" || lowercased == "y" || lowercased == "yes" {
-                // 用户确认执行 Skill
-                if let skill = AISkill(rawValue: pendingSkill) {
-                    preferences.recordSkillAcceptance(skill)
-                    await handleSkillCommand(skill, input: skillInput, images: images)
-                    return
-                }
-            } else if lowercased == "否" || lowercased == "n" || lowercased == "no" {
-                // 用户拒绝，记录偏好
-                if let skill = AISkill(rawValue: pendingSkill) {
-                    preferences.recordSkillRejection(skill)
-                    
-                    let response = ChatMessage(
-                        id: UUID(),
-                        role: MessageRole.assistant,
-                        content: "好的，已跳过。下次遇到类似情况不再提示此 Skill。",
-                        timestamp: Date()
-                    )
-                    await MainActor.run {
-                        messages.append(response)
-                        isProcessing = false
-                    }
-                    return
-                }
-            }
-        }
-
-        if agentStore.needsInitialSetup {
-            let userMessage = ChatMessage(
-                id: UUID(),
-                role: .user,
-                content: text,
-                timestamp: Date(),
-                images: contextualImages
+        let envelope = await MainActor.run { () -> RequestEnvelope in
+            RequestEnvelope(
+                originalText: text,
+                images: contextualImages,
+                currentAgent: orchestrator.currentAgent,
+                needsInitialSetup: agentStore.needsInitialSetup,
+                lastMessage: messages.last,
+                creationFlowActive: creationSkill.isInCreationFlow,
+                resumableTaskSessionID: latestResumableTaskSessionID()
             )
-            await MainActor.run {
-                messages.append(userMessage)
-                isProcessing = false
-                presentInitialSetupPrompt(for: contextualImages.isEmpty ? "开始对话" : "处理附件请求")
-            }
+        }
+        let plan = await requestPlanner.plan(envelope)
+
+        if !plan.shouldAppendUserMessage {
+            logRequestPlan(plan)
+            await executeRequestPlan(plan, anchorMessageID: envelope.id)
             return
         }
-        
-        // 3. 智能解析输入
-        let parsed = intelligence.analyzeInput(text)
-        
-        // 4. 记录用户输入
-        logger.logUserInput(text, parsed: parsed)
-        
-        // 3. 添加用户消息（显示原始输入）
+
+        // 3. 记录用户输入和统一规划结果
+        logger.logUserInput(text, parsed: plan.parsedInput)
+        logRequestPlan(plan)
+
+        // 4. 添加用户消息（显示原始输入）
         let userMessage = ChatMessage(
             id: UUID(),
             role: .user,
@@ -235,89 +152,149 @@ class CommandRunner: ObservableObject {
             isProcessing = true
         }
 
-        if let toolSkillCommand = detectToolSkillCommand(in: text) {
-            await handleToolSkillCommand(toolSkillCommand.name, input: toolSkillCommand.input)
-            return
+        await executeRequestPlan(plan, anchorMessageID: userMessageID)
+    }
+
+    private func executeRequestPlan(_ plan: RequestPlan, anchorMessageID: UUID) async {
+        if !plan.notices.isEmpty {
+            await MainActor.run {
+                for notice in plan.notices {
+                    appendSystemMessage(notice)
+                }
+            }
         }
 
-        if await handleSkillEvolutionOverviewIfNeeded(text) {
-            return
-        }
-
-        if await handleAgentCreationRequestIfNeeded(text) {
-            return
-        }
-
-        if await handleDirectWebContextIfNeeded(text, images: contextualImages) {
-            return
-        }
-
-        if let nativeMacSkillName = await MacSystemAgent.shared.suggestedSkillName(for: text) {
-            await handleToolSkillCommand(nativeMacSkillName, input: text)
-            return
-        }
-
-        if await handleProjectSkillOverviewIfNeeded(text, images: contextualImages) {
-            return
-        }
-        
-        // 4. 处理 @Agent 提及（检查是否涉及图片）
-        if let mention = parsed.agentMention {
-            let requiresVision = !contextualImages.isEmpty ||
-                                parsed.cleanText.lowercased().contains("图") ||
-                                parsed.cleanText.lowercased().contains("图片") ||
-                                parsed.cleanText.lowercased().contains("截图")
-            let requiredCapability: Capability? = requiresVision ? .vision : nil
-            await handleAgentSwitch(mention.agent, reason: "通过 @\(mention.agentName) 指定", requiredCapability: requiredCapability)
-        }
-        
-        // 5. 处理 /Skill 命令
-        if let skillCommand = parsed.skillCommand {
-            await handleSkillCommand(skillCommand.skill, input: parsed.cleanText, images: contextualImages)
-            return
-        }
-        
-        // 6. 处理检测到的 Skill 意图（需要确认）
-        if let detectedSkill = parsed.detectedSkill {
-            await handleDetectedSkill(
-                detectedSkill,
-                input: parsed.cleanText,
-                images: contextualImages,
-                anchorMessageID: userMessageID
+        if let requestedAgentSwitch = plan.requestedAgentSwitch {
+            let switched = await handleAgentSwitch(
+                requestedAgentSwitch.agent,
+                reason: requestedAgentSwitch.reason,
+                requiredCapability: requestedAgentSwitch.requiredCapability
             )
-            return
+            guard switched else { return }
         }
-        
-        // 7. 处理 Agent 建议
-        if let agentSuggestion = parsed.suggestedAgent {
-            await handleAgentSuggestion(agentSuggestion, input: parsed.cleanText, images: contextualImages)
-            return
+
+        switch plan.primaryAction {
+        case .continueAgentCreationFlow(let input):
+            await creationSkill.handleInput(input, runner: self)
+
+        case .resumeInterruptedTask(let sessionID):
+            await resumeTaskSessionIfPossible(sessionID)
+
+        case .respondToSkillEvolution(let proposalID, let accepted):
+            let response = accepted
+                ? skillEvolutionAdvisor.acceptProposal(id: proposalID)
+                : skillEvolutionAdvisor.rejectProposal(id: proposalID)
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: response,
+                        timestamp: Date(),
+                        agentId: "builtin-skill-evolution-advisor",
+                        agentName: "Skill 迭代顾问"
+                    )
+                )
+                isProcessing = false
+            }
+
+        case .respondToDetectedSkillSuggestion(let messageID, let action):
+            await MainActor.run {
+                isProcessing = false
+            }
+            await handleDetectedSkillSuggestionAction(
+                messageID: messageID,
+                action: action,
+                images: plan.envelope.images
+            )
+
+        case .respondToLegacySkillSuggestion(let skill, let input, let accepted):
+            if accepted {
+                await runDetectedSkillInSideSession(
+                    skill: skill,
+                    input: input,
+                    images: plan.envelope.images,
+                    suggestionMessageID: plan.envelope.lastMessage?.id
+                )
+            } else {
+                await MainActor.run {
+                    preferences.recordSkillRejection(skill)
+                    if let messageID = plan.envelope.lastMessage?.id {
+                        resolveDetectedSkillSuggestionMessage(
+                            messageID: messageID,
+                            content: "已跳过这次 \(skill.name) 建议。后续是否继续提示，可以在 Skills > 设置 里修改。"
+                        )
+                    }
+                    isProcessing = false
+                }
+            }
+
+        case .requestInitialSetup:
+            await MainActor.run {
+                isProcessing = false
+                presentInitialSetupPrompt(for: plan.envelope.images.isEmpty ? "开始对话" : "处理附件请求")
+            }
+
+        case .showSkillEvolutionOverview:
+            await presentSkillEvolutionOverview()
+
+        case .showPlannerConsole:
+            await presentPlannerConsoleStatus()
+
+        case .executeToolSkill(let name, let input):
+            await handleToolSkillCommand(name, input: input)
+
+        case .showSkillOverview:
+            await presentProjectSkillOverview()
+
+        case .showAgentCreationGuidance(let kind):
+            await presentAgentCreationGuidance(kind: kind, originalInput: plan.envelope.originalText)
+
+        case .executeLocalToolSkill(let name, let input):
+            await handleToolSkillCommand(name, input: input)
+
+        case .executeExplicitSkill(let skill, let input):
+            await handleSkillCommand(skill, input: input, images: plan.envelope.images)
+
+        case .handleDetectedSkill(let skill, let input, let executionInput):
+            await handleDetectedSkill(
+                skill,
+                input: input,
+                executionInput: executionInput,
+                images: plan.envelope.images,
+                anchorMessageID: anchorMessageID
+            )
+
+        case .handleAgentSuggestion(let suggestion, let input):
+            await handleAgentSuggestion(suggestion, input: input, images: plan.envelope.images)
+
+        case .routeParallelLinkResearch(let input):
+            await handleParallelLinkResearch(
+                input: input,
+                originalText: plan.envelope.originalText,
+                images: plan.envelope.images,
+                anchorMessageID: anchorMessageID
+            )
+
+        case .routeMainConversation(let input):
+            await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
         }
-        
-        // 8. 普通消息处理（使用解析后的纯净文本）
-        await processCleanInput(parsed.cleanText, images: contextualImages, anchorMessageID: userMessageID)
     }
 
-    private func detectToolSkillCommand(in text: String) -> (name: String, input: String)? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("/") else { return nil }
-
-        let payload = String(trimmed.dropFirst())
-        let parts = payload.split(maxSplits: 1, whereSeparator: \.isWhitespace)
-        guard let rawName = parts.first else { return nil }
-
-        let name = rawName.lowercased()
-        guard toolSkillRegistry.getSkill(name) != nil else { return nil }
-
-        let input = parts.count > 1 ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines) : name
-        return (name, input)
+    private func logRequestPlan(_ plan: RequestPlan) {
+        let currentAgentID = plan.envelope.currentAgent?.id ?? "none"
+        let mentionID = plan.requestedAgentSwitch?.agent.id ?? "none"
+        LogInfo(
+            "RequestPlanner decision requestID=\(plan.envelope.id.uuidString) " +
+            "planner=\(plan.plannerID) action=\(plan.summary) confidence=\(plan.confidence.rawValue) " +
+            "mode=\(plan.executionMode.rawValue) tasks=\(plan.taskSummary) " +
+            "currentAgent=\(currentAgentID) mentionedAgent=\(mentionID) " +
+            "images=\(plan.envelope.images.count) notices=\(plan.notices.count) " +
+            "reason=\(plan.reason)"
+        )
     }
 
-    private func handleProjectSkillOverviewIfNeeded(_ text: String, images: [String]) async -> Bool {
-        guard images.isEmpty, shouldRespondWithProjectSkillOverview(to: text) else {
-            return false
-        }
-
+    private func presentProjectSkillOverview() async {
         let currentAgentName = orchestrator.currentAgent?.name
         let content = await openClawSkillOverviewMessage()
         let message = ChatMessage(
@@ -337,22 +314,6 @@ class CommandRunner: ObservableObject {
             messages.append(message)
             isProcessing = false
         }
-        return true
-    }
-
-    private func shouldRespondWithProjectSkillOverview(to text: String) -> Bool {
-        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if normalized.contains("openclaw") && (normalized.contains("skill") || normalized.contains("能力")) {
-            return true
-        }
-
-        let skillKeywords = ["skill", "skills", "技能", "功能", "能做什么", "可以做什么", "会什么", "可用"]
-        let requestKeywords = ["哪些", "什么", "查看", "列出", "介绍", "有哪些", "有什么"]
-
-        let hasSkillIntent = skillKeywords.contains { normalized.contains($0) }
-        let hasRequestIntent = requestKeywords.contains { normalized.contains($0) }
-        return hasSkillIntent && hasRequestIntent
     }
 
     private func projectSkillOverviewMessage() -> String {
@@ -459,6 +420,80 @@ class CommandRunner: ObservableObject {
             return "文本与代码"
         case .webSearch:
             return "联网与检索"
+        }
+    }
+
+    private func presentSkillEvolutionOverview() async {
+        let newlyDiscovered = skillEvolutionAdvisor.scanNow()
+        if !newlyDiscovered.isEmpty {
+            await MainActor.run {
+                for proposal in newlyDiscovered {
+                    presentSkillEvolutionProposal(proposal)
+                }
+            }
+        }
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: skillEvolutionAdvisor.summaryMessage(),
+            timestamp: Date(),
+            agentId: "builtin-skill-evolution-advisor",
+            agentName: "Skill 迭代顾问"
+        )
+
+        await MainActor.run {
+            messages.append(message)
+            isProcessing = false
+        }
+    }
+
+    private func presentPlannerConsoleStatus() async {
+        let preferredPlannerAgentName: String = {
+            if let agentID = preferences.plannerPreferredAgentID,
+               let agent = agentStore.usableAgents.first(where: { $0.id == agentID }) {
+                return agent.displayName
+            }
+            return "自动选择"
+        }()
+
+        let shadowStatus = preferences.plannerShadowEnabled ? "已开启" : "未开启"
+        let content = """
+        我已经把 **Skills > 设置 > Planner Console** 打开了。
+
+        当前这条意图分析/调度链路的真实状态是：
+        • 主 Planner：\(preferences.plannerPrimaryStrategy.displayName)
+        • Planner Agent：\(preferredPlannerAgentName)
+        • 影子对比：\(shadowStatus)
+        • Dispatcher：已启用，会决定主会话 / side task / 并行子任务
+        • Link Research：已启用，URL 研究类请求会拆成主回答 + 链接抓取子任务
+        • Result Collector：已启用，会在主回答后补充 side task 的研究结果
+        • Local System Guard：已启用，只在高置信度系统操作时才会本地截走
+        • Self-heal：已启用，负责 Agent 回退、Kimi CLI 登录恢复和 OpenClaw 自愈
+
+        你现在可以直接在面板里切换：
+        • 规则优先
+        • Planner Agent 接管
+        • 是否开启影子对比
+        • 由哪个 Agent 担任 Planner
+        """
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: content,
+            timestamp: Date(),
+            agentId: "builtin-planner-console",
+            agentName: "Planner Console"
+        )
+
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: NSNotification.Name("ShowSkillsBrowser"),
+                object: "设置"
+            )
+            messages.append(message)
+            isProcessing = false
         }
     }
 
@@ -580,51 +615,14 @@ class CommandRunner: ObservableObject {
         return description.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func handleSkillEvolutionOverviewIfNeeded(_ text: String) async -> Bool {
-        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let keywords = [
-            "skill优化", "优化skill", "技能优化", "skill 迭代", "技能迭代",
-            "有哪些skill需要优化", "哪些技能需要优化", "skill建议", "优化建议"
-        ]
-
-        guard keywords.contains(where: { normalized.contains($0) }) else {
-            return false
-        }
-
-        let newlyDiscovered = skillEvolutionAdvisor.scanNow()
-        if !newlyDiscovered.isEmpty {
-            await MainActor.run {
-                for proposal in newlyDiscovered {
-                    presentSkillEvolutionProposal(proposal)
-                }
-            }
-        }
-
+    private func presentAgentCreationGuidance(
+        kind: AgentCreationRequestKind,
+        originalInput: String
+    ) async {
         let message = ChatMessage(
             id: UUID(),
             role: .assistant,
-            content: skillEvolutionAdvisor.summaryMessage(),
-            timestamp: Date(),
-            agentId: "builtin-skill-evolution-advisor",
-            agentName: "Skill 迭代顾问"
-        )
-
-        await MainActor.run {
-            messages.append(message)
-            isProcessing = false
-        }
-        return true
-    }
-
-    private func handleAgentCreationRequestIfNeeded(_ text: String) async -> Bool {
-        guard let kind = classifyAgentCreationRequest(text) else {
-            return false
-        }
-
-        let message = ChatMessage(
-            id: UUID(),
-            role: .assistant,
-            content: agentCreationGuidanceMessage(for: kind, originalInput: text),
+            content: agentCreationGuidanceMessage(for: kind, originalInput: originalInput),
             timestamp: Date(),
             agentId: "builtin-agent-creation-guard",
             agentName: "Agent 创建顾问"
@@ -641,48 +639,6 @@ class CommandRunner: ObservableObject {
                 )
             }
         }
-
-        return true
-    }
-
-    private func classifyAgentCreationRequest(_ text: String) -> AgentCreationRequestKind? {
-        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !normalized.isEmpty else { return nil }
-
-        let createKeywords = [
-            "创建", "新建", "新增", "添加", "配置", "设计", "做一个", "做个",
-            "create", "build", "new"
-        ]
-        let agentKeywords = ["agent", "智能体", "助手", "机器人", "bot"]
-
-        guard createKeywords.contains(where: { normalized.contains($0) }),
-              agentKeywords.contains(where: { normalized.contains($0) }) else {
-            return nil
-        }
-
-        let workflowKeywords = [
-            "每天", "每周", "定时", "自动", "监控", "通知", "提醒", "订阅", "策略",
-            "工作流", "任务", "服务", "接口", "部署", "执行", "分析", "跟踪", "告警",
-            "开盘", "收盘", "cron", "schedule", "webhook", "mcp"
-        ]
-        let runtimeKeywords = [
-            "openai", "anthropic", "claude", "moonshot", "kimi", "google", "gemini",
-            "gpt", "api key", "apikey", "provider", "提供商", "模型", "llm"
-        ]
-
-        if workflowKeywords.contains(where: { normalized.contains($0) }) {
-            return .workflowDesign
-        }
-
-        if runtimeKeywords.contains(where: { normalized.contains($0) }) {
-            return .runtimeSetup
-        }
-
-        if text.count >= 80 || normalized.contains("需要") || normalized.contains("希望") {
-            return .workflowDesign
-        }
-
-        return .runtimeSetup
     }
 
     private func agentCreationGuidanceMessage(
@@ -728,26 +684,36 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func handleDirectWebContextIfNeeded(_ text: String, images: [String]) async -> Bool {
-        guard let content = await WebContextAgent.shared.responseIfNeeded(for: text, images: images) else {
-            return false
-        }
-
-        let message = ChatMessage(
-            id: UUID(),
-            role: .assistant,
-            content: content,
-            timestamp: Date(),
-            agentId: "builtin-web-context-agent",
-            agentName: "网页读取 Agent"
+    private func preferredOpenClawToolAgent(for images: [String]) -> Agent? {
+        let requiredCapability: Capability = images.isEmpty ? .textChat : .vision
+        return agentStore.preferredSubtaskWorker(
+            for: requiredCapability,
+            requireToolSupport: true
         )
+    }
 
-        await MainActor.run {
-            messages.append(message)
-            isProcessing = false
+    private func supportsOpenClawTools(_ agent: Agent) -> Bool {
+        agent.provider != .ollama
+    }
+
+    private func effectiveAgentForLinkHandlingIfNeeded(
+        requestedAgent: Agent,
+        text: String,
+        images: [String]
+    ) -> (agent: Agent, rerouted: Bool) {
+        guard WebContextAgent.shared.hasLinkRequest(for: text, images: images),
+              !RequestPlanningHeuristics.shouldRespectCurrentAgentSelection(
+                for: text,
+                images: images,
+                currentAgent: requestedAgent
+              ),
+              !supportsOpenClawTools(requestedAgent),
+              let helperAgent = preferredOpenClawToolAgent(for: images),
+              helperAgent.id != requestedAgent.id else {
+            return (requestedAgent, false)
         }
 
-        return true
+        return (helperAgent, true)
     }
 
     private func handleToolSkillCommand(_ skillName: String, input: String) async {
@@ -836,11 +802,22 @@ class CommandRunner: ObservableObject {
     
     /// 处理纯净输入
     private func processCleanInput(_ text: String, images: [String], anchorMessageID: UUID) async {
+        let preferCurrentAgent = RequestPlanningHeuristics.shouldRespectCurrentAgentSelection(
+            for: text,
+            images: images,
+            currentAgent: orchestrator.currentAgent
+        )
+
         // 检测意图
         let intent = await orchestrator.analyzeIntent(text)
         
         // 路由决策
-        let routingResult = await orchestrator.route(text, images: images, intent: intent)
+        let routingResult = await orchestrator.route(
+            text,
+            images: images,
+            intent: intent,
+            preferCurrentAgent: preferCurrentAgent
+        )
         
         // 处理路由结果
         switch routingResult {
@@ -859,6 +836,29 @@ class CommandRunner: ObservableObject {
         case .multipleAgents(let agents):
             await handleMultipleAgentOptions(agents: agents, text: text, images: images)
         }
+    }
+
+    private func handleParallelLinkResearch(
+        input: String,
+        originalText: String,
+        images: [String],
+        anchorMessageID: UUID
+    ) async {
+        let groupID = await resultCollector.startParallelGroup(originalRequest: originalText)
+        let sessionID = await MainActor.run {
+            createLinkResearchTaskSession(request: originalText, linkedMessageID: anchorMessageID)
+        }
+
+        Task {
+            await executeLinkResearchTask(
+                sessionID: sessionID,
+                originalText: originalText,
+                groupID: groupID
+            )
+        }
+
+        await processCleanInput(input, images: images, anchorMessageID: anchorMessageID)
+        await deliverCollectedParallelSummaryIfReady(groupID: groupID)
     }
     
     /// 处理截图命令
@@ -887,7 +887,7 @@ class CommandRunner: ObservableObject {
     // MARK: - 智能处理方法
     
     /// 处理 Agent 切换（带能力检查）
-    private func handleAgentSwitch(_ agent: Agent, reason: String, requiredCapability: Capability? = nil) async {
+    private func handleAgentSwitch(_ agent: Agent, reason: String, requiredCapability: Capability? = nil) async -> Bool {
         // 检查是否需要特定能力
         if let capability = requiredCapability {
             if !agent.supports(capability) {
@@ -917,7 +917,7 @@ class CommandRunner: ObservableObject {
                 
                 // 记录能力缺口
                 logger.logCapabilityGap(gap, context: "切换 Agent 时发现能力不匹配")
-                return
+                return false
             }
         }
         
@@ -936,6 +936,7 @@ class CommandRunner: ObservableObject {
         await MainActor.run {
             messages.append(systemMessage)
         }
+        return true
     }
     
     /// 处理 Skill 命令
@@ -965,40 +966,91 @@ class CommandRunner: ObservableObject {
     private func handleDetectedSkill(
         _ skill: AISkill,
         input: String,
+        executionInput: String? = nil,
         images: [String],
         anchorMessageID: UUID
     ) async {
-        // 1. 检查是否应该跳过（用户之前拒绝过）
         if preferences.shouldSkipDetection(skill) {
-            // 直接发送纯净文本，不提示 Skill
-            await processCleanInput(input, images: images, anchorMessageID: anchorMessageID)
+            await processCleanInput(executionInput ?? input, images: images, anchorMessageID: anchorMessageID)
             return
         }
-        
-        // 2. 检查是否应该自动确认（用户经常使用）
+
         if preferences.shouldAutoConfirm(skill) {
-            await handleSkillCommand(skill, input: input, images: images)
+            preferences.recordSkillAcceptance(skill)
+            await runDetectedSkillInSideSession(
+                skill: skill,
+                input: executionInput ?? input,
+                images: images,
+                suggestionMessageID: nil
+            )
             return
         }
-        
-        // 3. 显示确认提示
+
         let confirmMessage = ChatMessage(
             id: UUID(),
             role: MessageRole.assistant,
-            content: """
-            💡 检测到 **\(skill.name)** 意图
-            
-            "\(input)"
-            
-            是否使用 \(skill.emoji) \(skill.name)？
-            回复 "是" 或 "y" 确认执行
-            回复 "否" 或 "n" 拒绝（下次不再提示此 Skill）
-            """,
+            content: "已检测到 \(skill.name) 意图",
             timestamp: Date(),
-            metadata: ["pending_skill": skill.rawValue, "skill_input": input]
+            agentId: "builtin-skill-suggester",
+            agentName: "意图建议",
+            metadata: [
+                ChatMessage.detectedSkillKey: skill.rawValue,
+                ChatMessage.detectedSkillInputKey: input,
+                ChatMessage.detectedSkillExecutionInputKey: executionInput ?? input,
+                ChatMessage.detectedSkillSourceKey: "自然意图"
+            ]
         )
         await MainActor.run {
             messages.append(confirmMessage)
+            isProcessing = false
+        }
+    }
+
+    @MainActor
+    func handleDetectedSkillSuggestionAction(
+        messageID: UUID,
+        action: DetectedSkillSuggestionAction,
+        images: [String] = []
+    ) async {
+        guard let message = messages.first(where: { $0.id == messageID }),
+              let suggestion = message.detectedSkillSuggestion else {
+            return
+        }
+
+        switch action {
+        case .runOnce:
+            preferences.recordSkillAcceptance(suggestion.skill)
+            await runDetectedSkillInSideSession(
+                skill: suggestion.skill,
+                input: suggestion.executionInput,
+                images: images,
+                suggestionMessageID: messageID
+            )
+
+        case .dismissOnce:
+            preferences.recordSkillRejection(suggestion.skill)
+            resolveDetectedSkillSuggestionMessage(
+                messageID: messageID,
+                content: "已跳过这次 \(suggestion.skill.name) 建议。后续是否继续提示，可以在 Skills > 设置 里修改。"
+            )
+            isProcessing = false
+
+        case .alwaysAutoRun:
+            preferences.setDetectionPreference(.autoRun, for: suggestion.skill)
+            preferences.recordSkillAcceptance(suggestion.skill)
+            await runDetectedSkillInSideSession(
+                skill: suggestion.skill,
+                input: suggestion.executionInput,
+                images: images,
+                suggestionMessageID: messageID
+            )
+
+        case .neverSuggest:
+            preferences.setDetectionPreference(.neverSuggest, for: suggestion.skill)
+            resolveDetectedSkillSuggestionMessage(
+                messageID: messageID,
+                content: "后续不再主动建议 \(suggestion.skill.name)。你仍然可以通过 `/\(suggestion.skill.rawValue)` 手动调用。"
+            )
             isProcessing = false
         }
     }
@@ -1055,10 +1107,16 @@ class CommandRunner: ObservableObject {
     private func handleSkillResult(_ result: SkillResult, for skill: AISkill) {
         switch result {
         case .success(let message):
+            let content: String
+            if skill == .webSearch {
+                content = message
+            } else {
+                content = "✅ \(skill.name) 执行成功：\(message)"
+            }
             let successMessage = ChatMessage(
                 id: UUID(),
                 role: MessageRole.assistant,
-                content: "✅ \(skill.name) 执行成功：\(message)",
+                content: content,
                 timestamp: Date()
             )
             messages.append(successMessage)
@@ -1085,6 +1143,346 @@ class CommandRunner: ObservableObject {
             messages.append(errorMessage)
         }
     }
+
+    private func runDetectedSkillInSideSession(
+        skill: AISkill,
+        input: String,
+        images: [String],
+        suggestionMessageID: UUID?
+    ) async {
+        let sessionID = await MainActor.run {
+            isProcessing = false
+            return createDetectedSkillTaskSession(
+                skill: skill,
+                request: input,
+                images: images,
+                suggestionMessageID: suggestionMessageID
+            )
+        }
+
+        Task {
+            await executeDetectedSkillTask(
+                sessionID: sessionID,
+                skill: skill,
+                input: input,
+                images: images
+            )
+        }
+    }
+
+    @MainActor
+    private func createDetectedSkillTaskSession(
+        skill: AISkill,
+        request: String,
+        images: [String],
+        suggestionMessageID: UUID?
+    ) -> String {
+        var session = AgentTaskSession(
+            title: "\(skill.emoji) \(skill.name) · 独立处理",
+            originalRequest: request,
+            status: .running,
+            statusSummary: "已从主会话拆出，正在后台独立处理",
+            mainAgentName: orchestrator.currentAgent?.name,
+            delegateAgentID: "builtin-skill-\(skill.rawValue)",
+            delegateAgentName: skill.name,
+            intentName: "独立处理",
+            isExpanded: true,
+            inputImages: images,
+            canResume: false
+        )
+
+        let linkedMessageID: UUID
+        let linkedTimestamp: Date
+
+        if let suggestionMessageID,
+           let existingMessage = messages.first(where: { $0.id == suggestionMessageID }) {
+            linkedMessageID = existingMessage.id
+            linkedTimestamp = existingMessage.timestamp
+
+            replaceMessage(
+                id: existingMessage.id,
+                with: ChatMessage(
+                    id: existingMessage.id,
+                    role: .system,
+                    content: "已将 \(skill.name) 拆到独立处理，不影响主会话。",
+                    timestamp: linkedTimestamp,
+                    linkedTaskSessionID: session.id
+                )
+            )
+        } else {
+            let taskCardMessage = ChatMessage(
+                id: UUID(),
+                role: .system,
+                content: "已将 \(skill.name) 拆到独立处理，不影响主会话。",
+                timestamp: Date(),
+                linkedTaskSessionID: session.id
+            )
+            linkedMessageID = taskCardMessage.id
+            linkedTimestamp = taskCardMessage.timestamp
+            messages.append(taskCardMessage)
+        }
+
+        session.linkedMainMessageID = linkedMessageID
+        session.messages = [
+            TaskSessionMessage(role: .system, content: "该 Skill 以独立任务方式执行，不阻塞主会话。"),
+            TaskSessionMessage(role: .user, content: request, timestamp: linkedTimestamp, agentName: orchestrator.currentAgent?.name)
+        ]
+
+        taskSessions.append(session)
+        return session.id
+    }
+
+    @MainActor
+    private func createLinkResearchTaskSession(request: String, linkedMessageID: UUID) -> String {
+        var session = AgentTaskSession(
+            title: "🔗 链接研究 · 独立抓取",
+            originalRequest: request,
+            status: .running,
+            statusSummary: "秘书层已拆出链接抓取子任务，正在后台处理",
+            mainAgentName: orchestrator.currentAgent?.name,
+            delegateAgentID: "builtin-link-researcher",
+            delegateAgentName: "链接研究子任务",
+            intentName: "并行抓取",
+            isExpanded: true,
+            inputImages: [],
+            canResume: false
+        )
+
+        let timestamp = messages.first(where: { $0.id == linkedMessageID })?.timestamp ?? Date()
+        let taskCardMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: "已拆出链接抓取子任务，不阻塞主会话回答。",
+            timestamp: timestamp,
+            linkedTaskSessionID: session.id
+        )
+
+        session.linkedMainMessageID = taskCardMessage.id
+        session.messages = [
+            TaskSessionMessage(role: .system, content: "该链接抓取任务由秘书层并行执行，用于补充研究上下文。"),
+            TaskSessionMessage(role: .user, content: request, timestamp: timestamp, agentName: orchestrator.currentAgent?.name)
+        ]
+
+        messages.append(taskCardMessage)
+        taskSessions.append(session)
+        return session.id
+    }
+
+    private func executeDetectedSkillTask(
+        sessionID: String,
+        skill: AISkill,
+        input: String,
+        images: [String]
+    ) async {
+        let startTime = Date()
+        let context = MacAssistant.SkillContext(
+            input: input,
+            images: images,
+            currentAgent: orchestrator.currentAgent,
+            runner: self
+        )
+
+        await MainActor.run {
+            appendTaskSessionMessage(
+                sessionID: sessionID,
+                role: .assistant,
+                content: "\(skill.name) 已开始执行，结果会单独回流到这张卡片。",
+                agentName: skill.name
+            )
+            updateTaskSessionStatus(
+                sessionID: sessionID,
+                status: .running,
+                summary: "\(skill.name) 正在独立处理，不影响当前对话。"
+            )
+        }
+
+        let result = await skillRegistry.execute(skill, context: context)
+        let duration = Date().timeIntervalSince(startTime)
+        logger.logSkillExecution(skill, result: result, duration: duration)
+
+        await MainActor.run {
+            switch result {
+            case .success(let message):
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .assistant,
+                    content: message,
+                    agentName: skill.name
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .completed,
+                    summary: "\(skill.name) 已返回结果",
+                    isExpanded: true,
+                    resultSummary: summarizeTaskResult(message),
+                    errorMessage: nil
+                )
+
+            case .requiresInput(let prompt):
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .system,
+                    content: prompt,
+                    agentName: skill.name
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .waitingUser,
+                    summary: "\(skill.name) 还需要更多输入",
+                    isExpanded: true,
+                    resultSummary: nil,
+                    errorMessage: prompt
+                )
+
+            case .requiresAgentCreation(let gap):
+                let prompt = "\(skill.name) 还缺少 \(gap.missingCapability.displayName) 能力：\(gap.description)"
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .system,
+                    content: prompt,
+                    agentName: skill.name
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .waitingUser,
+                    summary: "\(skill.name) 需要先补齐能力",
+                    isExpanded: true,
+                    resultSummary: nil,
+                    errorMessage: prompt
+                )
+                NotificationCenter.default.post(
+                    name: NSNotification.Name("ShowCapabilityWizard"),
+                    object: gap
+                )
+
+            case .error(let message):
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .system,
+                    content: message,
+                    agentName: skill.name
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .failed,
+                    summary: "\(skill.name) 没有成功完成",
+                    isExpanded: true,
+                    resultSummary: nil,
+                    errorMessage: message
+                )
+            }
+        }
+    }
+
+    private func executeLinkResearchTask(
+        sessionID: String,
+        originalText: String,
+        groupID: String
+    ) async {
+        await MainActor.run {
+            appendTaskSessionMessage(
+                sessionID: sessionID,
+                role: .assistant,
+                content: "正在抓取链接内容并提炼补充上下文...",
+                agentName: "链接研究子任务"
+            )
+            updateTaskSessionStatus(
+                sessionID: sessionID,
+                status: .running,
+                summary: "正在并行抓取链接内容"
+            )
+        }
+
+        do {
+            guard let summary = try await WebContextAgent.shared.backgroundResearchSummary(for: originalText, images: []) else {
+                await MainActor.run {
+                    appendTaskSessionMessage(
+                        sessionID: sessionID,
+                        role: .system,
+                        content: "没有额外抓到可补充的链接内容。",
+                        agentName: "链接研究子任务"
+                    )
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .completed,
+                        summary: "链接抓取完成，但没有新增补充",
+                        isExpanded: false,
+                        resultSummary: nil,
+                        errorMessage: nil
+                    )
+                }
+                return
+            }
+
+            await MainActor.run {
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .assistant,
+                    content: summary,
+                    agentName: "链接研究子任务"
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .completed,
+                    summary: "链接抓取已完成",
+                    isExpanded: true,
+                    resultSummary: summarizeTaskResult(summary),
+                    errorMessage: nil
+                )
+            }
+
+            if let supplement = await resultCollector.recordSubtaskResult(
+                groupID: groupID,
+                title: "链接抓取",
+                content: summary
+            ) {
+                await MainActor.run {
+                    appendAssistantConversationMessage(supplement)
+                }
+            }
+        } catch {
+            let message = "链接抓取失败：\((error as NSError).localizedDescription)"
+            await MainActor.run {
+                appendTaskSessionMessage(
+                    sessionID: sessionID,
+                    role: .system,
+                    content: message,
+                    agentName: "链接研究子任务"
+                )
+                updateTaskSessionStatus(
+                    sessionID: sessionID,
+                    status: .failed,
+                    summary: "链接抓取没有完成",
+                    isExpanded: true,
+                    resultSummary: nil,
+                    errorMessage: message
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func resolveDetectedSkillSuggestionMessage(messageID: UUID, content: String) {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
+        let timestamp = messages[index].timestamp
+        replaceMessage(
+            id: messageID,
+            with: ChatMessage(
+                id: messageID,
+                role: .system,
+                content: content,
+                timestamp: timestamp
+            )
+        )
+    }
+
+    @MainActor
+    private func replaceMessage(id: UUID, with message: ChatMessage) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+        var updatedMessages = messages
+        updatedMessages[index] = message
+        messages = updatedMessages
+    }
     
     // MARK: - 路由处理
     
@@ -1096,17 +1494,32 @@ class CommandRunner: ObservableObject {
         intent: Intent,
         anchorMessageID: UUID
     ) async {
+        let resolved = effectiveAgentForLinkHandlingIfNeeded(
+            requestedAgent: agent,
+            text: text,
+            images: images
+        )
+        let effectiveAgent = resolved.agent
+
+        if resolved.rerouted {
+            await MainActor.run {
+                appendSystemMessage(
+                    "当前选中的 \(agent.displayName) 走的是 text-only CLI backend，不能直接调用 Claw tools；这次链接任务已自动交给 \(effectiveAgent.displayName) 通过 Claw tools 继续处理。"
+                )
+            }
+        }
+
         let traceID = await MainActor.run {
             startExecutionTrace(
                 anchorMessageID: anchorMessageID,
-                agentName: agent.displayName,
+                agentName: effectiveAgent.displayName,
                 intentName: intent.displayName,
-                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)"
+                summary: "OpenClaw 正在把这次请求交给 \(effectiveAgent.displayName)"
             )
         }
         
         // 发送给 OpenClaw
-        await sendToOpenClaw(agent: agent, text: text, images: images, traceID: traceID)
+        await sendToOpenClaw(agent: effectiveAgent, text: text, images: images, traceID: traceID)
     }
     
     /// 处理能力缺口（聊天内引导）
@@ -1383,32 +1796,11 @@ class CommandRunner: ObservableObject {
         }
 
         let requiredCapability = recoveryCapability(for: images)
-        let candidates = agentStore.usableAgents.filter { candidate in
-            candidate.id != failingAgent.id && candidate.supports(requiredCapability)
-        }
-
-        var ordered: [Agent] = []
-        var seenAgentIDs = Set<String>()
-
-        func appendCandidate(_ candidate: Agent?) {
-            guard let candidate,
-                  seenAgentIDs.insert(candidate.id).inserted,
-                  candidates.contains(where: { $0.id == candidate.id }) else {
-                return
-            }
-            ordered.append(candidate)
-        }
-
-        if requiredCapability == .textChat {
-            candidates
-                .filter { $0.provider == .ollama }
-                .forEach { appendCandidate($0) }
-        }
-
-        appendCandidate(orchestrator.currentAgent)
-        appendCandidate(agentStore.defaultAgent)
-        candidates.forEach { appendCandidate($0) }
-        return ordered
+        return agentStore.fallbackCandidates(
+            for: requiredCapability,
+            excluding: [failingAgent.id],
+            preferredCurrent: orchestrator.currentAgent
+        )
     }
 
     private func recoveryCapability(for images: [String]) -> Capability {
@@ -1590,7 +1982,7 @@ class CommandRunner: ObservableObject {
     }
 
     private func preferredAgent(for capability: Capability) -> Agent? {
-        let candidates = agentStore.agentsSupporting(capability)
+        let candidates = agentStore.autoRoutableAgentsSupporting(capability)
 
         if let current = orchestrator.currentAgent,
            current.supports(capability),
@@ -2039,37 +2431,11 @@ class CommandRunner: ObservableObject {
         return "\(prefix)…"
     }
 
-    private func shouldTreatAsResumeCommand(_ text: String) -> Bool {
-        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let candidates: Set<String> = [
-            "继续",
-            "继续处理",
-            "继续刚才任务",
-            "继续刚才中断的任务",
-            "恢复刚才任务",
-            "恢复处理",
-            "继续上次任务"
-        ]
-        return candidates.contains(normalized)
-    }
-
-    private func handleResumeRequestIfNeeded(_ text: String) async -> Bool {
-        guard shouldTreatAsResumeCommand(text) else {
-            return false
-        }
-
-        let sessionID = await MainActor.run {
-            taskSessions
-                .reversed()
-                .first(where: { $0.canResume || $0.status == .partial || $0.status == .waitingUser })?
-                .id
-        }
-        guard let sessionID else {
-            return false
-        }
-
-        await resumeTaskSessionIfPossible(sessionID)
-        return true
+    private func latestResumableTaskSessionID() -> String? {
+        taskSessions
+            .reversed()
+            .first(where: { $0.canResume || $0.status == .partial || $0.status == .waitingUser })?
+            .id
     }
 
     private func resumeTaskSessionIfPossible(_ sessionID: String) async {
@@ -2691,7 +3057,7 @@ class CommandRunner: ObservableObject {
 
         let responseText: String
         switch agent.provider {
-        case .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             responseText = try await callOpenAICompatibleProvider(
                 agent: agent,
                 text: text,
@@ -2820,7 +3186,7 @@ class CommandRunner: ObservableObject {
 
         let responseText: String
         switch agent.provider {
-        case .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             responseText = try await callOpenAICompatibleProvider(
                 agent: agent,
                 text: text,
@@ -3627,6 +3993,16 @@ class CommandRunner: ObservableObject {
             timestamp: Date()
         )
         messages.append(assistantMessage)
+    }
+
+    private func deliverCollectedParallelSummaryIfReady(groupID: String) async {
+        guard let summary = await resultCollector.recordMainConversationCompleted(groupID: groupID) else {
+            return
+        }
+
+        await MainActor.run {
+            appendAssistantConversationMessage(summary)
+        }
     }
 
     private func restorePersistedState() {

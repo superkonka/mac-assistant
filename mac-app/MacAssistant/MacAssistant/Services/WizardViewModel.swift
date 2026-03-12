@@ -13,6 +13,7 @@ enum ConfigurationStep: Int, CaseIterable {
     case inputAPIKey
     case testConnection
     case customizeSettings
+    case assignRoles
     case complete
 
     var title: String {
@@ -21,6 +22,7 @@ enum ConfigurationStep: Int, CaseIterable {
         case .inputAPIKey: return "配置凭证"
         case .testConnection: return "测试连接"
         case .customizeSettings: return "自定义"
+        case .assignRoles: return "分配角色"
         case .complete: return "完成"
         }
     }
@@ -42,6 +44,7 @@ class WizardViewModel: ObservableObject {
     @Published var agentDescription: String = ""
     @Published var temperature: Double = 0.7
     @Published var maxTokens: Int = 4096
+    @Published var roleProfile: AgentRoleProfile = .init()
     
     // 测试
     @Published var isTesting = false
@@ -63,7 +66,13 @@ class WizardViewModel: ObservableObject {
         case .testConnection:
             return testSuccess
         case .customizeSettings:
-            return !agentName.isEmpty
+            let model = selectedModel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return !agentName.isEmpty && !model.isEmpty
+        case .assignRoles:
+            if AgentStore.shared.needsInitialSetup {
+                return roleProfile.contains(.primaryChat)
+            }
+            return !roleProfile.roles.isEmpty
         case .complete:
             return true
         }
@@ -82,15 +91,21 @@ class WizardViewModel: ObservableObject {
             } else {
                 agentName = "\(provider.displayName) Agent"
                 agentDescription = "基于 \(provider.displayName) 的智能 Agent"
-                agentEmoji = provider == .openai ? "👁️" : (provider == .anthropic ? "🔮" : "🤖")
+                agentEmoji = provider.emoji
             }
         }
+
+        roleProfile = AgentRoleProfile.suggested(
+            provider: provider,
+            capabilities: inferCapabilities(for: provider, model: selectedModel ?? provider.availableModels[0]),
+            isFirstAgent: AgentStore.shared.agents.isEmpty
+        )
     }
     
     func nextStep() {
         guard let next = ConfigurationStep(rawValue: currentStep.rawValue + 1) else { return }
         
-        if currentStep == .customizeSettings {
+        if currentStep == .assignRoles {
             // 创建 Agent
             createAgent()
         }
@@ -101,6 +116,10 @@ class WizardViewModel: ObservableObject {
     func previousStep() {
         guard let prev = ConfigurationStep(rawValue: currentStep.rawValue - 1) else { return }
         currentStep = prev
+    }
+
+    func setRole(_ role: AgentRole, enabled: Bool) {
+        roleProfile.set(role, enabled: enabled)
     }
     
     
@@ -182,7 +201,7 @@ class WizardViewModel: ObservableObject {
         switch provider {
         case .ollama:
             return await AgentStore.shared.validateLocalCodingRuntime()
-        case .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             return try await testOpenAICompatibleProvider(provider: provider, apiKey: apiKey)
         case .anthropic:
             return try await testAnthropicProvider(apiKey: apiKey)
@@ -192,16 +211,11 @@ class WizardViewModel: ObservableObject {
     }
 
     private func testOpenAICompatibleProvider(provider: ProviderType, apiKey: String) async throws -> Bool {
-        let baseURL: String
-        switch provider {
-        case .openai:
-            baseURL = "https://api.openai.com/v1"
-        case .moonshot:
-            baseURL = "https://api.moonshot.cn/v1"
-        case .anthropic, .google, .ollama:
+        guard provider.isOpenAICompatible else {
             throw NSError(domain: "WizardViewModel", code: 100, userInfo: [NSLocalizedDescriptionKey: "不支持的提供商测试。"])
         }
 
+        let baseURL = provider.defaultBaseURL
         let endpoint = URL(string: "\(baseURL)/chat/completions")!
         let body: [String: Any] = [
             "model": selectedModel ?? provider.recommendedModel,
@@ -341,7 +355,8 @@ class WizardViewModel: ObservableObject {
                     provider: provider,
                     model: model,
                     apiKey: apiKey,
-                    config: config
+                    config: config,
+                    roleProfile: roleProfile
                 )
                 
                 await MainActor.run {
@@ -353,10 +368,34 @@ class WizardViewModel: ObservableObject {
                         for: error,
                         providerName: provider.displayName
                     )
-                    // 回到上一步
-                    self.currentStep = .customizeSettings
+                    self.currentStep = .assignRoles
                 }
             }
         }
+    }
+
+    private func inferCapabilities(for provider: ProviderType, model: String) -> [Capability] {
+        var capabilities: [Capability] = [.textChat]
+
+        switch provider {
+        case .ollama:
+            capabilities.append(.codeAnalysis)
+        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
+            capabilities.append(contentsOf: [.codeAnalysis, .longContext])
+        }
+
+        if provider.visionModels.contains(model) {
+            capabilities.append(contentsOf: [.imageAnalysis, .vision])
+        }
+
+        let normalizedModel = model.lowercased()
+        if normalizedModel.contains("32k") || normalizedModel.contains("100k") ||
+            normalizedModel.contains("claude") || normalizedModel.contains("gemini") ||
+            normalizedModel.contains("deepseek") || normalizedModel.contains("glm") ||
+            normalizedModel.contains("doubao") {
+            capabilities.append(.documentAnalysis)
+        }
+
+        return capabilities
     }
 }

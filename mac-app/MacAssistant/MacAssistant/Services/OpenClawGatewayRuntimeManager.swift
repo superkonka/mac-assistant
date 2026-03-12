@@ -280,7 +280,7 @@ class OpenClawGatewayRuntimeManager {
                     "serialize": true,
                 ]
 
-            case .openai, .anthropic, .google, .moonshot:
+            case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
                 guard let profile = self.agentStore.runtimeProfile(for: agent) else { continue }
 
                 let providerID = self.providerID(prefix: agent.provider.rawValue, agentID: agent.id)
@@ -353,6 +353,11 @@ class OpenClawGatewayRuntimeManager {
                     "mode": "none",
                 ],
             ],
+            "browser": [
+                "enabled": true,
+                "color": "#34C759",
+            ],
+            "tools": self.buildManagedToolConfig(usableAgents: usableAgents),
         ]
 
         if !customProviders.isEmpty {
@@ -370,6 +375,99 @@ class OpenClawGatewayRuntimeManager {
             modelRefsByAgentID: modelRefsByAgentID,
             primaryModelRef: primaryModelRef
         )
+    }
+
+    private func buildManagedToolConfig(usableAgents: [Agent]) -> [String: Any] {
+        var web: [String: Any] = [
+            "fetch": [
+                "enabled": true,
+                "maxChars": 50_000,
+                "maxCharsCap": 50_000,
+                "maxResponseBytes": 2_000_000,
+                "timeoutSeconds": 30,
+                "cacheTtlMinutes": 15,
+                "maxRedirects": 3,
+                "readability": true,
+            ]
+        ]
+
+        if let searchConfig = self.buildManagedWebSearchConfig(usableAgents: usableAgents) {
+            web["search"] = searchConfig
+        }
+
+        return [
+            "web": web
+        ]
+    }
+
+    private func buildManagedWebSearchConfig(usableAgents: [Agent]) -> [String: Any]? {
+        var search: [String: Any] = [
+            "enabled": true,
+            "maxResults": 5,
+            "timeoutSeconds": 30,
+            "cacheTtlMinutes": 15,
+        ]
+
+        if let apiKey = nonEmptyEnvironmentValue("BRAVE_API_KEY") {
+            search["provider"] = "brave"
+            search["apiKey"] = apiKey
+            return search
+        }
+
+        if let apiKey = nonEmptyEnvironmentValue("KIMI_API_KEY")
+            ?? nonEmptyEnvironmentValue("MOONSHOT_API_KEY")
+            ?? providerSearchAPIKey(for: .moonshot, usableAgents: usableAgents) {
+            search["provider"] = "kimi"
+            search["kimi"] = ["apiKey": apiKey]
+            return search
+        }
+
+        if let apiKey = nonEmptyEnvironmentValue("GEMINI_API_KEY")
+            ?? providerSearchAPIKey(for: .google, usableAgents: usableAgents) {
+            search["provider"] = "gemini"
+            search["gemini"] = ["apiKey": apiKey]
+            return search
+        }
+
+        if let apiKey = nonEmptyEnvironmentValue("XAI_API_KEY") {
+            search["provider"] = "grok"
+            search["grok"] = ["apiKey": apiKey]
+            return search
+        }
+
+        if let apiKey = nonEmptyEnvironmentValue("PERPLEXITY_API_KEY") {
+            search["provider"] = "perplexity"
+            search["perplexity"] = ["apiKey": apiKey]
+            return search
+        }
+
+        if let apiKey = nonEmptyEnvironmentValue("OPENROUTER_API_KEY") {
+            search["provider"] = "perplexity"
+            search["perplexity"] = [
+                "apiKey": apiKey,
+                "baseUrl": "https://openrouter.ai/api/v1",
+            ]
+            return search
+        }
+
+        return nil
+    }
+
+    private func providerSearchAPIKey(for provider: ProviderType, usableAgents: [Agent]) -> String? {
+        for agent in usableAgents where agent.provider == provider {
+            if let apiKey = self.agentStore.runtimeProfile(for: agent)?.apiKey
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !apiKey.isEmpty {
+                return apiKey
+            }
+        }
+        return nil
+    }
+
+    private func nonEmptyEnvironmentValue(_ key: String) -> String? {
+        let value = ProcessInfo.processInfo.environment[key]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
     }
 
     private func resolvePrimaryModelRef(
@@ -393,6 +491,8 @@ class OpenClawGatewayRuntimeManager {
         switch provider {
         case .openai:
             return "openai-responses"
+        case .deepseek, .doubao, .zhipu:
+            return "openai-completions"
         case .anthropic:
             return "anthropic-messages"
         case .google:

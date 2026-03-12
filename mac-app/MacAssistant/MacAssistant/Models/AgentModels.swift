@@ -11,6 +11,9 @@ import Foundation
 
 enum ProviderType: String, CaseIterable, Codable, Identifiable {
     case ollama
+    case deepseek
+    case doubao
+    case zhipu
     case openai
     case anthropic
     case google
@@ -19,6 +22,9 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     var displayName: String {
         switch self {
         case .ollama: return "Kimi CLI"
+        case .deepseek: return "DeepSeek"
+        case .doubao: return "Doubao"
+        case .zhipu: return "Zhipu"
         case .openai: return "OpenAI"
         case .anthropic: return "Anthropic"
         case .google: return "Google"
@@ -31,15 +37,104 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     var icon: String {
         switch self {
         case .ollama: return "terminal"
+        case .deepseek: return "bolt.circle"
+        case .doubao: return "sparkles.rectangle.stack"
+        case .zhipu: return "brain"
         case .openai: return "sparkles"
         case .anthropic: return "brain.head.profile"
         case .google: return "globe"
         case .moonshot: return "moon.stars.fill"
         }
     }
+
+    var emoji: String {
+        switch self {
+        case .ollama: return "🦙"
+        case .deepseek: return "🧠"
+        case .doubao: return "🎯"
+        case .zhipu: return "🟣"
+        case .openai: return "🅾️"
+        case .anthropic: return "🅰️"
+        case .google: return "🇬"
+        case .moonshot: return "🌙"
+        }
+    }
     
     var requiresAPIKey: Bool {
         self != .ollama
+    }
+
+    var isOpenAICompatible: Bool {
+        switch self {
+        case .ollama, .anthropic, .google:
+            return false
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
+            return true
+        }
+    }
+
+    var defaultBaseURL: String {
+        switch self {
+        case .ollama:
+            return "http://localhost:11434"
+        case .openai:
+            return "https://api.openai.com/v1"
+        case .anthropic:
+            return "https://api.anthropic.com/v1"
+        case .google:
+            return "https://generativelanguage.googleapis.com/v1"
+        case .moonshot:
+            return "https://api.moonshot.cn/v1"
+        case .deepseek:
+            return "https://api.deepseek.com/v1"
+        case .doubao:
+            return "https://ark.cn-beijing.volces.com/api/v3"
+        case .zhipu:
+            return "https://open.bigmodel.cn/api/paas/v4"
+        }
+    }
+
+    var modelLabel: String {
+        switch self {
+        case .doubao:
+            return "模型 / Endpoint"
+        default:
+            return "模型"
+        }
+    }
+
+    var modelPlaceholder: String {
+        switch self {
+        case .ollama:
+            return "kimi-local"
+        case .openai:
+            return "gpt-4o"
+        case .anthropic:
+            return "claude-opus-4"
+        case .google:
+            return "gemini-2.0-flash"
+        case .moonshot:
+            return "kimi-k2.5"
+        case .deepseek:
+            return "deepseek-chat"
+        case .doubao:
+            return "例如 Doubao-1.5-pro-32k 或 ep-xxxx"
+        case .zhipu:
+            return "glm-4.7"
+        }
+    }
+
+    var setupHint: String? {
+        switch self {
+        case .doubao:
+            return "豆包通过火山方舟接入。大多数场景可直接填写豆包模型名；如果你在方舟里创建了自定义接入点，也可以把 Endpoint ID 填到模型字段。"
+        case .deepseek:
+            return "DeepSeek 使用 OpenAI 兼容接口，默认走 /chat/completions。"
+        case .zhipu:
+            return "智谱默认走通用对话接口 /api/paas/v4/chat/completions。"
+        default:
+            return nil
+        }
     }
     
     /// 获取最新的可用模型列表
@@ -47,6 +142,28 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .ollama:
             return ["kimi-local"]
+
+        case .deepseek:
+            return [
+                "deepseek-chat",
+                "deepseek-reasoner",
+            ]
+
+        case .doubao:
+            return [
+                "Doubao-1.5-pro-32k",
+                "Doubao-1.5-thinking-pro",
+                "Doubao-1.5-vision-pro-32k",
+                "doubao-seed-code-preview-latest",
+            ]
+
+        case .zhipu:
+            return [
+                "glm-4.7",
+                "glm-4.7-flash",
+                "glm-4.5-air",
+                "glm-4.5v",
+            ]
             
         case .openai:
             // 2025 年最新 OpenAI 模型
@@ -92,6 +209,9 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     var recommendedModel: String {
         switch self {
         case .ollama: return "kimi-local"
+        case .deepseek: return "deepseek-chat"
+        case .doubao: return "Doubao-1.5-pro-32k"
+        case .zhipu: return "glm-4.7"
         case .openai: return "gpt-4o"
         case .anthropic: return "claude-opus-4"
         case .moonshot: return "kimi-k2.5"
@@ -104,6 +224,12 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         switch self {
         case .ollama:
             return []
+        case .deepseek:
+            return []
+        case .doubao:
+            return ["Doubao-1.5-vision-pro-32k", "doubao-seed-code-preview-latest"]
+        case .zhipu:
+            return ["glm-4.5v"]
         case .openai:
             return ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview"]
         case .anthropic:
@@ -118,6 +244,9 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     var apiKeyPlaceholder: String {
         switch self {
         case .ollama: return "无需 API Key，请先安装并登录 Kimi CLI"
+        case .deepseek: return "sk-..."
+        case .doubao: return "火山方舟 API Key"
+        case .zhipu: return "智谱 API Key"
         case .openai: return "sk-..."
         case .anthropic: return "sk-ant-..."
         case .google: return "AIza..."
@@ -128,6 +257,9 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     var apiDocsURL: String {
         switch self {
         case .ollama: return "https://ollama.com/library"
+        case .deepseek: return "https://api-docs.deepseek.com/"
+        case .doubao: return "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?"
+        case .zhipu: return "https://open.bigmodel.cn/"
         case .openai: return "https://platform.openai.com/api-keys"
         case .anthropic: return "https://console.anthropic.com/settings/keys"
         case .google: return "https://makersuite.google.com/app/apikey"
@@ -193,6 +325,118 @@ enum Capability: String, CaseIterable, Codable {
         case .webSearch:
             return "实时网络搜索"
         }
+    }
+}
+
+enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
+    case primaryChat
+    case planner
+    case subtaskWorker
+    case fallback
+    case manualOnly
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .primaryChat:
+            return "主会话"
+        case .planner:
+            return "Planner"
+        case .subtaskWorker:
+            return "子任务"
+        case .fallback:
+            return "回退"
+        case .manualOnly:
+            return "仅手动"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .primaryChat:
+            return "可作为主对话 Agent，承接主会话回答。"
+        case .planner:
+            return "可作为秘书层 / Planner，负责意图分析与调度。"
+        case .subtaskWorker:
+            return "可作为独立 side task worker，不打断主会话。"
+        case .fallback:
+            return "主 Agent 失败时可作为自动回退候选。"
+        case .manualOnly:
+            return "只在用户手动选择时使用，不参与自动路由。"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .primaryChat:
+            return "text.bubble"
+        case .planner:
+            return "point.topleft.down.curvedto.point.bottomright.up"
+        case .subtaskWorker:
+            return "square.stack.3d.up"
+        case .fallback:
+            return "arrow.trianglehead.clockwise"
+        case .manualOnly:
+            return "hand.raised"
+        }
+    }
+}
+
+struct AgentRoleProfile: Codable, Hashable {
+    var roles: Set<AgentRole>
+
+    init(roles: Set<AgentRole> = []) {
+        if roles.contains(.manualOnly) {
+            self.roles = [.manualOnly]
+        } else {
+            self.roles = roles
+        }
+    }
+
+    var sortedRoles: [AgentRole] {
+        AgentRole.allCases.filter { roles.contains($0) }
+    }
+
+    func contains(_ role: AgentRole) -> Bool {
+        roles.contains(role)
+    }
+
+    mutating func set(_ role: AgentRole, enabled: Bool) {
+        if role == .manualOnly {
+            roles = enabled ? [.manualOnly] : []
+            return
+        }
+
+        if enabled {
+            roles.remove(.manualOnly)
+            roles.insert(role)
+        } else {
+            roles.remove(role)
+        }
+    }
+
+    static func suggested(
+        provider: ProviderType,
+        capabilities: [Capability],
+        isFirstAgent: Bool
+    ) -> AgentRoleProfile {
+        var roles: Set<AgentRole> = [.fallback]
+
+        if isFirstAgent || provider == .ollama || capabilities.contains(.codeAnalysis) {
+            roles.insert(.primaryChat)
+        }
+
+        if provider != .ollama {
+            roles.insert(.planner)
+            roles.insert(.subtaskWorker)
+        }
+
+        if capabilities.contains(.vision) || capabilities.contains(.documentAnalysis) {
+            roles.insert(.subtaskWorker)
+        }
+
+        return AgentRoleProfile(roles: roles)
     }
 }
 
@@ -338,6 +582,9 @@ private extension ProviderType {
     var defaultEmoji: String {
         switch self {
         case .ollama: return "🦙"
+        case .deepseek: return "🧠"
+        case .doubao: return "🎯"
+        case .zhipu: return "🟣"
         case .openai: return "🅾️"
         case .anthropic: return "🅰️"
         case .google: return "🇬"

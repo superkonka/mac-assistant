@@ -80,6 +80,12 @@ class AgentCreationSkill {
             selectedProvider = .moonshot
         } else if choice.contains("4") || choice.contains("google") || choice.contains("gemini") {
             selectedProvider = .google
+        } else if choice.contains("5") || choice.contains("deepseek") {
+            selectedProvider = .deepseek
+        } else if choice.contains("6") || choice.contains("doubao") || choice.contains("豆包") {
+            selectedProvider = .doubao
+        } else if choice.contains("7") || choice.contains("zhipu") || choice.contains("智谱") || choice.contains("glm") {
+            selectedProvider = .zhipu
         } else {
             // 无法识别，重新提示
             let retryMessage = MacAssistant.ChatMessage(
@@ -88,11 +94,14 @@ class AgentCreationSkill {
                 content: """
                 ❓ 无法识别您的选择："\(input)"
                 
-                请回复数字 1-4 或提供商名称：
+                请回复数字 1-7 或提供商名称：
                 1️⃣ OpenAI (GPT-4V)
                 2️⃣ Anthropic (Claude 3)
                 3️⃣ Moonshot (Kimi K2.5)
                 4️⃣ Google (Gemini)
+                5️⃣ DeepSeek
+                6️⃣ Doubao (豆包)
+                7️⃣ Zhipu (智谱 GLM)
                 
                 或输入 "取消" 退出创建流程。
                 """,
@@ -252,11 +261,15 @@ class AgentCreationSkill {
                 provider: provider,
                 model: model,
                 apiKey: apiKey,
-                config: config
+                config: config,
+                roleProfile: recommendedRoleProfile(for: gap)
             )
             
-            // 3. 切换到新 Agent
-            AgentOrchestrator.shared.switchToAgent(agent)
+            // 3. 仅在适合作为主会话时自动切换
+            let adoptedAsCurrent = AgentStore.shared.shouldAutoAdoptAsCurrent(agent)
+            if adoptedAsCurrent {
+                AgentOrchestrator.shared.switchToAgent(agent)
+            }
             
             // 4. 完成提示
             let successMessage = MacAssistant.ChatMessage(
@@ -270,7 +283,7 @@ class AgentCreationSkill {
                 • 模型: \(model)
                 • 能力: \(agent.capabilities.map { $0.displayName }.joined(separator: ", "))
                 
-                已自动切换到此 Agent。
+                \(adoptedAsCurrent ? "已自动切换到此 Agent。" : "它已加入后台角色池，不会影响当前主会话。")
                 
                 现在可以重新发送您的图片分析请求了！
                 """,
@@ -315,8 +328,17 @@ class AgentCreationSkill {
            
         4️⃣ **Google** (Gemini Pro Vision)
            多模态能力强，免费额度多
+
+        5️⃣ **DeepSeek**
+           OpenAI 兼容接口，适合长文本与推理
+
+        6️⃣ **Doubao** (豆包 / 火山方舟)
+           国内主流模型，可走方舟 API
+
+        7️⃣ **Zhipu** (智谱 GLM)
+           国内主流模型，GLM 系列适合通用对话与文档
         
-        请回复数字 (1-4) 选择，或输入 "取消" 退出。
+        请回复数字 (1-7) 选择，或输入 "取消" 退出。
         """
     }
     
@@ -337,19 +359,11 @@ class AgentCreationSkill {
         
         格式: \(provider.apiKeyPlaceholder)
         """
-        
-        // 添加获取链接
-        switch provider {
-        case .openai:
-            message += "\n\n获取地址: https://platform.openai.com/api-keys"
-        case .anthropic:
-            message += "\n\n获取地址: https://console.anthropic.com/settings/keys"
-        case .moonshot:
-            message += "\n\n获取地址: https://platform.moonshot.cn/console/api-keys"
-        case .google:
-            message += "\n\n获取地址: https://makersuite.google.com/app/apikey"
-        case .ollama:
-            break
+
+        message += "\n\n获取地址: \(provider.apiDocsURL)"
+
+        if let setupHint = provider.setupHint {
+            message += "\n\n说明: \(setupHint)"
         }
         
         message += "\n\n您的 API Key 将安全存储在本地。"
@@ -383,6 +397,10 @@ class AgentCreationSkill {
             return key.hasPrefix("AIza") && key.count > 20
         case .moonshot:
             return key.hasPrefix("sk-") && key.count > 20
+        case .deepseek:
+            return key.hasPrefix("sk-") && key.count > 20
+        case .doubao, .zhipu:
+            return key.count > 20
         case .ollama:
             return true
         }
@@ -395,9 +413,13 @@ class AgentCreationSkill {
         case (.anthropic, .imageAnalysis), (.anthropic, .vision):
             return "claude-opus-4"
         case (.moonshot, .imageAnalysis), (.moonshot, .vision):
-            return "kimi-k2-5"
+            return "kimi-k2.5"
         case (.google, .imageAnalysis), (.google, .vision):
             return "gemini-pro-vision"
+        case (.doubao, .imageAnalysis), (.doubao, .vision):
+            return "Doubao-1.5-vision-pro-32k"
+        case (.zhipu, .imageAnalysis), (.zhipu, .vision):
+            return "glm-4.5v"
         default:
             return provider.availableModels[0]
         }
@@ -458,5 +480,16 @@ class AgentCreationSkill {
     /// 取消创建
     func cancel() {
         state = .idle
+    }
+
+    private func recommendedRoleProfile(for gap: CapabilityGap) -> AgentRoleProfile {
+        switch gap.missingCapability {
+        case .vision, .imageAnalysis, .documentAnalysis:
+            return AgentRoleProfile(roles: [.subtaskWorker, .fallback])
+        case .webSearch:
+            return AgentRoleProfile(roles: [.planner, .subtaskWorker, .fallback])
+        default:
+            return AgentRoleProfile(roles: [.primaryChat, .fallback])
+        }
     }
 }

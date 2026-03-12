@@ -118,19 +118,27 @@ actor MacSystemAgent {
     private func parseAppCommand(_ command: String) -> AppCommand? {
         let normalized = command.lowercased()
 
-        let launchHints = ["启动", "打开", "运行", "launch", "open", "start"]
-        let quitHints = ["退出", "关闭", "quit", "close", "terminate"]
-        let statusHints = ["状态", "在吗", "运行中", "是否启动", "检查", "查看", "status", "check"]
-        let listHints = ["列出", "列表", "有哪些", "全部应用", "应用列表", "list"]
+        guard !self.isLikelyDocumentOrWebRequest(normalized) else {
+            return nil
+        }
+
+        let launchHints = ["启动", "打开", "运行"]
+        let launchEnglishHints = ["launch", "open", "start"]
+        let quitHints = ["退出", "关闭"]
+        let quitEnglishHints = ["quit", "close", "terminate"]
+        let statusHints = ["状态", "在吗", "运行中", "是否启动", "检查", "查看"]
+        let statusEnglishHints = ["status", "check"]
+        let listHints = ["列出", "全部应用", "应用列表", "运行中的应用", "运行中的程序", "当前应用"]
+        let listEnglishHints = ["list"]
 
         let action: AppAction?
-        if self.containsAny(quitHints, in: normalized) {
+        if self.containsAny(quitHints, in: normalized) || self.containsStandaloneEnglishWord(from: quitEnglishHints, in: normalized) {
             action = .quit
-        } else if self.containsAny(launchHints, in: normalized) {
+        } else if self.containsAny(launchHints, in: normalized) || self.containsStandaloneEnglishWord(from: launchEnglishHints, in: normalized) {
             action = .launch
-        } else if self.containsAny(listHints, in: normalized) {
+        } else if self.containsAny(listHints, in: normalized) || self.containsStandaloneEnglishWord(from: listEnglishHints, in: normalized) {
             action = .list
-        } else if self.containsAny(statusHints, in: normalized) {
+        } else if self.containsAny(statusHints, in: normalized) || self.containsStandaloneEnglishWord(from: statusEnglishHints, in: normalized) {
             action = .status
         } else {
             action = nil
@@ -142,6 +150,9 @@ actor MacSystemAgent {
 
         let query = self.extractQuery(from: command, action: action)
         if action == .list {
+            guard self.hasExplicitAppListingIntent(command) else {
+                return nil
+            }
             return AppCommand(action: action, query: query)
         }
 
@@ -167,6 +178,16 @@ actor MacSystemAgent {
             return nil
         }
 
+        // 文档/API/能力扩展类请求不应该被误判成“检查 FutuOpenD 状态”
+        let nonOperationalHints = [
+            "http://", "https://", "网页", "页面", "文档", "docs", "api", "openapi",
+            "链接", "url", "读取", "读一下", "分析", "学习", "扩展", "能力",
+            "mcp", "接口", "endpoint", "丰富", "搜索"
+        ]
+        if self.containsAny(nonOperationalHints, in: normalized) {
+            return nil
+        }
+
         if normalized.contains("退出") || normalized.contains("关闭") || normalized.contains("quit") {
             return AppCommand(action: .quit, query: "FutuOpenD")
         }
@@ -180,16 +201,74 @@ actor MacSystemAgent {
             return AppCommand(action: .status, query: "FutuOpenD")
         }
 
-        return AppCommand(action: .status, query: "FutuOpenD")
+        // 只有非常短、明显指向 OpenD 本体的请求，才把它当作状态查询兜底。
+        let compact = normalized
+            .replacingOccurrences(of: " ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bareFutuQueries = ["futu", "futuopend", "opend", "富途", "牛牛"]
+        if bareFutuQueries.contains(compact) {
+            return AppCommand(action: .status, query: "FutuOpenD")
+        }
+
+        return nil
     }
 
     private func containsExplicitAppNoun(_ command: String) -> Bool {
         let normalized = command.lowercased()
-        return ["应用", "app", "程序", "软件"].contains { normalized.contains($0) }
+        if ["应用", "程序", "软件"].contains(where: { normalized.contains($0) }) {
+            return true
+        }
+        return self.containsStandaloneEnglishWord(from: ["app", "application"], in: normalized)
+    }
+
+    private func hasExplicitAppListingIntent(_ command: String) -> Bool {
+        let normalized = command.lowercased()
+
+        if self.containsExplicitAppNoun(command) {
+            return true
+        }
+
+        let explicitListingPhrases = [
+            "运行中的", "前台应用", "当前应用", "打开了哪些", "哪些应用", "列出应用", "应用列表"
+        ]
+        if self.containsAny(explicitListingPhrases, in: normalized) {
+            return true
+        }
+
+        return false
     }
 
     private func containsAny(_ candidates: [String], in text: String) -> Bool {
         candidates.contains { text.contains($0) }
+    }
+
+    private func containsStandaloneEnglishWord(from candidates: [String], in text: String) -> Bool {
+        candidates.contains { self.containsStandaloneEnglishWord($0, in: text) }
+    }
+
+    private func containsStandaloneEnglishWord(_ candidate: String, in text: String) -> Bool {
+        let pattern = "(?i)(?:^|[^a-z0-9])" + NSRegularExpression.escapedPattern(for: candidate) + "(?:$|[^a-z0-9])"
+        return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private func isLikelyDocumentOrWebRequest(_ text: String) -> Bool {
+        if text.contains("http://") || text.contains("https://") || text.contains("www.") {
+            return true
+        }
+
+        let documentHints = [
+            "网页", "页面", "文档", "链接", "读取", "读一下", "分析", "学习", "总结",
+            "扩展", "能力", "搜索", "检索", "github", "仓库", "repo", "文章"
+        ]
+        if self.containsAny(documentHints, in: text) {
+            return true
+        }
+
+        let webEnglishHints = [
+            "api", "openapi", "docs", "doc", "url", "link", "web",
+            "browser", "mcp", "endpoint", "github", "repo", "read"
+        ]
+        return self.containsStandaloneEnglishWord(from: webEnglishHints, in: text)
     }
 
     private func extractQuery(from command: String, action: AppAction) -> String? {
@@ -586,7 +665,7 @@ actor MacSystemAgent {
         if candidates.contains(where: { $0.contains(normalizedQuery) }) {
             return 72
         }
-        if normalizedQuery.contains(record.normalizedName) {
+        if record.normalizedName.count >= 3, normalizedQuery.contains(record.normalizedName) {
             return 54
         }
 
@@ -628,11 +707,11 @@ actor MacSystemAgent {
     private static func normalize(_ value: String) -> String {
         value
             .lowercased()
+            .replacingOccurrences(of: ".app", with: "")
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: "_", with: "")
             .replacingOccurrences(of: ".", with: "")
-            .replacingOccurrences(of: "app", with: "")
             .replacingOccurrences(of: "应用程序", with: "")
             .replacingOccurrences(of: "应用", with: "")
     }

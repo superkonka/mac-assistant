@@ -7,6 +7,51 @@
 
 import Foundation
 
+enum SkillDetectionPreference: String, Codable, CaseIterable, Identifiable {
+    case askEveryTime = "ask_every_time"
+    case autoRun = "auto_run"
+    case neverSuggest = "never_suggest"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .askEveryTime:
+            return "每次都问"
+        case .autoRun:
+            return "自动执行"
+        case .neverSuggest:
+            return "不再建议"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .askEveryTime:
+            return "检测到意图后先弹卡片确认，再决定是否独立处理。"
+        case .autoRun:
+            return "检测到意图后直接拆成独立任务，不打断主会话。"
+        case .neverSuggest:
+            return "不再主动推荐这个 Skill，只有手动命令时才执行。"
+        }
+    }
+}
+
+enum DetectedSkillSuggestionAction {
+    case runOnce
+    case dismissOnce
+    case alwaysAutoRun
+    case neverSuggest
+}
+
+struct DetectedSkillSuggestion: Equatable {
+    let messageID: UUID
+    let skill: AISkill
+    let input: String
+    let executionInput: String
+    let sourceLabel: String
+}
+
 // MARK: - Message Role
 
 enum MessageRole: String, Codable, Equatable {
@@ -191,6 +236,31 @@ struct ChatMessage: Identifiable, Codable, Equatable {
         self.agentName = agentName
         self.linkedTaskSessionID = linkedTaskSessionID
         self.metadata = metadata
+    }
+}
+
+extension ChatMessage {
+    static let detectedSkillKey = "detected_skill"
+    static let detectedSkillInputKey = "detected_skill_input"
+    static let detectedSkillExecutionInputKey = "detected_skill_execution_input"
+    static let detectedSkillSourceKey = "detected_skill_source"
+
+    var detectedSkillSuggestion: DetectedSkillSuggestion? {
+        guard let metadata,
+              let rawSkill = metadata[Self.detectedSkillKey],
+              let skill = AISkill(rawValue: rawSkill),
+              let input = metadata[Self.detectedSkillInputKey],
+              !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        return DetectedSkillSuggestion(
+            messageID: id,
+            skill: skill,
+            input: input,
+            executionInput: metadata[Self.detectedSkillExecutionInputKey] ?? input,
+            sourceLabel: metadata[Self.detectedSkillSourceKey] ?? "自然意图"
+        )
     }
 }
 

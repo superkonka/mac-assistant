@@ -159,6 +159,21 @@ enum AISkill: String, CaseIterable, Identifiable {
         case .webSearch: return nil
         }
     }
+
+    var supportsIntentDetection: Bool {
+        switch self {
+        case .screenshot,
+             .codeReview,
+             .explainSelection,
+             .translateText,
+             .summarizeText,
+             .webSearch:
+            return true
+        case .createVisionAgent,
+             .analyzeImage:
+            return false
+        }
+    }
 }
 
 // MARK: - Skill Registry
@@ -242,7 +257,7 @@ class AISkillRegistry: ObservableObject {
         if AgentStore.shared.visionAgents.isEmpty {
             let gap = CapabilityGap(
                 missingCapability: .vision,
-                suggestedProviders: [.openai, .anthropic, .moonshot],
+                suggestedProviders: [.openai, .anthropic, .moonshot, .doubao, .zhipu],
                 description: "需要创建支持视觉理解的 Agent"
             )
             return .requiresAgentCreation(gap: gap)
@@ -290,11 +305,17 @@ class AISkillRegistry: ObservableObject {
     }
     
     private func executeWebSearch(context: MacAssistant.SkillContext) async -> SkillResult {
-        guard let query = context.input else {
+        guard let query = context.input?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !query.isEmpty else {
             return .requiresInput(prompt: "请输入搜索关键词")
         }
-        
-        return .success(message: "正在搜索: \(query)")
+
+        do {
+            let summary = try await WebSearchService.shared.searchSummary(for: query)
+            return .success(message: summary)
+        } catch {
+            return .error(message: error.localizedDescription)
+        }
     }
 }
 
