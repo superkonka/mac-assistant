@@ -149,6 +149,11 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
     var latestAssistantText: String?
     var canResume: Bool
     var lastReconciledAt: Date?
+    var dismissedAt: Date?
+
+    var isHiddenFromTabs: Bool {
+        dismissedAt != nil
+    }
 
     init(
         id: String = "task-\(UUID().uuidString.prefix(8))",
@@ -174,7 +179,8 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         requestStartedAt: Date? = nil,
         latestAssistantText: String? = nil,
         canResume: Bool = false,
-        lastReconciledAt: Date? = nil
+        lastReconciledAt: Date? = nil,
+        dismissedAt: Date? = nil
     ) {
         self.id = id
         self.title = title
@@ -200,6 +206,7 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         self.latestAssistantText = latestAssistantText
         self.canResume = canResume
         self.lastReconciledAt = lastReconciledAt
+        self.dismissedAt = dismissedAt
     }
 }
 

@@ -129,19 +129,7 @@ struct PlannerConsoleView: View {
                 title: "Dispatcher",
                 icon: "arrow.triangle.branch",
                 status: "已启用",
-                detail: "负责决定主会话、side task 或并行子任务。"
-            )
-            moduleRow(
-                title: "Link Research",
-                icon: "link.badge.plus",
-                status: "并行抓取",
-                detail: "URL 研究类请求会拆成主回答 + 链接抓取子任务。"
-            )
-            moduleRow(
-                title: "Result Collector",
-                icon: "tray.full",
-                status: "已启用",
-                detail: "等待主回答和 side task 完成后，再补充研究结果。"
+                detail: "负责决定主会话或 side task，不再内置 URL 研究分流。"
             )
             moduleRow(
                 title: "Local System Guard",

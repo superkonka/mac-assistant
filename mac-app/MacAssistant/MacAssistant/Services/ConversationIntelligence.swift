@@ -159,11 +159,6 @@ class ConversationIntelligence: ObservableObject {
             return .summarizeText
         }
         
-        // 搜索 - 明确的搜索指令
-        if containsAny(lowercased, ["搜索", "查一下", "搜索网络", "google", "百度"]) {
-            return .webSearch
-        }
-        
         return nil
     }
     

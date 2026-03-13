@@ -35,7 +35,7 @@ struct SkillIntentSettingsView: View {
             Text("猜测到的 Skill 不再直接插入主会话")
                 .font(.system(size: 15, weight: .semibold))
 
-            Text("开启后，系统会把猜测到的网络搜索、翻译、总结这类能力拆成独立任务卡处理。你可以选择每次都问、自动执行，或者不再建议。")
+            Text("开启后，系统会把猜测到的翻译、总结这类能力拆成独立任务卡处理。你可以选择每次都问、自动执行，或者不再建议。")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

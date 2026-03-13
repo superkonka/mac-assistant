@@ -332,10 +332,6 @@ class AgentRunner: ObservableObject {
             result = handleScreenshot()
         case "剪贴板", "clipboard", "cb":
             result = handleClipboard()
-        case "搜索", "search", "s":
-            if let skill = skills.getSkill("web") {
-                result = (try? runAsync { try await skill.execute("搜索 \(args)", args: [args]) }) ?? "搜索失败"
-            }
         case "系统", "system", "sys":
             if let skill = skills.getSkill("system") {
                 result = (try? runAsync { try await skill.execute("系统信息", args: []) }) ?? "获取失败"
@@ -351,7 +347,7 @@ class AgentRunner: ObservableObject {
             if let skill = skills.getSkill(cmd) {
                 result = (try? runAsync { try await skill.execute(args, args: [args]) }) ?? "执行失败"
             } else {
-                result = "未知命令: \(cmd)\n可用命令: /截图, /剪贴板, /搜索, /系统, /清空, /帮助"
+                result = "未知命令: \(cmd)\n可用命令: /截图, /剪贴板, /系统, /清空, /帮助"
             }
         }
         
@@ -400,7 +396,6 @@ class AgentRunner: ObservableObject {
         
         /截图, /ss      - 截图并分析
         /剪贴板, /cb    - 分析剪贴板内容
-        /搜索 <关键词>  - Google 搜索
         /系统, /sys     - 系统信息
         /清空, /c       - 清空历史
         /帮助, /h       - 显示帮助

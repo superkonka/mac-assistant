@@ -34,7 +34,6 @@ class SkillRegistry {
         register(SystemSkill())
         register(FileSkill())
         register(AppSkill())
-        register(WebSkill())
         register(GitSkill())
         register(FutuSkill())
     }
@@ -160,50 +159,6 @@ struct AppSkill: AgentSkill {
     
     func execute(_ command: String, args: [String]) async throws -> String {
         await MacSystemAgent.shared.handleAppCommand(command)
-    }
-}
-
-// MARK: - Web 操作 Skill
-
-struct WebSkill: AgentSkill {
-    let name = "web"
-    let description = "网络操作：搜索、打开网页、获取信息等"
-    let emoji = "🌐"
-    let requiredTools = ["open", "curl"]
-    
-    func canHandle(_ command: String) -> Bool {
-        let keywords = ["搜索", "google", "百度", "网页", "网站", "search", "web", "url", "http"]
-        return keywords.contains { command.lowercased().contains($0) }
-    }
-    
-    func execute(_ command: String, args: [String]) async throws -> String {
-        let lowerCommand = command.lowercased()
-        
-        // 提取搜索词
-        var searchTerm: String?
-        
-        if command.contains("搜索") {
-            if let range = command.range(of: "搜索") {
-                searchTerm = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            }
-        } else if lowerCommand.contains("search for") {
-            if let range = lowerCommand.range(of: "search for") {
-                searchTerm = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            }
-        } else if lowerCommand.contains("google") {
-            if let range = lowerCommand.range(of: "google") {
-                searchTerm = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-            }
-        }
-        
-        if let term = searchTerm, !term.isEmpty {
-            let encoded = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? term
-            let url = "https://www.google.com/search?q=\(encoded)"
-            _ = runShellCommand("open '\(url)'")
-            return "🔍 已在浏览器中搜索: \(term)"
-        }
-        
-        return "请提供搜索关键词"
     }
 }
 

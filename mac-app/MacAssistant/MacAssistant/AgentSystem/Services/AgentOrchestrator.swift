@@ -52,10 +52,6 @@ class AgentOrchestrator: ObservableObject {
             return .documentAnalysis
         }
         
-        if containsAny(lowercased, ["搜索", "查找", "查一下", "google", "百度"]) {
-            return .webSearch
-        }
-        
         if containsAny(lowercased, ["创建 agent", "新 agent", "添加 agent", "agent 设置"]) {
             return .agentManagement
         }

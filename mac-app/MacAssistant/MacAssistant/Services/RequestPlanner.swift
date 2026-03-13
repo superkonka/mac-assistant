@@ -37,13 +37,15 @@ final class RequestPlanner {
 
         switch preferences.plannerPrimaryStrategy {
         case .ruleBased:
-            async let primary = ruleProvider.plan(envelope)
-            async let shadow = intentAgentProvider.planShadow(envelope)
+            let primaryPlan = await ruleProvider.plan(envelope).withPlannerID(ruleProvider.providerID)
 
-            let primaryPlan = await primary.withPlannerID(ruleProvider.providerID)
-
-            if let shadowPlan = await shadow?.withPlannerID(intentAgentProvider.providerID) {
-                logShadowComparison(primary: primaryPlan, shadow: shadowPlan)
+            if preferences.plannerShadowEnabled {
+                let shadowProvider = self.intentAgentProvider
+                Task { [primaryPlan] in
+                    if let shadowPlan = await shadowProvider.planShadow(envelope)?.withPlannerID(shadowProvider.providerID) {
+                        self.logShadowComparison(primary: primaryPlan, shadow: shadowPlan)
+                    }
+                }
             }
 
             return primaryPlan
@@ -95,7 +97,6 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
     private let intelligence = ConversationIntelligence.shared
     private let toolSkillRegistry = SkillRegistry.shared
     private let orchestrator = AgentOrchestrator.shared
-    private let agentStore = AgentStore.shared
 
     private init() {}
 
@@ -236,7 +237,6 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
 
         let normalized = RequestPlanningHeuristics.normalized(envelope.originalText)
         let parsed = intelligence.analyzeInput(envelope.originalText)
-        let hasLinkRequest = WebContextAgent.shared.hasLinkRequest(for: envelope.originalText, images: envelope.images)
         let respectCurrentAgentSelection = RequestPlanningHeuristics.shouldRespectCurrentAgentSelection(
             for: envelope.originalText,
             images: envelope.images,
@@ -436,16 +436,15 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             )
         }
 
-        let prepared = await prepareInput(from: parsed.cleanText, images: envelope.images)
+        let preparedInput = parsed.cleanText
         let requestedAgentSwitch = RequestPlanningHeuristics.plannedAgentSwitch(for: parsed, images: envelope.images)
 
-        if !hasLinkRequest,
-           let nativeMacSkillName = await MacSystemAgent.shared.suggestedSkillName(for: envelope.originalText) {
+        if let nativeMacSkillName = await MacSystemAgent.shared.suggestedSkillName(for: envelope.originalText) {
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
-                preparedInput: prepared.text,
-                notices: prepared.notices,
+                preparedInput: preparedInput,
+                notices: [],
                 requestedAgentSwitch: requestedAgentSwitch,
                 primaryAction: .executeLocalToolSkill(name: nativeMacSkillName, input: envelope.originalText),
                 confidence: .medium,
@@ -453,29 +452,12 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             )
         }
 
-        if parsed.skillCommand == nil,
-           RequestPlanningHeuristics.shouldUseParallelLinkResearch(
-            for: envelope.originalText,
-            images: envelope.images
-        ) {
-            return RequestPlan(
-                envelope: envelope,
-                parsedInput: parsed,
-                preparedInput: prepared.text,
-                notices: prepared.notices,
-                requestedAgentSwitch: requestedAgentSwitch,
-                primaryAction: .routeParallelLinkResearch(input: prepared.text),
-                confidence: .medium,
-                reason: "识别为链接研究类请求，拆成主回答与并行链接抓取子任务。"
-            )
-        }
-
         if let skillCommand = parsed.skillCommand {
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
-                preparedInput: prepared.text,
-                notices: prepared.notices,
+                preparedInput: preparedInput,
+                notices: [],
                 requestedAgentSwitch: requestedAgentSwitch,
                 primaryAction: .executeExplicitSkill(skill: skillCommand.skill, input: parsed.cleanText),
                 confidence: .high,
@@ -487,13 +469,13 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
-                preparedInput: prepared.text,
-                notices: prepared.notices,
+                preparedInput: preparedInput,
+                notices: [],
                 requestedAgentSwitch: requestedAgentSwitch,
                 primaryAction: .handleDetectedSkill(
                     skill: detectedSkill,
                     input: parsed.cleanText,
-                    executionInput: prepared.text
+                    executionInput: preparedInput
                 ),
                 confidence: .medium,
                 reason: "自然语言意图更接近内置 Skill，先进入 Skill 建议/独立处理链。"
@@ -504,8 +486,8 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
-                preparedInput: prepared.text,
-                notices: prepared.notices,
+                preparedInput: preparedInput,
+                notices: [],
                 requestedAgentSwitch: requestedAgentSwitch,
                 primaryAction: .handleAgentSuggestion(suggestedAgent, input: parsed.cleanText),
                 confidence: .medium,
@@ -516,41 +498,12 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
         return RequestPlan(
             envelope: envelope,
             parsedInput: parsed,
-            preparedInput: prepared.text,
-            notices: prepared.notices,
+            preparedInput: preparedInput,
+            notices: [],
             requestedAgentSwitch: requestedAgentSwitch,
-            primaryAction: .routeMainConversation(input: prepared.text),
+            primaryAction: .routeMainConversation(input: preparedInput),
             confidence: .medium,
             reason: "未命中特殊分支，进入主对话路由链。"
-        )
-    }
-
-    private func prepareInput(from text: String, images: [String]) async -> (text: String, notices: [String]) {
-        let preferClawTools = shouldPreferClawURLHandling(for: text, images: images)
-        guard preferClawTools,
-              let attachment = await WebContextAgent.shared.attachmentIfNeeded(
-                for: text,
-                images: images,
-                preferClawTools: true
-              ) else {
-            return (text, [])
-        }
-
-        return (attachment.augmentedInput, [attachment.notice])
-    }
-
-    private func shouldPreferClawURLHandling(for text: String, images: [String]) -> Bool {
-        guard WebContextAgent.shared.hasLinkRequest(for: text, images: images) else {
-            return false
-        }
-        return preferredOpenClawToolAgent(for: images) != nil
-    }
-
-    private func preferredOpenClawToolAgent(for images: [String]) -> Agent? {
-        let requiredCapability: Capability = images.isEmpty ? .textChat : .vision
-        return agentStore.preferredSubtaskWorker(
-            for: requiredCapability,
-            requireToolSupport: true
         )
     }
 }

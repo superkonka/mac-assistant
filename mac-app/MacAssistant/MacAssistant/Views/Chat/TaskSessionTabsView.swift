@@ -1,24 +1,162 @@
+import AppKit
 import SwiftUI
 
 struct TaskSessionTabsView: View {
     let sessions: [AgentTaskSession]
     let selectedSessionID: String?
     let onToggleSelection: (String) -> Void
+    let onDismissSession: (String) -> Void
+
+    @State private var hoveredSessionID: String?
+    @State private var isShelfHovered = false
+
+    private var isShelfExpanded: Bool {
+        isShelfHovered || hoveredSessionID != nil || selectedSessionID != nil
+    }
+
+    private var shelfWidth: CGFloat {
+        isShelfExpanded ? 338 : 164
+    }
+
+    private var displaySessions: [AgentTaskSession] {
+        Array(sessions.prefix(isShelfExpanded ? 8 : 5))
+    }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(sessions) { session in
-                    TaskSessionTabItem(
-                        session: session,
-                        isSelected: session.id == selectedSessionID,
-                        onTap: { onToggleSelection(session.id) }
-                    )
-                }
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 2)
+        VStack(alignment: .trailing, spacing: isShelfExpanded ? 12 : -14) {
+            shelfBadge
+            shelfCards
         }
+        .frame(width: shelfWidth, alignment: .trailing)
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: isShelfExpanded)
+        .onHover { hovering in
+            isShelfHovered = hovering
+            if !hovering && hoveredSessionID != nil {
+                hoveredSessionID = nil
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var shelfCards: some View {
+        if isShelfExpanded && sessions.count > 5 {
+            ScrollView(.vertical, showsIndicators: false) {
+                shelfCardRows
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .frame(height: min(CGFloat(displaySessions.count) * 84 + 12, 500))
+        } else {
+            shelfCardRows
+        }
+    }
+
+    private var shelfCardRows: some View {
+        VStack(alignment: .trailing, spacing: isShelfExpanded ? 12 : -18) {
+            ForEach(Array(displaySessions.enumerated()), id: \.element.id) { index, session in
+                TaskSessionTabItem(
+                    session: session,
+                    stackIndex: index,
+                    isSelected: session.id == selectedSessionID,
+                    isShelfExpanded: isShelfExpanded,
+                    isHovered: hoveredSessionID == session.id,
+                    onTap: { onToggleSelection(session.id) },
+                    onDismiss: session.status == .completed ? { onDismissSession(session.id) } : nil,
+                    onHoverChange: { hovering in
+                        hoveredSessionID = hovering ? session.id : (hoveredSessionID == session.id ? nil : hoveredSessionID)
+                    }
+                )
+                .zIndex(hoveredSessionID == session.id ? 3 : (session.id == selectedSessionID ? 2 : Double(displaySessions.count - index)))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private var shelfBadge: some View {
+        HStack(spacing: 8) {
+            if isShelfExpanded {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("任务悬层")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    Text(shelfSubtitle)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                sessionGlowColor.opacity(0.24),
+                                sessionGlowColor.opacity(0.08)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(width: 24, height: 24)
+
+                Image(systemName: "square.stack.3d.up.fill")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(sessionGlowColor)
+            }
+
+            Text("\(sessions.count)")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundColor(sessionGlowColor)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(
+                    Capsule()
+                        .fill(sessionGlowColor.opacity(0.12))
+                )
+
+            if runningCount > 0 && isShelfExpanded {
+                Text("\(runningCount) 进行中")
+                    .font(.system(size: 10, weight: .medium, design: .rounded))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule()
+                            .fill(Color.white.opacity(0.52))
+                    )
+            }
+        }
+        .padding(.horizontal, isShelfExpanded ? 14 : 10)
+        .padding(.vertical, 8)
+        .background(
+            Capsule(style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    Capsule(style: .continuous)
+                        .stroke(Color.white.opacity(0.72), lineWidth: 1)
+                )
+        )
+        .shadow(color: sessionGlowColor.opacity(0.14), radius: 16, y: 8)
+        .shadow(color: Color.black.opacity(0.06), radius: 10, y: 4)
+    }
+
+    private var runningCount: Int {
+        sessions.filter { $0.status == .running }.count
+    }
+
+    private var sessionGlowColor: Color {
+        sessions.first(where: { $0.status == .running })?.status.taskAccentColor
+            ?? sessions.first?.status.taskAccentColor
+            ?? .blue
+    }
+
+    private var shelfSubtitle: String {
+        if runningCount > 0 {
+            return "右侧浮层查看后台流转"
+        }
+        return "悬停展开，点击查看详情"
     }
 }
 
@@ -50,35 +188,37 @@ struct TaskSessionInspectorPanel: View {
                 }
                 .padding(16)
             }
-            .frame(maxHeight: 360)
+            .frame(maxHeight: 380)
         }
-        .background(
-            RoundedRectangle(cornerRadius: 16)
-                .fill(AppColors.controlBackground.opacity(0.96))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(session.status.taskBorderColor.opacity(0.9), lineWidth: 1)
-        )
+        .background(panelBackground)
+        .overlay(panelOutline)
+        .shadow(color: session.status.taskAccentColor.opacity(0.18), radius: 28, y: 10)
+        .shadow(color: Color.black.opacity(0.12), radius: 22, y: 8)
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .transition(.move(edge: .top).combined(with: .opacity))
+        .transition(.move(edge: .top).combined(with: .scale(scale: 0.96)).combined(with: .opacity))
     }
 
     private var header: some View {
         HStack(alignment: .center, spacing: 12) {
-            Image(systemName: session.status.symbolName)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(session.status.taskAccentColor)
+            ZStack {
+                Circle()
+                    .fill(session.status.taskAccentColor.opacity(0.14))
+                    .frame(width: 34, height: 34)
+
+                Image(systemName: session.status.symbolName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(session.status.taskAccentColor)
+            }
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 8) {
                     Text(session.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 14, weight: .semibold, design: .rounded))
                         .lineLimit(1)
 
                     Text(session.status.displayName)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
                         .foregroundColor(session.status.taskAccentColor)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
@@ -105,10 +245,10 @@ struct TaskSessionInspectorPanel: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(.secondary)
-                        .frame(width: 22, height: 22)
+                        .frame(width: 24, height: 24)
                         .background(
                             Circle()
-                                .fill(Color.black.opacity(0.05))
+                                .fill(Color.white.opacity(0.7))
                         )
                 }
                 .buttonStyle(.plain)
@@ -116,6 +256,16 @@ struct TaskSessionInspectorPanel: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+        .background(
+            LinearGradient(
+                colors: [
+                    session.status.taskAccentColor.opacity(0.06),
+                    Color.clear
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
     }
 
     private var summarySection: some View {
@@ -281,6 +431,41 @@ struct TaskSessionInspectorPanel: View {
         }
     }
 
+    private var panelBackground: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.regularMaterial)
+
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [
+                            session.status.taskAccentColor.opacity(0.13),
+                            Color.white.opacity(0.7),
+                            AppColors.controlBackground.opacity(0.88)
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        }
+    }
+
+    private var panelOutline: some View {
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .stroke(
+                LinearGradient(
+                    colors: [
+                        session.status.taskBorderColor.opacity(0.95),
+                        Color.white.opacity(0.68)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: 1
+            )
+    }
+
     private var resumeDescription: String {
         if let lastReconciledAt = session.lastReconciledAt {
             return "上次检查 \(lastReconciledAt.formatted(date: .omitted, time: .shortened))"
@@ -295,49 +480,393 @@ struct TaskSessionInspectorPanel: View {
 
 private struct TaskSessionTabItem: View {
     let session: AgentTaskSession
+    let stackIndex: Int
     let isSelected: Bool
+    let isShelfExpanded: Bool
+    let isHovered: Bool
     let onTap: () -> Void
+    let onDismiss: (() -> Void)?
+    let onHoverChange: (Bool) -> Void
+
+    private var isExpanded: Bool {
+        isShelfExpanded || isHovered || isSelected
+    }
+
+    private var labelWidth: CGFloat {
+        isExpanded ? 224 : 94
+    }
+
+    private var tileSize: CGFloat {
+        isExpanded ? 56 : 46
+    }
+
+    private var collapsedOffsetX: CGFloat {
+        isExpanded ? 0 : -CGFloat(min(stackIndex, 4)) * 18
+    }
+
+    private var collapsedTilt: Double {
+        guard !isExpanded else { return 0 }
+
+        switch stackIndex % 3 {
+        case 0: return -6
+        case 1: return 4
+        default: return -3
+        }
+    }
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 8) {
-                Image(systemName: session.status.symbolName)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(session.status.taskAccentColor)
+        ZStack(alignment: .topTrailing) {
+            Button(action: onTap) {
+                HStack(spacing: 10) {
+                    labelBubble
+                    previewTile
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .buttonStyle(.plain)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(session.title)
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-
-                    Text(session.status.displayName)
-                        .font(.system(size: 10))
+            if isExpanded, let onDismiss {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
                         .foregroundColor(.secondary)
-                        .lineLimit(1)
+                        .frame(width: 20, height: 20)
+                        .background(
+                            Circle()
+                                .fill(Color.white.opacity(0.8))
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("关闭此已完成任务")
+                .offset(x: 8, y: -8)
+                .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .offset(x: collapsedOffsetX, y: isHovered ? -4 : 0)
+        .rotationEffect(.degrees(collapsedTilt))
+        .scaleEffect(isSelected ? 1.03 : (isExpanded ? 1.01 : 1))
+        .shadow(color: session.status.taskAccentColor.opacity(isSelected ? 0.18 : (isExpanded ? 0.12 : 0.06)), radius: isExpanded ? 18 : 10, y: 8)
+        .shadow(color: Color.black.opacity(isExpanded ? 0.09 : 0.05), radius: 14, y: 6)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .contentShape(Rectangle())
+        .animation(.spring(response: 0.24, dampingFraction: 0.82), value: isExpanded)
+        .onHover(perform: onHoverChange)
+        .help(session.originalRequest)
+    }
+
+    private var labelBubble: some View {
+        VStack(alignment: .trailing, spacing: isExpanded ? 6 : 2) {
+            HStack(spacing: 8) {
+                if isExpanded {
+                    Text(session.status.displayName)
+                        .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                        .foregroundColor(session.status.taskAccentColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule()
+                                .fill(session.status.taskAccentColor.opacity(0.12))
+                        )
                 }
 
+                Text(session.shelfPrimaryText)
+                    .font(.system(size: isExpanded ? 12 : 11, weight: .semibold, design: .rounded))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+
+            if isExpanded {
+                Text(session.shelfSecondaryText)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+
+                HStack(spacing: 6) {
+                    ForEach(session.railTags.filter { $0 != session.status.displayName }, id: \.self) { tag in
+                        Text(tag)
+                            .font(.system(size: 9, weight: .medium, design: .rounded))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule()
+                                    .fill(Color.black.opacity(0.04))
+                            )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            } else {
+                Text(session.railKeyword)
+                    .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                    .foregroundColor(isSelected ? session.status.taskAccentColor : .secondary)
+                        .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, isExpanded ? 16 : 14)
+        .padding(.vertical, isExpanded ? 12 : 10)
+        .frame(width: labelWidth, alignment: .trailing)
+        .background(labelBubbleBackground)
+        .overlay(labelBubbleOutline)
+    }
+
+    private var labelBubbleBackground: some View {
+        Capsule(style: .continuous)
+            .fill(.ultraThinMaterial)
+            .overlay {
+                Capsule(style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                session.status.taskAccentColor.opacity(isSelected ? 0.16 : 0.08),
+                                Color.white.opacity(isExpanded ? 0.34 : 0.22)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+            }
+    }
+
+    private var labelBubbleOutline: some View {
+        Capsule(style: .continuous)
+            .stroke(
+                LinearGradient(
+                    colors: [
+                        isSelected ? session.status.taskBorderColor : Color.white.opacity(0.72),
+                        isSelected ? session.status.taskAccentColor.opacity(0.22) : Color.black.opacity(0.08)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: isSelected ? 1.2 : 1
+            )
+    }
+
+    private var previewTile: some View {
+        ZStack(alignment: .bottomTrailing) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.thinMaterial)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    session.status.taskAccentColor.opacity(0.16),
+                                    Color.white.opacity(0.18)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                }
+
+            if let previewImage = session.previewNSImage {
+                Image(nsImage: previewImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: tileSize, height: tileSize)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            } else {
+                VStack(spacing: 3) {
+                    Image(systemName: session.status.symbolName)
+                        .font(.system(size: isExpanded ? 17 : 15, weight: .semibold))
+                        .foregroundColor(session.status.taskAccentColor)
+
+                    if isExpanded {
+                        Text(session.railKeyword)
+                            .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+
+            Group {
                 if session.status == .running {
                     ProgressView()
                         .controlSize(.mini)
+                        .tint(.white)
+                } else {
+                    Image(systemName: session.status == .completed ? "checkmark" : session.status.symbolName)
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.white)
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .frame(minWidth: 138, alignment: .leading)
+            .padding(6)
             .background(
-                RoundedRectangle(cornerRadius: 11)
-                    .fill(isSelected ? session.status.taskBackgroundColor : Color.black.opacity(0.03))
+                Circle()
+                    .fill(session.status.taskAccentColor.opacity(0.92))
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 11)
-                    .stroke(
-                        isSelected ? session.status.taskBorderColor : Color.black.opacity(0.08),
-                        lineWidth: 1
-                    )
-            )
+            .offset(x: 5, y: 5)
         }
-        .buttonStyle(.plain)
+        .frame(width: tileSize, height: tileSize)
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.72), lineWidth: 1)
+        )
+    }
+}
+
+private struct TaskSessionMarqueeText: View {
+    let text: String
+
+    private let fontSize: CGFloat = 10.5
+    private let gap: CGFloat = 24
+    private let speed: CGFloat = 26
+
+    var body: some View {
+        GeometryReader { proxy in
+            let font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
+            let textWidth = measuredWidth(using: font)
+
+            if textWidth <= proxy.size.width {
+                Text(text)
+                    .font(.system(size: fontSize))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                    let cycle = textWidth + gap
+                    let elapsed = CGFloat(context.date.timeIntervalSinceReferenceDate) * speed
+                    let offset = elapsed.truncatingRemainder(dividingBy: cycle)
+
+                    HStack(spacing: gap) {
+                        marqueeLabel
+                        marqueeLabel
+                    }
+                    .offset(x: -offset)
+                }
+            }
+        }
+        .frame(height: 14)
+        .clipped()
+    }
+
+    private var marqueeLabel: some View {
+        Text(text)
+            .font(.system(size: fontSize))
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func measuredWidth(using font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
+    }
+}
+
+private extension AgentTaskSession {
+    var shelfPrimaryText: String {
+        let titleCandidate = title
+            .replacingOccurrences(of: "·", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !titleCandidate.isEmpty {
+            return titleCandidate
+        }
+
+        return railKeyword
+    }
+
+    var shelfSecondaryText: String {
+        let candidates = [
+            resultSummary ?? "",
+            latestAssistantText ?? "",
+            errorMessage ?? "",
+            statusSummary,
+            originalRequest
+        ]
+
+        for candidate in candidates {
+            let compact = candidate
+                .replacingOccurrences(of: "\n", with: "  ·  ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !compact.isEmpty {
+                return compact
+            }
+        }
+
+        return "点击查看任务详情"
+    }
+
+    var previewNSImage: NSImage? {
+        guard let firstPath = inputImages?.first(where: {
+            FileManager.default.fileExists(atPath: $0)
+        }) else {
+            return nil
+        }
+
+        return NSImage(contentsOfFile: firstPath)
+    }
+
+    var railKeyword: String {
+        let candidates = [
+            intentName,
+            delegateAgentName ?? "",
+            title,
+            originalRequest
+        ]
+
+        for candidate in candidates {
+            let compact = sanitizedRailToken(from: candidate)
+            if compact.count >= 2 {
+                return String(compact.prefix(min(3, compact.count)))
+            }
+        }
+
+        return "任务"
+    }
+
+    var railTags: [String] {
+        var tags: [String] = [status.displayName]
+
+        if !intentName.isEmpty {
+            tags.append(intentName)
+        }
+
+        if let delegateAgentName, !delegateAgentName.isEmpty {
+            tags.append(delegateAgentName)
+        }
+
+        let requestKeyword = sanitizedRailToken(from: originalRequest)
+        if requestKeyword.count >= 2 {
+            tags.append(String(requestKeyword.prefix(min(6, requestKeyword.count))))
+        }
+
+        var unique: [String] = []
+        for tag in tags where !tag.isEmpty && !unique.contains(tag) {
+            unique.append(tag)
+        }
+        return Array(unique.prefix(3))
+    }
+
+    var railPreviewLine: String {
+        let previewSource = latestAssistantText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? latestAssistantText ?? ""
+            : originalRequest
+
+        return previewSource
+            .replacingOccurrences(of: "\n", with: "  ·  ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func sanitizedRailToken(from source: String) -> String {
+        source
+            .replacingOccurrences(of: "子会话", with: "")
+            .replacingOccurrences(of: "独立处理", with: "")
+            .replacingOccurrences(of: "业务工作流设计", with: "工作流")
+            .filter { character in
+                if character.isWhitespace || character.isNewline {
+                    return false
+                }
+                return !character.unicodeScalars.allSatisfy {
+                    CharacterSet.punctuationCharacters.contains($0) ||
+                    CharacterSet.symbols.contains($0)
+                }
+            }
     }
 }
 

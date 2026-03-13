@@ -78,6 +78,7 @@ struct RequestEnvelope {
     let originalText: String
     let images: [String]
     let createdAt: Date
+    let sessionTopology: ConversationSessionTopology
     let currentAgent: Agent?
     let needsInitialSetup: Bool
     let lastMessage: ChatMessage?
@@ -90,6 +91,7 @@ struct RequestEnvelope {
         originalText: String,
         images: [String],
         createdAt: Date = Date(),
+        sessionTopology: ConversationSessionTopology,
         currentAgent: Agent?,
         needsInitialSetup: Bool,
         lastMessage: ChatMessage?,
@@ -101,6 +103,7 @@ struct RequestEnvelope {
         self.originalText = originalText
         self.images = images
         self.createdAt = createdAt
+        self.sessionTopology = sessionTopology
         self.currentAgent = currentAgent
         self.needsInitialSetup = needsInitialSetup
         self.lastMessage = lastMessage
@@ -135,7 +138,6 @@ enum RequestPlannerPrimaryAction {
     case executeExplicitSkill(skill: AISkill, input: String)
     case handleDetectedSkill(skill: AISkill, input: String, executionInput: String)
     case handleAgentSuggestion(AgentSuggestion, input: String)
-    case routeParallelLinkResearch(input: String)
     case routeMainConversation(input: String)
 }
 
@@ -196,8 +198,6 @@ struct RequestPlan {
             return .sideSession
         case .handleDetectedSkill:
             return .sideSession
-        case .routeParallelLinkResearch:
-            return .parallelSubtasks
         default:
             return .mainSession
         }
@@ -406,25 +406,6 @@ struct RequestPlan {
                     returnsToMainConversation: true
                 )
             ]
-        case .routeParallelLinkResearch:
-            return [
-                PlannedTaskSpec(
-                    id: "parallel-link-main",
-                    kind: .mainConversation,
-                    title: "主会话回答",
-                    executorLabel: envelope.currentAgent?.displayName ?? "自动路由",
-                    summary: "主会话先继续回答，不阻塞当前对话。",
-                    returnsToMainConversation: true
-                ),
-                PlannedTaskSpec(
-                    id: "parallel-link-research",
-                    kind: .recovery,
-                    title: "链接抓取子任务",
-                    executorLabel: "WebContextAgent",
-                    summary: "并行抓取链接内容并提炼补充上下文。",
-                    returnsToMainConversation: true
-                )
-            ]
         case .routeMainConversation:
             return [
                 PlannedTaskSpec(
@@ -489,8 +470,6 @@ struct RequestPlan {
             return "handle_detected_skill:\(skill.rawValue)"
         case .handleAgentSuggestion(_, _):
             return "handle_agent_suggestion"
-        case .routeParallelLinkResearch:
-            return "route_parallel_link_research"
         case .routeMainConversation:
             return "route_main_conversation"
         }

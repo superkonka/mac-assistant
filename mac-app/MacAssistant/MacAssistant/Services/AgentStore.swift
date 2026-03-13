@@ -169,7 +169,9 @@ class AgentStore: ObservableObject {
     /// 切换到指定 Agent
     func switchToAgent(_ agent: Agent) {
         guard canUse(agent) else { return }
+        let previousAgentID = currentAgent?.id ?? "none"
         currentAgent = agent
+        LogInfo("切换当前 Agent previous=\(previousAgentID) next=\(agent.id)")
         
         // 更新最后使用时间
         if let index = agents.firstIndex(where: { $0.id == agent.id }) {

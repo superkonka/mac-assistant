@@ -9,7 +9,7 @@ import SwiftUI
 import Combine
 
 struct ChatView: View {
-    @StateObject private var commandRunner = CommandRunner.shared
+    @StateObject private var conversationController = ConversationController.shared
     @StateObject private var agentStore = AgentStore.shared
     @StateObject private var orchestrator = AgentOrchestrator.shared
     @StateObject private var intelligence = ConversationIntelligence.shared
@@ -31,35 +31,17 @@ struct ChatView: View {
     @State private var hasPerformedInitialBottomAlignment = false
 
     private let bottomAnchorID = "chat-bottom-anchor"
+    private let taskShelfTopInset: CGFloat = 88
+    private let taskShelfTrailingInset: CGFloat = 20
+    private let taskPanelTopInset: CGFloat = 68
+    private let taskPanelTrailingInset: CGFloat = 124
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部工具栏
             topBar
 
-            taskSessionPanel
-
             Divider()
-            
-            // 消息列表
-            messageList
-
-            if shouldShowProcessingStatusDock {
-                processingStatusDock
-            }
-            
-            Divider()
-            
-            // 当前 Agent 指示器
-            currentAgentBar
-            
-            // 智能输入区域
-            IntelligentInputView(
-                text: $inputText,
-                onSend: sendMessage,
-                onTakeScreenshot: takeScreenshot,
-                onShowSkills: { showSkills = true }
-            )
+            chatContentColumn
         }
         .frame(minWidth: 600, minHeight: 500)
         .onAppear {
@@ -99,7 +81,7 @@ struct ChatView: View {
                         """,
                         timestamp: Date()
                     )
-                    commandRunner.messages.append(successMessage)
+                    conversationController.appendMessage(successMessage)
                 }
             )
         }
@@ -137,15 +119,6 @@ struct ChatView: View {
                 showClawDoctor = true
             }
 
-            if !taskSessionsForDisplay.isEmpty {
-                TaskSessionTabsView(
-                    sessions: taskSessionsForDisplay,
-                    selectedSessionID: selectedTaskSessionID,
-                    onToggleSelection: toggleTaskSessionPanel
-                )
-                .frame(maxWidth: 520)
-            }
-
             Spacer(minLength: 12)
 
             if let suggestion = orchestrator.getSuggestion(for: inputText) {
@@ -168,6 +141,45 @@ struct ChatView: View {
         .padding(.vertical, 8)
         .background(AppColors.controlBackground)
     }
+
+    private var chatContentColumn: some View {
+        VStack(spacing: 0) {
+            ZStack(alignment: .topTrailing) {
+                messageList
+
+                if !taskSessionsForDisplay.isEmpty {
+                    TaskSessionTabsView(
+                        sessions: taskSessionsForDisplay,
+                        selectedSessionID: selectedTaskSessionID,
+                        onToggleSelection: toggleTaskSessionPanel,
+                        onDismissSession: dismissTaskSessionTab
+                    )
+                    .padding(.trailing, taskShelfTrailingInset)
+                    .padding(.top, taskShelfTopInset)
+                    .zIndex(3)
+                }
+
+                taskSessionPanel
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if shouldShowProcessingStatusDock {
+                processingStatusDock
+            }
+
+            Divider()
+
+            currentAgentBar
+
+            IntelligentInputView(
+                text: $inputText,
+                onSend: sendMessage,
+                onTakeScreenshot: takeScreenshot,
+                onShowSkills: { showSkills = true }
+            )
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
     
     private var messageList: some View {
         GeometryReader { geometry in
@@ -184,7 +196,7 @@ struct ChatView: View {
                         }
 
                         ForEach(visibleMessages) { message in
-                            let trace = commandRunner.executionTrace(forMessageID: message.id)
+                            let trace = conversationController.executionTrace(forMessageID: message.id)
                             let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
                             let detectedSkillSuggestion = message.detectedSkillSuggestion
 
@@ -196,7 +208,7 @@ struct ChatView: View {
                                     detectedSkillSuggestion: detectedSkillSuggestion,
                                     onDetectedSkillSuggestionAction: { action in
                                         Task {
-                                            await commandRunner.handleDetectedSkillSuggestionAction(
+                                            await conversationController.handleDetectedSkillSuggestionAction(
                                                 messageID: message.id,
                                                 action: action
                                             )
@@ -214,7 +226,7 @@ struct ChatView: View {
                             }
                         }
 
-                        if commandRunner.isProcessing && commandRunner.currentExecutionTrace == nil {
+                        if conversationController.stores.isProcessing && conversationController.stores.currentTrace == nil {
                             TypingIndicator()
                         }
 
@@ -246,13 +258,13 @@ struct ChatView: View {
                         shouldFollowLatest = true
                     }
                 }
-                .onChange(of: commandRunner.messages.count) { _ in
+                .onChange(of: conversationController.stores.messages.count) { _ in
                     handleMessageCountChange(using: proxy)
                 }
                 .onChange(of: latestMessageRenderIdentity) { _ in
                     handleLatestMessageMutation(using: proxy)
                 }
-                .onChange(of: commandRunner.currentExecutionTrace?.id) { _ in
+                .onChange(of: conversationController.stores.currentTrace?.id) { _ in
                     if shouldFollowLatest {
                         scrollToBottom(proxy: proxy, animated: false)
                     }
@@ -309,15 +321,20 @@ struct ChatView: View {
                 session: selectedTaskSession,
                 onClose: { selectedTaskSessionID = nil },
                 onResume: {
-                    commandRunner.resumeTaskSession(selectedTaskSession.id)
+                    conversationController.resumeTaskSession(selectedTaskSession.id)
                 }
             )
+            .frame(maxWidth: 540)
+            .padding(.top, taskPanelTopInset)
+            .padding(.trailing, taskPanelTrailingInset)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            .zIndex(2)
         }
     }
 
     private var processingStatusDock: some View {
         InlineProcessingBar(
-            trace: commandRunner.currentExecutionTrace,
+            trace: conversationController.stores.currentTrace,
             fallbackAgentName: orchestrator.currentAgent?.displayName ?? "当前 Agent"
         )
         .padding(.horizontal, 12)
@@ -338,25 +355,19 @@ struct ChatView: View {
     }
 
     private var visibleMessages: [ChatMessage] {
-        commandRunner.messages.filter { $0.linkedTaskSessionID == nil }
+        conversationController.stores.visibleMessages
     }
 
     private var taskSessionsForDisplay: [AgentTaskSession] {
-        commandRunner.taskSessions.sorted {
-            if $0.updatedAt == $1.updatedAt {
-                return $0.createdAt > $1.createdAt
-            }
-            return $0.updatedAt > $1.updatedAt
-        }
+        conversationController.stores.taskSessionsForDisplay
     }
 
     private var taskSessionIDs: [String] {
-        taskSessionsForDisplay.map(\.id)
+        conversationController.stores.taskSessionIDs
     }
 
     private var selectedTaskSession: AgentTaskSession? {
-        guard let selectedTaskSessionID else { return nil }
-        return commandRunner.taskSession(for: selectedTaskSessionID)
+        conversationController.taskSession(for: selectedTaskSessionID)
     }
 
     private var messageListRevision: String {
@@ -371,8 +382,8 @@ struct ChatView: View {
     }
 
     private var shouldShowProcessingStatusDock: Bool {
-        guard commandRunner.isProcessing else { return false }
-        guard let trace = commandRunner.currentExecutionTrace else { return true }
+        guard conversationController.stores.isProcessing else { return false }
+        guard let trace = conversationController.stores.currentTrace else { return true }
 
         let inlineMessageID = trace.assistantMessageID ?? trace.anchorMessageID
         return !visibleMessages.contains(where: { $0.id == inlineMessageID })
@@ -387,6 +398,13 @@ struct ChatView: View {
             content.contains("正在连接") ||
             content.contains("正在直接调用")
     }
+
+    private func dismissTaskSessionTab(_ sessionID: String) {
+        conversationController.dismissTaskSessionFromTabs(sessionID)
+        if selectedTaskSessionID == sessionID {
+            selectedTaskSessionID = nil
+        }
+    }
     
     private func sendMessage(_ rawText: String) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -395,7 +413,7 @@ struct ChatView: View {
         if agentStore.needsInitialSetup {
             currentGap = nil
             showWizard = true
-            commandRunner.showInitialSetupGuidance(for: "开始对话")
+            conversationController.showInitialSetupGuidance(for: "开始对话")
             return
         }
 
@@ -406,13 +424,11 @@ struct ChatView: View {
             scrollToBottom(proxy: scrollProxy, animated: true, force: true)
         }
         
-        Task {
-            await commandRunner.processInput(text)
-        }
+        conversationController.processInput(text)
     }
     
     private func takeScreenshot() {
-        commandRunner.handleScreenshot()
+        conversationController.handleScreenshot()
     }
     
     private func setupNotifications() {
@@ -441,10 +457,12 @@ struct ChatView: View {
             object: nil,
             queue: .main
         ) { notification in
-            if let panel = notification.object as? String {
-                skillsBrowserState.selectedPanelRawValue = panel
+            Task { @MainActor in
+                if let panel = notification.object as? String {
+                    skillsBrowserState.selectedPanelRawValue = panel
+                }
+                showSkills = true
             }
-            showSkills = true
         }
     }
     
@@ -504,7 +522,7 @@ struct ChatView: View {
         scrollToBottom(
             proxy: proxy,
             animated: false,
-            throttleInterval: commandRunner.isProcessing ? 0.2 : nil
+            throttleInterval: conversationController.stores.isProcessing ? 0.2 : nil
         )
     }
 

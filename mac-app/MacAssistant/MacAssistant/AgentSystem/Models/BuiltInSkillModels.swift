@@ -74,7 +74,6 @@ enum AISkill: String, CaseIterable, Identifiable {
     case explainSelection = "explain_selection"
     case translateText = "translate_text"
     case summarizeText = "summarize_text"
-    case webSearch = "web_search"
     
     var id: String { rawValue }
     
@@ -87,7 +86,6 @@ enum AISkill: String, CaseIterable, Identifiable {
         case .explainSelection: return "解释选中内容"
         case .translateText: return "翻译文本"
         case .summarizeText: return "总结文本"
-        case .webSearch: return "网络搜索"
         }
     }
     
@@ -100,7 +98,6 @@ enum AISkill: String, CaseIterable, Identifiable {
         case .explainSelection: return "💡"
         case .translateText: return "🌐"
         case .summarizeText: return "📋"
-        case .webSearch: return "🔍"
         }
     }
     
@@ -113,7 +110,6 @@ enum AISkill: String, CaseIterable, Identifiable {
         case .explainSelection: return "解释当前选中的文本或代码"
         case .translateText: return "将文本翻译成其他语言"
         case .summarizeText: return "总结长文本的核心内容"
-        case .webSearch: return "搜索网络获取实时信息"
         }
     }
     
@@ -127,8 +123,6 @@ enum AISkill: String, CaseIterable, Identifiable {
             return .analysis
         case .translateText, .summarizeText:
             return .productivity
-        case .webSearch:
-            return .system
         }
     }
     
@@ -142,8 +136,6 @@ enum AISkill: String, CaseIterable, Identifiable {
             return .textChat
         case .translateText:
             return .textChat
-        case .webSearch:
-            return .webSearch
         }
     }
     
@@ -156,7 +148,6 @@ enum AISkill: String, CaseIterable, Identifiable {
         case .explainSelection: return "⌘⇧E"
         case .translateText: return nil
         case .summarizeText: return nil
-        case .webSearch: return nil
         }
     }
 }
@@ -219,9 +210,6 @@ class AISkillRegistry: ObservableObject {
             
         case .summarizeText:
             return await executeSummarizeText(context: context)
-            
-        case .webSearch:
-            return await executeWebSearch(context: context)
         }
     }
     
@@ -283,14 +271,6 @@ class AISkillRegistry: ObservableObject {
         }
         
         return .success(message: "正在总结文本...")
-    }
-    
-    private func executeWebSearch(context: MacAssistant.SkillContext) async -> SkillResult {
-        guard let query = context.input else {
-            return .requiresInput(prompt: "请输入搜索关键词")
-        }
-        
-        return .success(message: "正在搜索: \(query)")
     }
 }
 

@@ -214,38 +214,6 @@ enum RequestPlanningHeuristics {
         return .runtimeSetup
     }
 
-    static func supportsOpenClawTools(_ agent: Agent) -> Bool {
-        agent.provider != .ollama
-    }
-
-    static func preferredOpenClawToolAgent(
-        images: [String],
-        currentAgent: Agent?,
-        defaultAgent: Agent?,
-        usableAgents: [Agent]
-    ) -> Agent? {
-        let requiredCapability: Capability = images.isEmpty ? .textChat : .vision
-
-        func isEligible(_ agent: Agent?) -> Bool {
-            guard let agent else {
-                return false
-            }
-            return supportsOpenClawTools(agent) && agent.supports(requiredCapability)
-        }
-
-        if isEligible(currentAgent) {
-            return currentAgent
-        }
-
-        if isEligible(defaultAgent) {
-            return defaultAgent
-        }
-
-        return usableAgents.first { candidate in
-            supportsOpenClawTools(candidate) && candidate.supports(requiredCapability)
-        }
-    }
-
     static func plannedAgentSwitch(for parsed: ParsedInput, images: [String]) -> PlannedAgentSwitch? {
         guard let mention = parsed.agentMention else {
             return nil
@@ -273,30 +241,7 @@ enum RequestPlanningHeuristics {
             return false
         }
 
-        if mentionsAgentIdentity(in: text, agent: currentAgent) {
-            return true
-        }
-
-        if currentAgent.provider == .ollama, hasLink(in: text) {
-            return true
-        }
-
-        return false
-    }
-
-    static func shouldUseParallelLinkResearch(for text: String, images: [String]) -> Bool {
-        guard images.isEmpty, hasLink(in: text) else {
-            return false
-        }
-
-        let normalizedText = normalized(text)
-        let researchKeywords = [
-            "读取", "分析", "研究", "学习", "扩展", "能力", "整理", "总结",
-            "文档", "api", "openapi", "mcp", "repo", "仓库", "接口", "endpoint",
-            "能不能", "可以不可以", "帮我看", "网页"
-        ]
-
-        return researchKeywords.contains { normalizedText.contains($0) }
+        return mentionsAgentIdentity(in: text, agent: currentAgent)
     }
 
     static func mentionsAgentIdentity(in text: String, agent: Agent?) -> Bool {
@@ -310,13 +255,6 @@ enum RequestPlanningHeuristics {
             let foldedKeyword = foldedIdentity(keyword)
             return !foldedKeyword.isEmpty && haystack.contains(foldedKeyword)
         }
-    }
-
-    private static func hasLink(in text: String) -> Bool {
-        let normalizedText = normalized(text)
-        return normalizedText.contains("http://") ||
-            normalizedText.contains("https://") ||
-            normalizedText.contains("www.")
     }
 
     private static func agentIdentityKeywords(for agent: Agent) -> [String] {

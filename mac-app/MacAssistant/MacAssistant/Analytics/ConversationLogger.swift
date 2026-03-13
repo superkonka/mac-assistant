@@ -106,6 +106,7 @@ class ConversationLogger: ObservableObject {
     static let shared = ConversationLogger()
     
     @Published var currentSessionId: String = ""
+    @Published var currentSessionStartedAt: Date = .distantPast
     @Published var events: [ConversationEvent] = []
     @Published var isRecording = false
     
@@ -126,11 +127,13 @@ class ConversationLogger: ObservableObject {
     // MARK: - 会话管理
     
     func startNewSession() {
+        let startedAt = Date()
         currentSessionId = "session-\(UUID().uuidString.prefix(8))"
+        currentSessionStartedAt = startedAt
         events = []
         stats = SessionStats(
             sessionId: currentSessionId,
-            startTime: Date(),
+            startTime: startedAt,
             activeAgent: AgentOrchestrator.shared.currentAgent?.name
         )
         isRecording = true

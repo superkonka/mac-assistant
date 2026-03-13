@@ -33,7 +33,6 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         "execute_explicit_skill",
         "handle_detected_skill",
         "handle_agent_suggestion",
-        "route_parallel_link_research",
         "route_main_conversation"
     ]
     private let allowedConfidence: Set<String> = ["high", "medium", "low"]
@@ -46,11 +45,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
     private init() {}
 
     func planPrimary(_ envelope: RequestEnvelope) async -> RequestPlan? {
-        await planWithAgent(
-            envelope,
-            sessionPrefix: "planner-primary",
-            sessionLabel: "Planner Primary"
-        )
+        await planWithAgent(envelope)
     }
 
     func planShadow(_ envelope: RequestEnvelope) async -> RequestPlan? {
@@ -58,29 +53,27 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
             return nil
         }
 
-        return await planWithAgent(
-            envelope,
-            sessionPrefix: "planner-shadow",
-            sessionLabel: "Planner Shadow"
-        )
+        return await planWithAgent(envelope)
     }
 
-    private func planWithAgent(
-        _ envelope: RequestEnvelope,
-        sessionPrefix: String,
-        sessionLabel: String
-    ) async -> RequestPlan? {
-
+    private func planWithAgent(_ envelope: RequestEnvelope) async -> RequestPlan? {
         guard let agent = selectPlannerAgent(for: envelope) else {
             LogDebug("IntentAgentShadow skipped: no usable planner agent")
             return nil
         }
 
+        guard agent.provider != .ollama else {
+            LogInfo(
+                "IntentAgentShadow skipped for local CLI planner agent=\(agent.id) provider=\(agent.provider.rawValue)"
+            )
+            return nil
+        }
+
         let parsed = intelligence.analyzeInput(envelope.originalText)
         let prompt = buildPrompt(envelope: envelope, parsed: parsed)
-        let sessionKey = "\(sessionPrefix)-\(envelope.id.uuidString.lowercased())"
+        let sessionKey = envelope.sessionTopology.shadowSessionKey
         let resolvedSessionLabel = OpenClawGatewayClient.uniqueSessionLabel(
-            base: sessionLabel,
+            base: envelope.sessionTopology.shadowSessionLabel,
             uniqueSource: sessionKey
         )
 
@@ -89,6 +82,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
                 agent: agent,
                 sessionKey: sessionKey,
                 sessionLabel: resolvedSessionLabel,
+                requestID: envelope.id.uuidString.lowercased(),
                 text: prompt,
                 images: []
             )
@@ -107,22 +101,23 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         let usable = agentStore.usableAgents
         guard !usable.isEmpty else { return nil }
 
-        if let preferred = agentStore.plannerPreferredAgent {
-            return preferred
-        }
-
         if let preferredID = preferences.plannerShadowPreferredAgentID,
            let preferred = usable.first(where: { $0.id == preferredID && agentStore.hasRole(.planner, for: $0) }) {
             return preferred
         }
 
-        if let apiAgent = usable.first(where: { $0.provider != .ollama }) {
-            return apiAgent
+        if let current = envelope.currentAgent,
+           usable.contains(where: { $0.id == current.id }),
+           current.supports(.textChat) {
+            return current
         }
 
-        if let current = envelope.currentAgent,
-           usable.contains(where: { $0.id == current.id }) {
-            return current
+        if let preferred = agentStore.plannerPreferredAgent {
+            return preferred
+        }
+
+        if let apiAgent = usable.first(where: { $0.provider != .ollama }) {
+            return apiAgent
         }
 
         return agentStore.defaultAgent ?? usable.first
@@ -149,7 +144,6 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         - execute_explicit_skill
         - handle_detected_skill
         - handle_agent_suggestion
-        - route_parallel_link_research
         - route_main_conversation
 
         输出 JSON schema：
@@ -163,6 +157,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         }
 
         判定上下文：
+        - conversationID: \(jsonString(envelope.sessionTopology.conversationID))
         - 用户原文: \(jsonString(envelope.originalText))
         - cleanText: \(jsonString(parsed.cleanText))
         - 图片数量: \(envelope.images.count)
@@ -372,7 +367,9 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
             )
 
         case "execute_explicit_skill":
-            let skill = parsed.skillCommand?.skill ?? AISkill(rawValue: decision.skillName ?? "") ?? .webSearch
+            guard let skill = parsed.skillCommand?.skill ?? AISkill(rawValue: decision.skillName ?? "") else {
+                break
+            }
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
@@ -385,7 +382,9 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
             )
 
         case "handle_detected_skill":
-            let skill = parsed.detectedSkill ?? AISkill(rawValue: decision.skillName ?? "") ?? .webSearch
+            guard let skill = parsed.detectedSkill ?? AISkill(rawValue: decision.skillName ?? "") else {
+                break
+            }
             return RequestPlan(
                 envelope: envelope,
                 parsedInput: parsed,
@@ -414,18 +413,6 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
                     reason: decision.reason
                 )
             }
-
-        case "route_parallel_link_research":
-            return RequestPlan(
-                envelope: envelope,
-                parsedInput: parsed,
-                preparedInput: preparedInput,
-                notices: [],
-                requestedAgentSwitch: RequestPlanningHeuristics.plannedAgentSwitch(for: parsed, images: envelope.images),
-                primaryAction: .routeParallelLinkResearch(input: preparedInput),
-                confidence: confidence,
-                reason: decision.reason
-            )
 
         case "respond_to_confirmation":
             break

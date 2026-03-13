@@ -80,12 +80,6 @@ class AgentOrchestrator: ObservableObject {
             return .systemOperation("general")
         }
         
-        // 网络搜索
-        let searchKeywords = ["搜索", "查找", "google", "百度", "最新", "新闻", "今天发生了什么"]
-        if searchKeywords.contains(where: { lowerInput.contains($0) }) {
-            return .webSearch(input)
-        }
-        
         return nil
     }
     

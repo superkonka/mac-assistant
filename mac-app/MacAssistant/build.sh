@@ -46,8 +46,8 @@ xcodebuild \
 # 导出应用
 echo "📦 导出应用..."
 
-# 找到构建产物
-APP_PATH=$(find build -name "MacAssistant.app" -type d | head -1)
+# 归档产物固定在 xcarchive 中，避免误拿到旧的 build/MacAssistant.app
+APP_PATH="build/MacAssistant.xcarchive/Products/Applications/MacAssistant.app"
 
 if [ -z "$APP_PATH" ]; then
     echo "❌ 构建失败，未找到 .app 文件"
@@ -59,12 +59,14 @@ echo "✅ 构建成功!"
 echo "📍 应用位置: $APP_PATH"
 
 # 复制到输出目录
-cp -R "$APP_PATH" build/MacAssistant.app
+OUTPUT_APP_PATH="build/MacAssistant.app"
+rm -rf "$OUTPUT_APP_PATH"
+ditto "$APP_PATH" "$OUTPUT_APP_PATH"
 
 echo ""
 echo "🎉 构建完成!"
-echo "📍 应用: $(pwd)/build/MacAssistant.app"
+echo "📍 应用: $(pwd)/$OUTPUT_APP_PATH"
 echo ""
 echo "安装方式:"
-echo "  1. 将 build/MacAssistant.app 拖到 Applications 文件夹"
-echo "  2. 或在终端运行: cp -R build/MacAssistant.app /Applications/"
+echo "  1. 将 build/MacAssistant.app 拖到 Applications 文件夹，替换旧版本"
+echo "  2. 或在终端运行: ditto build/MacAssistant.app /Applications/MacAssistant.app"

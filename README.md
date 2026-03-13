@@ -28,12 +28,13 @@
 ```text
 SwiftUI Mac App
   ├─ ChatView / MessageBubble / RichTextView
-  ├─ CommandRunner
+  ├─ ConversationController
+  ├─ ContextAssembler
   ├─ RequestPlanner
-  ├─ AgentStore / AgentOrchestrator
-  ├─ ResultCollector
-  ├─ MacSystemAgent / WebContextAgent / WebSearchService
-  └─ OpenClawGatewayClient
+  ├─ TaskSupervisor
+  ├─ ResultReducer / ConversationStores
+  ├─ AgentStore / AgentOrchestrator / MacSystemAgent
+  └─ ClawRuntimeAdapter (OpenClawGatewayClient)
           │
           ▼
 OpenClawGatewayRuntimeManager
@@ -49,19 +50,24 @@ Kimi CLI / DeepSeek / Doubao / Zhipu / OpenAI / Anthropic / Google / Moonshot
 当前调度逻辑不是“所有请求都直接进一个 LLM”，而是固定阶段的模块链：
 
 ```text
-RequestEnvelope
+UI
+  -> ConversationController
+  -> ContextAssembler
   -> Planner
-  -> Dispatcher
-  -> Main Session / Side Session / Parallel Subtasks
-  -> Result Collector
-  -> Memory / Trace / Self-heal
+  -> TaskSupervisor
+  -> ClawRuntimeAdapter(OpenClaw)
+  -> ResultReducer
+  -> Stores
 ```
 
 其中：
 
+- `ConversationController` 负责给 UI 提供统一会话入口和观察态，避免 `ChatView` 直接绑定底层运行时。
+- `ContextAssembler` 负责把截图、最近消息、当前 Agent、可恢复 task context 组装成 `RequestEnvelope`。
 - `Planner` 负责判定这次请求是主对话、配置向导、系统操作、URL 研究、Skill 建议还是 side task。
-- `Dispatcher` 负责决定是走主会话、独立子任务，还是并行子任务。
-- `Result Collector` 负责把并行抓取或 side task 的结果补回主会话。
+- `TaskSupervisor` 负责承接规划结果，并驱动主会话、独立子任务和恢复链路。
+- `ClawRuntimeAdapter` 负责把 OpenClaw runtime 调用收口到单一适配层。
+- `ResultReducer` 负责把运行态压成 UI 可消费的 `ConversationStores`。
 - `Self-heal` 负责 Agent 回退、Kimi 登录恢复、OpenClaw 诊断与重装。
 
 辅助链路仍然保留：
@@ -73,15 +79,20 @@ RequestEnvelope
 ## 核心模块
 
 - `mac-app/MacAssistant/MacAssistant/MacAssistantApp.swift`：应用入口、菜单栏、主窗口、日志窗口。
+- `mac-app/MacAssistant/MacAssistant/Services/ConversationController.swift`：UI 会话控制器，统一收口发送入口和观察态。
+- `mac-app/MacAssistant/MacAssistant/Services/ContextAssembler.swift`：会话上下文组装器，负责形成 `RequestEnvelope`。
 - `mac-app/MacAssistant/MacAssistant/Services/CommandRunner.swift`：主对话编排器，负责 planner 决策执行、主会话、side task、自愈和 trace。
 - `mac-app/MacAssistant/MacAssistant/Services/RequestPlanner.swift`：统一请求规划器，负责判定请求类型和执行模式。
+- `mac-app/MacAssistant/MacAssistant/Services/TaskSupervisor.swift`：任务承接和 task session 监督层。
 - `mac-app/MacAssistant/MacAssistant/Services/IntentAgentShadowPlannerProvider.swift`：独立 Planner Agent 的影子判定接口。
 - `mac-app/MacAssistant/MacAssistant/Services/AgentStore.swift`：Agent 持久化、可用性检测、认证验证、角色分配、OpenClaw 配置同步。
 - `mac-app/MacAssistant/MacAssistant/Services/AgentOrchestrator.swift`：能力路由和当前 Agent 协同。
+- `mac-app/MacAssistant/MacAssistant/Services/ClawRuntimeAdapter.swift`：OpenClaw runtime 适配层。
+- `mac-app/MacAssistant/MacAssistant/Services/ResultReducer.swift`：把运行态收敛成 UI Stores。
 - `mac-app/MacAssistant/MacAssistant/Services/OpenClawGatewayRuntimeManager.swift`：本地 gateway wrapper 生命周期和运行时配置生成。
 - `mac-app/MacAssistant/MacAssistant/Services/OpenClawGatewayClient.swift`：发送消息、消费流式事件、history 恢复和异常收敛。
 - `mac-app/MacAssistant/MacAssistant/Services/MacSystemAgent.swift`：原生 macOS 应用操作代理。
-- `mac-app/MacAssistant/MacAssistant/Services/ResultCollector.swift`：side task / 并行子任务结果回收和补写。
+- `mac-app/MacAssistant/MacAssistant/Models/ConversationPipelineModels.swift`：Conversation Stores 和组装后的请求模型。
 - `mac-app/MacAssistant/MacAssistant/Services/DependencyManager.swift` + `OpenClawDoctor.swift`：OpenClaw runtime 检测、安装、修复、重装。
 - `mac-app/MacAssistant/MacAssistant/Services/SkillEvolutionAdvisor.swift`：根据 Skill 使用数据提出演进建议。
 

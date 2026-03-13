@@ -184,7 +184,6 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 QuickButton(icon: "camera", text: "截图") { inputText = "/截图"; send() }
                 QuickButton(icon: "doc.on.clipboard", text: "剪贴板") { inputText = "/剪贴板"; send() }
-                QuickButton(icon: "magnifyingglass", text: "搜索") { inputText = "/搜索 "; isInputFocused = true }
                 QuickButton(icon: "brain.head.profile", text: "分析") { inputText = "/分析"; send() }
                 QuickButton(icon: "questionmark.circle", text: "帮助") { inputText = "/帮助"; send() }
             }
