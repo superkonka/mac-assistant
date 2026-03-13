@@ -173,12 +173,12 @@ actor HierarchicalRetriever {
             // 如果 L2 是聚合的，可能没有明确的 sourceIds
             // 此时根据概念和关键词搜索相关 L1
             if sourceIds.isEmpty {
-                let keywords = l2.concepts.map(\.name)
+                let keywords = l2.concepts.map { $0.name }
                 let matches = try await l1Store.queryByKeywords(
                     keywords: keywords,
-                    planId: query.filters?.planId
+                    planId: query.filters.planId
                 )
-                sourceIds = matches.map(\.id)
+                sourceIds = matches.map { $0.id }
             }
             
             // 批量获取 L1 条目
@@ -338,9 +338,9 @@ actor HierarchicalRetriever {
     }
 }
 
-// MARK: - Context Assembler
+// MARK: - Memory Context Assembler
 
-actor ContextAssembler {
+actor MemoryContextAssembler {
     
     /// 组装检索结果为 LLM 可用上下文
     func assemble(
@@ -392,7 +392,7 @@ actor ContextAssembler {
         }
         
         // 3. L0 细节（如果有空间）
-        if usedTokens < budget.totalTokens * 0.9 && !retrievalResult.l0Entries.isEmpty {
+        if usedTokens < Int(Double(budget.totalTokens) * 0.9) && !retrievalResult.l0Entries.isEmpty {
             let content = formatL0(retrievalResult.l0Entries)
             sections.append(ContextSection(
                 title: "执行记录 (\(retrievalResult.l0Entries.count)条)",

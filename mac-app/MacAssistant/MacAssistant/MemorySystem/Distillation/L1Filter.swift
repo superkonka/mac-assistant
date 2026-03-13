@@ -85,7 +85,7 @@ actor L1DistillationEngine {
         // 提取结果
         [TaskOutcome(
             success: entry.executionTrace.errorInfo == nil,
-            result: entry.output.response.prefix(100),
+            result: String(entry.output.response.prefix(100)),
             metrics: [
                 "durationMs": Double(entry.executionTrace.durationMs),
                 "tokenCount": Double(entry.executionTrace.tokenUsage?.totalTokens ?? 0)
@@ -95,7 +95,7 @@ actor L1DistillationEngine {
     
     private func extractKeywords(from entry: RawMemoryEntry) -> [String] {
         // 关键词提取
-        entry.input.prompt.split(separator: " ").map(String.init)
+        entry.input.prompt.split(separator: " ").map { String($0) }
     }
     
     private func buildSearchableContent(_ summary: String, _ facts: [KeyFact]) -> String {

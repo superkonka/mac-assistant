@@ -102,7 +102,7 @@ actor MemoryCoordinator: MemoryCoordinating {
         prompt: String,
         response: String,
         durationMs: Int,
-        tokenUsage: TokenUsage?,
+        tokenUsage: MemoryTokenUsage?,
         metadata: [String: AnyCodable]? = nil
     ) async {
         guard MemoryFeatureFlags.enableL0Storage else { return }
@@ -131,7 +131,7 @@ actor MemoryCoordinator: MemoryCoordinating {
                 metadata: metadata,
                 finishReason: nil
             ),
-            executionTrace: ExecutionTrace(
+            executionTrace: MemoryExecutionTrace(
                 durationMs: durationMs,
                 tokenUsage: tokenUsage,
                 costEstimate: nil,
@@ -308,7 +308,7 @@ actor MemoryCoordinator: MemoryCoordinating {
             let content = formatL1ForContext(entry)
             let tokens = estimateContentTokens(content)
             
-            if usedTokens + tokens <= remainingBudget * 0.7 {
+            if usedTokens + tokens <= Int(Double(remainingBudget) * 0.7) {
                 sections.append(ContextSection(
                     title: "关键信息: \(entry.summary.prefix(30))...",
                     content: content,
@@ -321,7 +321,7 @@ actor MemoryCoordinator: MemoryCoordinating {
         }
         
         // 优先级 3: L0 细节（仅当空间允许）
-        if !retrievalResult.l0Entries.isEmpty && usedTokens < budget.totalTokens * 0.9 {
+        if !retrievalResult.l0Entries.isEmpty && usedTokens < Int(Double(budget.totalTokens) * 0.9) {
             let l0Summary = formatL0Summary(retrievalResult.l0Entries)
             sections.append(ContextSection(
                 title: "执行细节",
@@ -496,7 +496,8 @@ extension MemoryCoordinator {
             prompt: prompt,
             response: response,
             durationMs: durationMs,
-            tokenUsage: nil
+            tokenUsage: nil as MemoryTokenUsage?,
+            metadata: nil
         )
     }
 }

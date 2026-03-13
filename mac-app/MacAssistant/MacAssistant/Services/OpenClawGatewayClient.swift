@@ -54,6 +54,10 @@ actor OpenClawGatewayClient {
         images: [String],
         onAssistantText: (@Sendable (String) async -> Void)? = nil
     ) async throws -> String {
+        // MARK: - Memory System Hook (Phase 1: L0 Storage)
+        let memoryStartTime = Date()
+        let planId = Self.derivePlanId(from: sessionKey)
+        
         let state = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         guard let modelRef = state.modelRefsByAgentID[agent.id] else {
             throw NSError(
@@ -131,7 +135,9 @@ actor OpenClawGatewayClient {
                             sessionID: knownSessionID,
                             prompt: prompt,
                             assistantText: recovery.text,
-                            requestStartedAtMs: requestStartedAtMs
+                            requestStartedAtMs: requestStartedAtMs,
+                            agent: agent,
+                            durationMs: Int(Date().timeIntervalSince1970 * 1000 - requestStartedAtMs)
                         )
                     }
                 }
@@ -156,7 +162,9 @@ actor OpenClawGatewayClient {
                             sessionID: knownSessionID,
                             prompt: prompt,
                             assistantText: recovery.text,
-                            requestStartedAtMs: requestStartedAtMs
+                            requestStartedAtMs: requestStartedAtMs,
+                            agent: agent,
+                            durationMs: Int(Date().timeIntervalSince1970 * 1000 - requestStartedAtMs)
                         )
                     }
 
@@ -169,7 +177,9 @@ actor OpenClawGatewayClient {
                         sessionID: knownSessionID,
                         prompt: prompt,
                         assistantText: currentAssistantText,
-                        requestStartedAtMs: requestStartedAtMs
+                        requestStartedAtMs: requestStartedAtMs,
+                        agent: agent,
+                        durationMs: Int(Date().timeIntervalSince1970 * 1000 - requestStartedAtMs)
                     )
                 }
 
@@ -263,7 +273,9 @@ actor OpenClawGatewayClient {
                                 sessionID: knownSessionID,
                                 prompt: prompt,
                                 assistantText: resolvedFinalText,
-                                requestStartedAtMs: requestStartedAtMs
+                                requestStartedAtMs: requestStartedAtMs,
+                                agent: agent,
+                                durationMs: Int(Date().timeIntervalSince1970 * 1000 - requestStartedAtMs)
                             )
 
                         case "error":
@@ -323,7 +335,9 @@ actor OpenClawGatewayClient {
                 sessionID: knownSessionID,
                 prompt: prompt,
                 assistantText: recovery.text,
-                requestStartedAtMs: requestStartedAtMs
+                requestStartedAtMs: requestStartedAtMs,
+                agent: agent,
+                durationMs: Int(Date().timeIntervalSince1970 * 1000 - requestStartedAtMs)
             )
         }
 
@@ -697,7 +711,9 @@ actor OpenClawGatewayClient {
         sessionID: String?,
         prompt: String,
         assistantText: String,
-        requestStartedAtMs: Double
+        requestStartedAtMs: Double,
+        agent: Agent? = nil,  // For memory system
+        durationMs: Int? = nil  // For memory system
     ) async -> String {
         await self.ensureTranscriptContainsTurn(
             sessionKey: sessionKey,
@@ -706,10 +722,59 @@ actor OpenClawGatewayClient {
             assistantText: assistantText,
             requestStartedAtMs: requestStartedAtMs
         )
+        
+        // MARK: - L0 Memory Storage (Phase 1)
+        if MemoryFeatureFlags.enableL0Storage,
+           let agent = agent,
+           let duration = durationMs {
+            Task {
+                await self.storeToL0Memory(
+                    planId: Self.derivePlanId(from: sessionKey),
+                    agent: agent,
+                    sessionKey: sessionKey,
+                    prompt: prompt,
+                    response: assistantText,
+                    durationMs: duration
+                )
+            }
+        }
+        
         Task {
             await MemoryRecallCoordinator.shared.noteTranscriptMutation(reason: "chat.finalize")
         }
         return assistantText
+    }
+    
+    // MARK: - Memory System Integration
+    
+    private func storeToL0Memory(
+        planId: String,
+        agent: Agent,
+        sessionKey: String,
+        prompt: String,
+        response: String,
+        durationMs: Int
+    ) async {
+        await MemoryCoordinator.shared.storeExecution(
+            planId: planId,
+            taskId: nil,
+            agentId: agent.id,
+            sessionKey: sessionKey,
+            prompt: prompt,
+            response: response,
+            durationMs: durationMs,
+            tokenUsage: nil,
+            metadata: [
+                "agentName": AnyCodable(agent.name),
+                "agentProvider": AnyCodable(agent.provider.rawValue),
+                "model": AnyCodable(agent.model)
+            ]
+        )
+    }
+    
+    private static func derivePlanId(from sessionKey: String) -> String {
+        // Extract plan ID from session key (e.g., "plan-xxx/task-yyy" -> "plan-xxx")
+        sessionKey.components(separatedBy: "/").first ?? sessionKey
     }
 
     private func ensureTranscriptContainsTurn(

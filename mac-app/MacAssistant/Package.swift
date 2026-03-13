@@ -36,6 +36,7 @@ let package = Package(
                 "AutoAgent",
                 "Distillation",
                 "Skills",
+                "MemorySystem",
             ],
             swiftSettings: [
                 .unsafeFlags(["-suppress-warnings"])

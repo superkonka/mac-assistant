@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import OpenClawKit
 
 /// ClawRuntimeAdapter 的记忆钩子扩展
 extension ClawRuntimeAdapter {
@@ -129,119 +130,7 @@ extension OpenClawGatewayClient {
     }
 }
 
-// MARK: - TaskWorkerPool Memory Integration
 
-extension TaskWorkerPool {
-    
-    /// 执行任务并记录到记忆系统
-    func executeTaskWithMemory(
-        _ task: TaskNode,
-        in planId: String,
-        plan: TaskPlan,
-        mainSessionKey: String
-    ) async -> TaskResult {
-        
-        let startTime = Date()
-        
-        // 构建带记忆上下文的执行
-        let context = await MemoryCoordinator.shared.buildTaskContext(
-            planId: planId,
-            taskId: task.id,
-            requiredDepth: .detailed
-        )
-        
-        // 注入记忆上下文到提示词
-        let enrichedPrompt = enrichPromptWithContext(task.prompt.template, context: context)
-        
-        // 执行（这里简化，实际需要调用 runtime）
-        // ... 执行逻辑 ...
-        let result = TaskResult(
-            output: "执行结果",
-            metadata: ["taskId": AnyCodable(task.id)],
-            usage: nil
-        )
-        
-        // 记录到记忆系统
-        let durationMs = Int(Date().timeIntervalSince(startTime) * 1000)
-        await MemoryCoordinator.shared.storeExecution(
-            planId: planId,
-            taskId: task.id,
-            agentId: resolveAgentRef(task.agentRef).id,
-            sessionKey: "\(mainSessionKey)/task-\(task.id)",
-            prompt: enrichedPrompt,
-            response: result.output,
-            durationMs: durationMs,
-            tokenUsage: result.usage,
-            metadata: result.metadata
-        )
-        
-        return result
-    }
-    
-    private func enrichPromptWithContext(_ prompt: String, context: TaskExecutionContext) -> String {
-        var enriched = prompt
-        
-        if !context.entries.isEmpty {
-            enriched += "\n\n[相关背景信息]\n"
-            for entry in context.entries.prefix(3) {
-                enriched += "- \(entry.content.prefix(100))...\n"
-            }
-        }
-        
-        if !context.concepts.isEmpty {
-            enriched += "\n[相关概念]\n"
-            for concept in context.concepts.prefix(3) {
-                enriched += "- \(concept.name): \(concept.definition.prefix(50))...\n"
-            }
-        }
-        
-        return enriched
-    }
-}
-
-// MARK: - 辅助类型
-
-struct TaskNode {
-    let id: String
-    let prompt: Prompt
-    let agentRef: AgentReference
-}
-
-struct Prompt {
-    let template: String
-}
-
-struct AgentReference {
-    enum RefType {
-        case byId(String)
-        case byRole(String)
-        case auto
-    }
-    let type: RefType
-}
-
-struct TaskPlan {
-    let planId: String
-}
-
-struct TaskResult {
-    let output: String
-    let metadata: [String: AnyCodable]
-    let usage: TokenUsage?
-}
-
-// 模拟解析
-func resolveAgentRef(_ ref: AgentReference) -> Agent {
-    // 实际实现中根据 ref 解析 Agent
-    Agent(
-        name: "Worker",
-        emoji: "🤖",
-        description: "Task worker",
-        provider: .openai,
-        model: "gpt-4",
-        capabilities: [.textChat]
-    )
-}
 
 // MARK: - Memory-Aware Conversation Controller
 

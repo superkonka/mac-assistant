@@ -73,7 +73,7 @@ struct RawMemoryEntry: Codable, Sendable, Identifiable {
     let output: RawOutput
     
     // 执行元数据
-    let executionTrace: ExecutionTrace
+    let executionTrace: MemoryExecutionTrace
     
     // 关联
     let parentEntryId: MemoryID?
@@ -103,24 +103,24 @@ struct RawMemoryEntry: Codable, Sendable, Identifiable {
     }
 }
 
-struct ExecutionTrace: Codable, Sendable {
+struct MemoryExecutionTrace: Codable, Sendable {
     let durationMs: Int
-    let tokenUsage: TokenUsage?
+    let tokenUsage: MemoryTokenUsage?
     let costEstimate: Double?
     let retryCount: Int
     let cacheHit: Bool
-    let errorInfo: ErrorInfo?
+    let errorInfo: MemoryErrorInfo?
     let dependencies: [String]  // 依赖的其他 entry ID
 }
 
-struct TokenUsage: Codable, Sendable {
+struct MemoryTokenUsage: Codable, Sendable {
     let promptTokens: Int
     let completionTokens: Int
     let totalTokens: Int
     let cachedTokens: Int?
 }
 
-struct ErrorInfo: Codable, Sendable {
+struct MemoryErrorInfo: Codable, Sendable {
     let type: String
     let message: String
     let stackTrace: String?

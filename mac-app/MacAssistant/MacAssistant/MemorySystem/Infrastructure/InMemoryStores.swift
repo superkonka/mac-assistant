@@ -12,21 +12,21 @@ import Foundation
 actor InMemoryRawStore: RawMemoryStore {
     private var entries: [MemoryID: RawMemoryEntry] = [:]
     private var planIndex: [String: [MemoryID]] = [:]
-    private var subscribers: [AsyncStream<[RawMemoryEntry]>.Continuation] = []
+    private var subscribers: [UUID: AsyncStream<[RawMemoryEntry]>.Continuation] = [:]
     
     func append(_ entry: RawMemoryEntry) async throws {
         entries[entry.id] = entry
         planIndex[entry.planId, default: []].append(entry.id)
         
         // 通知订阅者
-        for continuation in subscribers {
+        for (_, continuation) in subscribers {
             continuation.yield([entry])
         }
     }
     
     func appendBatch(_ entries: [RawMemoryEntry]) async throws {
         for entry in entries {
-            await self.append(entry)
+            try await self.append(entry)
         }
     }
     
@@ -74,20 +74,19 @@ actor InMemoryRawStore: RawMemoryStore {
     
     func subscribe(batchSize: Int) -> AsyncStream<[RawMemoryEntry]> {
         AsyncStream { continuation in
-            subscribers.append(continuation)
+            let id = UUID()
+            subscribers[id] = continuation
             
             continuation.onTermination = { [weak self] _ in
                 Task {
-                    await self?.removeSubscriber(continuation)
+                    await self?.removeSubscriber(id: id)
                 }
             }
         }
     }
     
-    private func removeSubscriber(
-        _ continuation: AsyncStream<[RawMemoryEntry]>.Continuation
-    ) {
-        subscribers.removeAll { $0 === continuation }
+    private func removeSubscriber(id: UUID) {
+        subscribers.removeValue(forKey: id)
     }
     
     func purgeEntries(olderThan: Date) async throws {
