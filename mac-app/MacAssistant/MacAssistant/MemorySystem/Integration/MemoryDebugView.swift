@@ -113,7 +113,15 @@ struct StatsSection: View {
             HStack {
                 StatCard(title: "L0 Entries", value: viewModel.l0Count)
                 StatCard(title: "L1 Entries", value: viewModel.l1Count)
-                StatCard(title: "Distilled", value: viewModel.distilledCount)
+                StatCard(title: "L2 Entries", value: viewModel.l2Count)
+            }
+            
+            if MemoryFeatureFlags.enableL2Distill {
+                HStack {
+                    StatCard(title: "Concepts", value: viewModel.conceptCount)
+                    StatCard(title: "Relations", value: viewModel.relationCount)
+                    StatCard(title: "Patterns", value: viewModel.patternCount)
+                }
             }
             
             if viewModel.distillationStats.totalProcessed > 0 {
@@ -169,15 +177,38 @@ struct ActionsSection: View {
                     viewModel.refresh()
                 }
                 
-                Button("Trigger Distillation") {
-                    viewModel.triggerDistillation()
+                if MemoryFeatureFlags.enableL1Filter {
+                    Button("L1 Distill") {
+                        viewModel.triggerDistillation()
+                    }
                 }
-                .disabled(!MemoryFeatureFlags.enableL1Filter)
                 
-                Button("Clear Memory") {
+                if MemoryFeatureFlags.enableL2Distill {
+                    Button("L2 Distill") {
+                        viewModel.triggerL2Distillation()
+                    }
+                }
+                
+                Button("Clear") {
                     viewModel.clearMemory()
                 }
                 .foregroundColor(.red)
+            }
+            
+            if MemoryFeatureFlags.enableL2Distill {
+                HStack {
+                    Button("Build Context") {
+                        viewModel.buildContext()
+                    }
+                    
+                    Button("Search") {
+                        viewModel.semanticSearch()
+                    }
+                    
+                    Button("Graph Query") {
+                        viewModel.queryGraph()
+                    }
+                }
             }
             
             if viewModel.isProcessing {
@@ -200,7 +231,10 @@ struct ActionsSection: View {
 class MemoryDebugViewModel: ObservableObject {
     @Published var l0Count: UInt64 = 0
     @Published var l1Count: UInt64 = 0
-    @Published var distilledCount: UInt64 = 0
+    @Published var l2Count: UInt64 = 0
+    @Published var conceptCount: UInt64 = 0
+    @Published var relationCount: UInt64 = 0
+    @Published var patternCount: UInt64 = 0
     @Published var distillationStats = DistillationStats()
     @Published var isProcessing = false
     @Published var statusMessage: String?
@@ -210,22 +244,91 @@ class MemoryDebugViewModel: ObservableObject {
             // 获取统计
             distillationStats = await MemoryCoordinator.shared.getDistillationStats()
             
-            // 获取存储统计（需要添加方法到 store）
-            // l0Count = await (MemoryCoordinator.shared.l0Store as? InMemoryRawStore)?.entryCount() ?? 0
+            // 获取 L2 统计
+            if let context = try? await MemoryCoordinator.shared.buildContext() {
+                conceptCount = UInt64(context.cognition.concepts.count)
+                patternCount = UInt64(context.cognition.insights.count)
+            }
             
-            statusMessage = "Last updated: \(Date().formatted(date: .omitted, time: .standard))"
+            statusMessage = "Updated: \(Date().formatted(date: .omitted, time: .standard))"
         }
     }
     
     func triggerDistillation() {
         Task {
             isProcessing = true
-            statusMessage = "Running distillation..."
+            statusMessage = "Running L1 distillation..."
             
             do {
                 let count = try await MemoryCoordinator.shared.triggerFullDistillation(planId: nil)
-                statusMessage = "Distilled \(count) entries"
+                statusMessage = "L1 distilled \(count) entries"
                 refresh()
+            } catch {
+                statusMessage = "Error: \(error.localizedDescription)"
+            }
+            
+            isProcessing = false
+        }
+    }
+    
+    func triggerL2Distillation() {
+        Task {
+            isProcessing = true
+            statusMessage = "Running L2 distillation..."
+            
+            // 触发 Plan 结束时的 L2 处理
+            do {
+                try await MemoryCoordinator.shared.finalizePlan(planId: "test-plan")
+                statusMessage = "L2 distillation complete"
+                refresh()
+            } catch {
+                statusMessage = "Error: \(error.localizedDescription)"
+            }
+            
+            isProcessing = false
+        }
+    }
+    
+    func buildContext() {
+        Task {
+            isProcessing = true
+            statusMessage = "Building context..."
+            
+            do {
+                let context = try await MemoryCoordinator.shared.buildContext()
+                statusMessage = "Context: \(context?.tokenEstimate ?? 0) tokens, \(context?.cognition.concepts.count ?? 0) concepts"
+            } catch {
+                statusMessage = "Error: \(error.localizedDescription)"
+            }
+            
+            isProcessing = false
+        }
+    }
+    
+    func semanticSearch() {
+        Task {
+            isProcessing = true
+            statusMessage = "Searching..."
+            
+            do {
+                let results = try await MemoryCoordinator.shared.semanticSearch(query: "test", limit: 5)
+                statusMessage = "Found \(results.count) results"
+            } catch {
+                statusMessage = "Error: \(error.localizedDescription)"
+            }
+            
+            isProcessing = false
+        }
+    }
+    
+    func queryGraph() {
+        Task {
+            isProcessing = true
+            statusMessage = "Querying graph..."
+            
+            do {
+                let results = try await MemoryCoordinator.shared.queryKnowledgeGraph(conceptName: "test")
+                statusMessage = "Found \(results.count) graph nodes"
             } catch {
                 statusMessage = "Error: \(error.localizedDescription)"
             }
@@ -236,10 +339,8 @@ class MemoryDebugViewModel: ObservableObject {
     
     func clearMemory() {
         Task {
-            // 清理内存存储
-            // await (MemoryCoordinator.shared.l0Store as? InMemoryRawStore)?.clearAll()
+            statusMessage = "Memory cleared (mock)"
             refresh()
-            statusMessage = "Memory cleared"
         }
     }
 }
