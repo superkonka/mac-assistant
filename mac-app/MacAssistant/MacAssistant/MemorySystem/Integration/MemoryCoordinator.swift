@@ -26,15 +26,31 @@ actor MemoryCoordinator: MemoryCoordinating {
     private var planContexts: [String: PlanMemoryContext] = [:]
     private var isInitialized = false
     
+    // Phase 2: Distillation
+    private var distillationWorker: DistillationWorker?
+    
     // MARK: - Initialization
     
     init() {
         // 使用内存存储作为默认实现（快速启动）
-        self.l0Store = InMemoryRawStore()
-        self.l1Store = InMemoryFilteredStore()
+        let l0 = InMemoryRawStore()
+        let l1 = InMemoryFilteredStore()
+        self.l0Store = l0
+        self.l1Store = l1
         self.l2Store = InMemoryDistilledStore()
         
-        LogInfo("[MemoryCoordinator] Initialized with in-memory stores")
+        // Phase 2: 初始化蒸馏 Worker
+        if MemoryFeatureFlags.enableL1Filter {
+            self.distillationWorker = DistillationWorker(
+                l0Store: l0,
+                l1Store: l1
+            )
+            Task {
+                await self.distillationWorker?.start()
+            }
+        }
+        
+        LogInfo("[MemoryCoordinator] Initialized with in-memory stores (L1 enabled: \(MemoryFeatureFlags.enableL1Filter))")
     }
     
     /// 使用指定后端初始化
@@ -85,10 +101,10 @@ actor MemoryCoordinator: MemoryCoordinating {
         
         LogDebug("[MemoryCoordinator] Stored L0 entry: \(entry.id)")
         
-        // 如果 L1 启用，触发异步蒸馏
+        // Phase 2: 如果 L1 启用且是实时模式，触发蒸馏
         if MemoryFeatureFlags.enableL1Filter && MemoryFeatureFlags.asyncDistillation {
             Task {
-                await triggerL1Distillation(for: entry)
+                await distillEntryRealtime(entry)
             }
         }
     }
@@ -369,10 +385,52 @@ actor MemoryCoordinator: MemoryCoordinating {
     
     // MARK: - Private Methods
     
-    private func triggerL1Distillation(for entry: RawMemoryEntry) async {
-        // 简化的 L1 蒸馏逻辑
-        // 实际实现应调用 L1DistillationEngine
-        LogDebug("[MemoryCoordinator] Would trigger L1 distillation for: \(entry.id)")
+    /// Phase 2: 实时蒸馏单个条目
+    private func distillEntryRealtime(_ entry: RawMemoryEntry) async {
+        guard let worker = distillationWorker else { return }
+        
+        do {
+            if let distilled = try await worker.distillRealtime(entry) {
+                LogDebug("[MemoryCoordinator] Realtime distilled L1 entry: \(distilled.id)")
+            }
+        } catch {
+            LogError("[MemoryCoordinator] Realtime distillation failed: \(error)")
+        }
+    }
+    
+    // MARK: - Phase 2 Public API
+    
+    /// 获取蒸馏统计
+    func getDistillationStats() async -> DistillationStats {
+        await distillationWorker?.getStats() ?? DistillationStats()
+    }
+    
+    /// 手动触发全量蒸馏
+    func triggerFullDistillation(planId: String?) async throws -> Int {
+        guard let worker = distillationWorker else {
+            throw MemoryError.distillationNotEnabled
+        }
+        return try await worker.triggerFullDistillation(planId: planId)
+    }
+    
+    /// 启动/停止蒸馏 Worker
+    func setDistillationEnabled(_ enabled: Bool) async {
+        if enabled {
+            if distillationWorker == nil {
+                distillationWorker = DistillationWorker(
+                    l0Store: l0Store,
+                    l1Store: l1Store
+                )
+            }
+            await distillationWorker?.start()
+        } else {
+            await distillationWorker?.stop()
+        }
+    }
+    
+    enum MemoryError: Error {
+        case distillationNotEnabled
+        case retrievalFailed(String)
     }
     
     private func triggerFinalL2Distillation(planId: String) async throws {

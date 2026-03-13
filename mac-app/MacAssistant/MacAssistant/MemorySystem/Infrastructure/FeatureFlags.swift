@@ -21,15 +21,15 @@ struct MemoryFeatureFlags {
     
     // MARK: - Phase Control
     
-    static var currentPhase: MemoryPhase = .l0Storage
+    static var currentPhase: MemoryPhase = .l1Filter  // Phase 2
     
     // MARK: - Feature Switches
     
     /// L0: 原始数据存储
     static var enableL0Storage: Bool = true
     
-    /// L1: 信息过滤层
-    static var enableL1Filter: Bool = false
+    /// L1: 信息过滤层 (Phase 2)
+    static var enableL1Filter: Bool = true  // 开启 Phase 2
     
     /// L2: 认知蒸馏层
     static var enableL2Distill: Bool = false
