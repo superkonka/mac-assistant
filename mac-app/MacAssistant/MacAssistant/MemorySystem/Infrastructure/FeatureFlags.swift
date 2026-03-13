@@ -21,7 +21,7 @@ struct MemoryFeatureFlags {
     
     // MARK: - Phase Control
     
-    static var currentPhase: MemoryPhase = .retrieval  // Phase 2
+    static var currentPhase: MemoryPhase = .integration  // Phase 2
     
     // MARK: - Feature Switches
     

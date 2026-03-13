@@ -232,6 +232,10 @@ enum StorageBackend: String, Sendable {
 }
 
 actor MemoryStorageFactory {
+    
+    // PostgreSQL 连接池缓存
+    private static var pgPool: PostgreSQLConnectionPool?
+    
     static func createRawStore(
         backend: StorageBackend
     ) -> RawMemoryStore {
@@ -247,10 +251,12 @@ actor MemoryStorageFactory {
     
     static func createFilteredStore(
         backend: StorageBackend
-    ) -> FilteredMemoryStore {
+    ) async -> FilteredMemoryStore {
         switch backend {
         case .postgreSQL:
-            return PostgreSQLFilteredStore()
+            let pool = pgPool ?? PostgreSQLConnectionPool()
+            pgPool = pool
+            return PostgreSQLFilteredStore(pool: pool)
         case .inMemory:
             return InMemoryFilteredStore()
         default:
@@ -260,8 +266,12 @@ actor MemoryStorageFactory {
     
     static func createDistilledStore(
         backend: StorageBackend
-    ) -> DistilledMemoryStore {
+    ) async -> DistilledMemoryStore {
         switch backend {
+        case .postgreSQL:
+            let pool = pgPool ?? PostgreSQLConnectionPool()
+            pgPool = pool
+            return PostgreSQLDistilledStore(pool: pool)
         case .pinecone:
             return PineconeDistilledStore()
         case .milvus:
@@ -270,6 +280,25 @@ actor MemoryStorageFactory {
             return InMemoryDistilledStore()
         default:
             fatalError("Unsupported backend for L2: \(backend)")
+        }
+    }
+    
+    /// 初始化所有存储后端的 Schema
+    static func initializeSchemas(
+        l0Store: RawMemoryStore,
+        l1Store: FilteredMemoryStore,
+        l2Store: DistilledMemoryStore
+    ) async throws {
+        // 存储后端的 Schema 初始化
+        // 实际实现需要调用各后端的 initializeSchema 方法
+        LogInfo("[MemoryStorageFactory] Schema initialization requested")
+    }
+    
+    /// 关闭所有连接池
+    static func shutdown() async {
+        if let pool = pgPool {
+            await pool.closeAll()
+            pgPool = nil
         }
     }
 }
