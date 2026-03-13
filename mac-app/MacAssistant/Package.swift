@@ -24,6 +24,8 @@ let package = Package(
                 "AgentSystem",
                 "Analytics/ConversationAnalyzer.swift",
                 "Analytics/ConversationAnalyzerView.swift",
+                "MemorySystem/docs",
+                "MemorySystem/README.md",
             ],
             sources: [
                 "MacAssistantApp.swift",

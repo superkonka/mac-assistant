@@ -218,7 +218,7 @@ final class L1DistillationTests: XCTestCase {
                 costEstimate: nil,
                 retryCount: hasError ? 1 : 0,
                 cacheHit: false,
-                errorInfo: hasError ? MemoryErrorInfo(type: "TestError", message: "Test", stackTrace: nil) : nil,
+                errorInfo: hasError ? MemoryErrorInfo(type: "TestError", message: "Test", stackTrace: nil, recoverable: true) : nil,
                 dependencies: []
             ),
             parentEntryId: nil,
