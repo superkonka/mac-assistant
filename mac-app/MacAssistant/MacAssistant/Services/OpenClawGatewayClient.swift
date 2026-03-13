@@ -49,6 +49,7 @@ actor OpenClawGatewayClient {
         agent: Agent,
         sessionKey: String,
         sessionLabel: String? = nil,
+        requestID: String,
         text: String,
         images: [String],
         onAssistantText: (@Sendable (String) async -> Void)? = nil
@@ -64,7 +65,7 @@ actor OpenClawGatewayClient {
 
         let resolvedSessionKey = Self.canonicalSessionKey(sessionKey)
 
-        try await self.patchSession(
+        let patchedSession = try await self.patchSession(
             key: resolvedSessionKey,
             modelRef: modelRef,
             label: sessionLabel
@@ -74,10 +75,12 @@ actor OpenClawGatewayClient {
         let prompt = self.normalizedPrompt(text, hasImages: !attachments.isEmpty)
         let startCursor = self.nextPushOrdinal
         let requestStartedAtMs = Date().timeIntervalSince1970 * 1000
+        let allowRelaxedHistoryRecovery = agent.provider != .ollama
         let response = try await self.chatSend(
             sessionKey: resolvedSessionKey,
             message: prompt,
-            attachments: attachments
+            attachments: attachments,
+            requestID: requestID
         )
 
         var latestAssistantText = ""
@@ -85,13 +88,17 @@ actor OpenClawGatewayClient {
         var lastForwardedAssistantText = ""
         var lastForwardedAssistantTextAt = Date.distantPast
         var lastHistoryRecoveryAt = Date.distantPast
-        var knownSessionID = await self.currentSessionID(for: resolvedSessionKey)
+        var knownSessionID = patchedSession.sessionID
+        if knownSessionID == nil {
+            knownSessionID = await self.currentSessionID(for: resolvedSessionKey)
+        }
         var cursor = startCursor
         let deadline = Date().addingTimeInterval(180)
 
         LogDebug(
             "OpenClaw send start agent=\(agent.id) sessionKey=\(resolvedSessionKey) " +
-            "chatRunID=\(response.runId) sessionID=\(knownSessionID ?? "unknown")"
+            "chatRunID=\(response.runId) sessionID=\(knownSessionID ?? "unknown") " +
+            "requestID=\(requestID)"
         )
 
         while Date() < deadline {
@@ -99,45 +106,71 @@ actor OpenClawGatewayClient {
             cursor = batch.nextCursor
 
             if batch.items.isEmpty {
-                if Date().timeIntervalSince(lastHistoryRecoveryAt) >= 3 {
-                    lastHistoryRecoveryAt = Date()
+                let now = Date()
+                let requestAge = (now.timeIntervalSince1970 * 1000 - requestStartedAtMs) / 1000
+                let assistantQuietInterval = lastAssistantUpdateAt.map { now.timeIntervalSince($0) } ?? .infinity
+                let shouldAllowRelaxedIdleRecovery = allowRelaxedHistoryRecovery &&
+                    (assistantQuietInterval >= 2 || requestAge >= 5)
+
+                if now.timeIntervalSince(lastHistoryRecoveryAt) >= 3 {
+                    lastHistoryRecoveryAt = now
                     if let recovery = await self.recoverAssistantText(
                         sessionKey: resolvedSessionKey,
                         requestStartedAtMs: requestStartedAtMs,
                         latestAssistantText: latestAssistantText,
-                        requireCompletedHistory: true
+                        requireCompletedHistory: !shouldAllowRelaxedIdleRecovery
                     ) {
                         knownSessionID = recovery.sessionID ?? knownSessionID
                         LogInfo(
                             "OpenClaw history recovery succeeded during idle wait " +
-                            "agent=\(agent.id) sessionKey=\(resolvedSessionKey)"
+                            "agent=\(agent.id) sessionKey=\(resolvedSessionKey) " +
+                            "requireCompletedHistory=\(!shouldAllowRelaxedIdleRecovery)"
                         )
-                        return recovery.text
+                        return await self.finalizeAssistantResponse(
+                            sessionKey: resolvedSessionKey,
+                            sessionID: knownSessionID,
+                            prompt: prompt,
+                            assistantText: recovery.text,
+                            requestStartedAtMs: requestStartedAtMs
+                        )
                     }
                 }
 
                 if let lastAssistantUpdateAt,
                    let currentAssistantText = self.normalizedNonEmptyText(latestAssistantText),
-                   Date().timeIntervalSince(lastAssistantUpdateAt) >= 2 {
+                   now.timeIntervalSince(lastAssistantUpdateAt) >= 2 {
                     if let recovery = await self.recoverAssistantText(
                         sessionKey: resolvedSessionKey,
                         requestStartedAtMs: requestStartedAtMs,
                         latestAssistantText: latestAssistantText,
-                        requireCompletedHistory: true
+                        requireCompletedHistory: !allowRelaxedHistoryRecovery
                     ) {
                         knownSessionID = recovery.sessionID ?? knownSessionID
                         LogInfo(
                             "OpenClaw finalized from trailing assistant stream " +
-                            "agent=\(agent.id) sessionKey=\(resolvedSessionKey)"
+                            "agent=\(agent.id) sessionKey=\(resolvedSessionKey) " +
+                            "requireCompletedHistory=\(!allowRelaxedHistoryRecovery)"
                         )
-                        return recovery.text
+                        return await self.finalizeAssistantResponse(
+                            sessionKey: resolvedSessionKey,
+                            sessionID: knownSessionID,
+                            prompt: prompt,
+                            assistantText: recovery.text,
+                            requestStartedAtMs: requestStartedAtMs
+                        )
                     }
 
                     LogInfo(
                         "OpenClaw returning buffered assistant text after quiet period " +
                         "agent=\(agent.id) sessionKey=\(resolvedSessionKey)"
                     )
-                    return currentAssistantText
+                    return await self.finalizeAssistantResponse(
+                        sessionKey: resolvedSessionKey,
+                        sessionID: knownSessionID,
+                        prompt: prompt,
+                        assistantText: currentAssistantText,
+                        requestStartedAtMs: requestStartedAtMs
+                    )
                 }
 
                 try await Task.sleep(nanoseconds: 300_000_000)
@@ -225,7 +258,13 @@ actor OpenClawGatewayClient {
                                 "OpenClaw chat.final received agent=\(agent.id) " +
                                 "sessionKey=\(resolvedSessionKey) source=\(finalSource)"
                             )
-                            return resolvedFinalText
+                            return await self.finalizeAssistantResponse(
+                                sessionKey: resolvedSessionKey,
+                                sessionID: knownSessionID,
+                                prompt: prompt,
+                                assistantText: resolvedFinalText,
+                                requestStartedAtMs: requestStartedAtMs
+                            )
 
                         case "error":
                             throw NSError(
@@ -279,7 +318,13 @@ actor OpenClawGatewayClient {
                 "OpenClaw recovered after deadline from history/buffer " +
                 "agent=\(agent.id) sessionKey=\(resolvedSessionKey)"
             )
-            return recovery.text
+            return await self.finalizeAssistantResponse(
+                sessionKey: resolvedSessionKey,
+                sessionID: knownSessionID,
+                prompt: prompt,
+                assistantText: recovery.text,
+                requestStartedAtMs: requestStartedAtMs
+            )
         }
 
         LogError(
@@ -311,11 +356,27 @@ actor OpenClawGatewayClient {
         )
     }
 
+    func injectAssistantMessage(
+        sessionKey: String,
+        message: String,
+        label: String? = nil
+    ) async throws {
+        let normalizedMessage = self.normalizedPrompt(message, hasImages: false)
+        try await self.chatInject(
+            sessionKey: Self.canonicalSessionKey(sessionKey),
+            message: normalizedMessage,
+            label: label
+        )
+        Task {
+            await MemoryRecallCoordinator.shared.noteTranscriptMutation(reason: "chat.inject")
+        }
+    }
+
     private func patchSession(
         key: String,
         modelRef: String,
         label: String? = nil
-    ) async throws {
+    ) async throws -> OpenClawPatchedSession {
         var params: [String: AnyCodable] = [
             "key": AnyCodable(key),
             "model": AnyCodable(modelRef),
@@ -326,7 +387,8 @@ actor OpenClawGatewayClient {
         }
 
         do {
-            _ = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+            let data = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+            return try self.decodePatchedSession(from: data)
         } catch let error as GatewayResponseError {
             guard error.code == "INVALID_REQUEST",
                   error.message.localizedCaseInsensitiveContains("label already in use"),
@@ -345,8 +407,14 @@ actor OpenClawGatewayClient {
                 "sessionKey=\(key) originalLabel=\(normalizedLabel) fallbackLabel=\(fallbackLabel)"
             )
             params["label"] = AnyCodable(fallbackLabel)
-            _ = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+            let data = try await self.request(method: "sessions.patch", params: params, timeoutMs: 15000)
+            return try self.decodePatchedSession(from: data)
         }
+    }
+
+    private func decodePatchedSession(from data: Data) throws -> OpenClawPatchedSession {
+        let payload = try self.decoder.decode(OpenClawSessionPatchResponse.self, from: data)
+        return OpenClawPatchedSession(sessionID: self.normalizedSessionID(payload.entry?.sessionId))
     }
 
     private func chatHistory(sessionKey: String) async throws -> OpenClawChatHistoryPayload {
@@ -361,9 +429,11 @@ actor OpenClawGatewayClient {
     private func chatSend(
         sessionKey: String,
         message: String,
-        attachments: [OpenClawChatAttachmentPayload]
+        attachments: [OpenClawChatAttachmentPayload],
+        requestID: String
     ) async throws -> OpenClawChatSendResponse {
         let idempotencyKey = self.deterministicIdempotencyKey(
+            requestID: requestID,
             sessionKey: sessionKey,
             message: message,
             attachments: attachments
@@ -391,7 +461,26 @@ actor OpenClawGatewayClient {
         return try self.decoder.decode(OpenClawChatSendResponse.self, from: data)
     }
 
+    private func chatInject(
+        sessionKey: String,
+        message: String,
+        label: String?
+    ) async throws {
+        var params: [String: AnyCodable] = [
+            "sessionKey": AnyCodable(sessionKey),
+            "message": AnyCodable(message),
+        ]
+
+        let normalizedLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedLabel, !normalizedLabel.isEmpty {
+            params["label"] = AnyCodable(normalizedLabel)
+        }
+
+        _ = try await self.request(method: "chat.inject", params: params, timeoutMs: 15000)
+    }
+
     private func deterministicIdempotencyKey(
+        requestID: String,
         sessionKey: String,
         message: String,
         attachments: [OpenClawChatAttachmentPayload]
@@ -399,7 +488,8 @@ actor OpenClawGatewayClient {
         let attachmentFingerprint = attachments
             .map { "\($0.fileName)|\($0.mimeType)|\($0.content.prefix(64))" }
             .joined(separator: "||")
-        let payload = "\(sessionKey)\n\(message)\n\(attachmentFingerprint)"
+        let normalizedRequestID = requestID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let payload = "\(normalizedRequestID)\n\(sessionKey)\n\(message)\n\(attachmentFingerprint)"
         let digest = SHA256.hash(data: Data(payload.utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return "macassistant-\(hex)"
@@ -459,11 +549,37 @@ actor OpenClawGatewayClient {
         from history: OpenClawChatHistoryPayload,
         newerThan minimumTimestamp: Double? = nil
     ) -> OpenClawChatMessage? {
+        self.latestChatMessage(
+            role: "assistant",
+            from: history,
+            newerThan: minimumTimestamp,
+            requireTextContent: true
+        )
+    }
+
+    private func latestUserMessage(
+        from history: OpenClawChatHistoryPayload,
+        newerThan minimumTimestamp: Double? = nil
+    ) -> OpenClawChatMessage? {
+        self.latestChatMessage(
+            role: "user",
+            from: history,
+            newerThan: minimumTimestamp,
+            requireTextContent: false
+        )
+    }
+
+    private func latestChatMessage(
+        role: String,
+        from history: OpenClawChatHistoryPayload,
+        newerThan minimumTimestamp: Double? = nil,
+        requireTextContent: Bool
+    ) -> OpenClawChatMessage? {
         let messages = (history.messages ?? []).compactMap { payload in
             try? self.decodePayload(payload, as: OpenClawChatMessage.self)
         }
 
-        for message in messages.reversed() where message.role.lowercased() == "assistant" {
+        for message in messages.reversed() where message.role.lowercased() == role {
             if let minimumTimestamp {
                 guard let messageTimestamp = message.timestamp,
                       messageTimestamp >= minimumTimestamp else {
@@ -471,7 +587,7 @@ actor OpenClawGatewayClient {
                 }
             }
 
-            if self.normalizedAssistantText(from: message) != nil {
+            if !requireTextContent || self.normalizedAssistantText(from: message) != nil {
                 return message
             }
         }
@@ -574,6 +690,275 @@ actor OpenClawGatewayClient {
             return nil
         }
         return self.normalizedSessionID(history.sessionId)
+    }
+
+    private func finalizeAssistantResponse(
+        sessionKey: String,
+        sessionID: String?,
+        prompt: String,
+        assistantText: String,
+        requestStartedAtMs: Double
+    ) async -> String {
+        await self.ensureTranscriptContainsTurn(
+            sessionKey: sessionKey,
+            sessionID: sessionID,
+            prompt: prompt,
+            assistantText: assistantText,
+            requestStartedAtMs: requestStartedAtMs
+        )
+        Task {
+            await MemoryRecallCoordinator.shared.noteTranscriptMutation(reason: "chat.finalize")
+        }
+        return assistantText
+    }
+
+    private func ensureTranscriptContainsTurn(
+        sessionKey: String,
+        sessionID: String?,
+        prompt: String,
+        assistantText: String,
+        requestStartedAtMs: Double
+    ) async {
+        guard let normalizedPrompt = self.normalizedNonEmptyText(prompt),
+              let normalizedAssistant = self.normalizedNonEmptyText(assistantText) else {
+            return
+        }
+
+        let historyBeforeRepair = try? await self.chatHistory(sessionKey: sessionKey)
+        if let historyBeforeRepair,
+           self.latestAssistantMessage(from: historyBeforeRepair, newerThan: requestStartedAtMs) != nil {
+            return
+        }
+
+        var injectedAssistant = false
+        do {
+            try await self.chatInject(
+                sessionKey: sessionKey,
+                message: normalizedAssistant,
+                label: "Gateway Recovery"
+            )
+            injectedAssistant = true
+        } catch {
+            LogWarning(
+                "OpenClaw transcript assistant inject failed " +
+                "sessionKey=\(sessionKey) error=\(error.localizedDescription)"
+            )
+        }
+
+        let historyAfterInject = try? await self.chatHistory(sessionKey: sessionKey)
+        let assistantPresent = injectedAssistant || historyAfterInject
+            .flatMap { self.latestAssistantMessage(from: $0, newerThan: requestStartedAtMs) } != nil
+        let userPresent = historyAfterInject
+            .flatMap { self.latestUserMessage(from: $0, newerThan: requestStartedAtMs) } != nil
+
+        if assistantPresent && userPresent {
+            return
+        }
+
+        var resolvedSessionID = self.normalizedSessionID(sessionID)
+        if resolvedSessionID == nil {
+            resolvedSessionID = self.normalizedSessionID(historyAfterInject?.sessionId)
+        }
+        if resolvedSessionID == nil {
+            resolvedSessionID = await self.currentSessionID(for: sessionKey)
+        }
+        guard let resolvedSessionID else {
+            return
+        }
+
+        do {
+            try await self.backfillTranscriptTurn(
+                sessionKey: sessionKey,
+                sessionID: resolvedSessionID,
+                prompt: normalizedPrompt,
+                assistantText: normalizedAssistant,
+                requestStartedAtMs: requestStartedAtMs,
+                includeUser: !userPresent,
+                includeAssistant: !assistantPresent
+            )
+            LogWarning(
+                "OpenClaw transcript repaired after incomplete history " +
+                "sessionKey=\(sessionKey) sessionID=\(resolvedSessionID) " +
+                "missingUser=\(!userPresent) missingAssistant=\(!assistantPresent)"
+            )
+            Task {
+                await MemoryRecallCoordinator.shared.noteTranscriptMutation(reason: "chat.repair")
+            }
+        } catch {
+            LogWarning(
+                "OpenClaw transcript repair failed " +
+                "sessionKey=\(sessionKey) sessionID=\(resolvedSessionID) " +
+                "error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func backfillTranscriptTurn(
+        sessionKey: String,
+        sessionID: String,
+        prompt: String,
+        assistantText: String,
+        requestStartedAtMs: Double,
+        includeUser: Bool,
+        includeAssistant: Bool
+    ) async throws {
+        guard includeUser || includeAssistant else {
+            return
+        }
+
+        let transcriptURL = try await self.transcriptURL(for: sessionKey, sessionID: sessionID)
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: transcriptURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        if !fileManager.fileExists(atPath: transcriptURL.path) {
+            let created = fileManager.createFile(
+                atPath: transcriptURL.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            )
+            guard created else {
+                throw NSError(
+                    domain: "OpenClawGatewayClient",
+                    code: 7,
+                    userInfo: [NSLocalizedDescriptionKey: "无法创建 OpenClaw transcript 文件。"]
+                )
+            }
+
+            let header = await self.sessionHeaderRecord(
+                sessionID: sessionID,
+                timestampMs: requestStartedAtMs
+            )
+            try self.appendTranscriptLine(header, to: transcriptURL)
+        }
+
+        var parentID = try self.lastTranscriptRecordID(at: transcriptURL)
+        var userRecordID: String?
+
+        if includeUser {
+            let appendedUserRecordID = Self.transcriptRecordID()
+            try self.appendTranscriptLine(
+                self.transcriptMessageRecord(
+                    recordID: appendedUserRecordID,
+                    parentID: parentID,
+                    role: "user",
+                    text: prompt,
+                    timestampMs: requestStartedAtMs
+                ),
+                to: transcriptURL
+            )
+            userRecordID = appendedUserRecordID
+            parentID = appendedUserRecordID
+        }
+
+        if includeAssistant {
+            try self.appendTranscriptLine(
+                self.transcriptMessageRecord(
+                    recordID: Self.transcriptRecordID(),
+                    parentID: userRecordID ?? parentID,
+                    role: "assistant",
+                    text: assistantText,
+                    timestampMs: requestStartedAtMs,
+                    isGatewayBackfill: true
+                ),
+                to: transcriptURL
+            )
+        }
+    }
+
+    private func transcriptURL(for sessionKey: String, sessionID: String) async throws -> URL {
+        let canonicalSessionKey = Self.canonicalSessionKey(sessionKey)
+        let components = canonicalSessionKey.split(separator: ":")
+        let agentID = components.count >= 2 ? String(components[1]) : Self.gatewayAgentID
+        let profileDirectory = await self.runtimeManager.profileDirectory()
+        return profileDirectory
+            .appendingPathComponent("agents", isDirectory: true)
+            .appendingPathComponent(agentID, isDirectory: true)
+            .appendingPathComponent("sessions", isDirectory: true)
+            .appendingPathComponent("\(sessionID).jsonl", isDirectory: false)
+    }
+
+    private func sessionHeaderRecord(sessionID: String, timestampMs: Double) async -> [String: Any] {
+        let workspaceDirectory = await self.runtimeManager.workspaceDirectory()
+        return [
+            "type": "session",
+            "version": 3,
+            "id": sessionID,
+            "timestamp": Self.isoTimestamp(fromMilliseconds: timestampMs),
+            "cwd": workspaceDirectory.path,
+        ]
+    }
+
+    private func transcriptMessageRecord(
+        recordID: String,
+        parentID: String?,
+        role: String,
+        text: String,
+        timestampMs: Double,
+        isGatewayBackfill: Bool = false
+    ) -> [String: Any] {
+        var message: [String: Any] = [
+            "role": role,
+            "content": [["type": "text", "text": text]],
+            "timestamp": Int64(timestampMs.rounded()),
+        ]
+
+        if isGatewayBackfill {
+            message["api"] = "openai-responses"
+            message["provider"] = "openclaw"
+            message["model"] = "gateway-backfill"
+            message["stopReason"] = "stop"
+            message["usage"] = [
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 0,
+                "cost": [
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0,
+                ],
+            ]
+        }
+
+        var record: [String: Any] = [
+            "type": "message",
+            "id": recordID,
+            "timestamp": Self.isoTimestamp(fromMilliseconds: timestampMs),
+            "message": message,
+        ]
+        if let parentID {
+            record["parentId"] = parentID
+        }
+        return record
+    }
+
+    private func appendTranscriptLine(_ object: [String: Any], to url: URL) throws {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        handle.write(data)
+        handle.write(Data([0x0A]))
+    }
+
+    private func lastTranscriptRecordID(at url: URL) throws -> String? {
+        let raw = try String(contentsOf: url, encoding: .utf8)
+        for line in raw.split(whereSeparator: \.isNewline).reversed() {
+            guard let data = line.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let recordID = object["id"] as? String,
+                  !recordID.isEmpty else {
+                continue
+            }
+            return recordID
+        }
+        return nil
     }
 
     private func matchesAgentRunID(_ agentRunID: String, chatRunID: String, sessionID: String?) -> Bool {
@@ -768,6 +1153,19 @@ actor OpenClawGatewayClient {
         let suffix = String(alphanumerics.suffix(12))
         return suffix.isEmpty ? "SESSION" : suffix
     }
+
+    nonisolated private static func transcriptRecordID() -> String {
+        String(
+            UUID().uuidString
+                .replacingOccurrences(of: "-", with: "")
+                .lowercased()
+                .prefix(8)
+        )
+    }
+
+    nonisolated private static func isoTimestamp(fromMilliseconds milliseconds: Double) -> String {
+        ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: milliseconds / 1000))
+    }
 }
 
 struct OpenClawSkillsStatusReport: Codable {
@@ -785,6 +1183,18 @@ struct OpenClawRecoveredOutput {
     let text: String
     let sessionID: String?
     let source: Source
+}
+
+struct OpenClawPatchedSession {
+    let sessionID: String?
+}
+
+struct OpenClawSessionPatchResponse: Codable {
+    let entry: OpenClawSessionPatchEntry?
+}
+
+struct OpenClawSessionPatchEntry: Codable {
+    let sessionId: String?
 }
 
 struct OpenClawSkillStatus: Codable {

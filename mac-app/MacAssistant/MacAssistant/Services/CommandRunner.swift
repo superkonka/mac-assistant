@@ -46,13 +46,14 @@ class CommandRunner: ObservableObject {
     private let agentStore = AgentStore.shared
     private let orchestrator = AgentOrchestrator.shared
     private let creationSkill = AgentCreationSkill.shared
+    private let conversationControl = ConversationControlStore.shared
     private let skillRegistry = AISkillRegistry.shared
     private let toolSkillRegistry = SkillRegistry.shared
     private let skillEvolutionAdvisor = SkillEvolutionAdvisor.shared
-    private let gatewayClient = OpenClawGatewayClient.shared
+    private let memoryRecallCoordinator = MemoryRecallCoordinator.shared
+    private let runtimeAdapter: any ClawRuntimeAdapter
     private let localKimiCLIService = LocalKimiCLIService.shared
     private let requestPlanner = RequestPlanner.shared
-    private let resultCollector = ResultCollector.shared
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
@@ -75,7 +76,8 @@ class CommandRunner: ObservableObject {
     
     static let shared = CommandRunner()
     
-    init() {
+    init(runtimeAdapter: any ClawRuntimeAdapter = OpenClawRuntimeAdapter.shared) {
+        self.runtimeAdapter = runtimeAdapter
         restorePersistedState()
         setupNotifications()
         Task {
@@ -129,6 +131,7 @@ class CommandRunner: ObservableObject {
             RequestEnvelope(
                 originalText: text,
                 images: contextualImages,
+                sessionTopology: conversationControl.currentTopology(),
                 currentAgent: orchestrator.currentAgent,
                 needsInitialSetup: agentStore.needsInitialSetup,
                 lastMessage: messages.last,
@@ -137,25 +140,36 @@ class CommandRunner: ObservableObject {
                 activeWorkflowDesignContext: activeWorkflowDesignContext()
             )
         }
+        let request = AssembledConversationContext(
+            text: text,
+            images: contextualImages,
+            envelope: envelope
+        )
         let plan = await requestPlanner.plan(envelope)
+        await processPreparedRequest(request, plan: plan)
+    }
 
+    func processPreparedRequest(
+        _ request: AssembledConversationContext,
+        plan: RequestPlan
+    ) async {
         if !plan.shouldAppendUserMessage {
             logRequestPlan(plan)
-            await executeRequestPlan(plan, anchorMessageID: envelope.id)
+            await executeRequestPlan(plan, anchorMessageID: request.envelope.id)
             return
         }
 
         // 3. 记录用户输入和统一规划结果
-        logger.logUserInput(text, parsed: plan.parsedInput)
+        logger.logUserInput(request.text, parsed: plan.parsedInput)
         logRequestPlan(plan)
 
         // 4. 添加用户消息（显示原始输入）
         let userMessage = ChatMessage(
             id: UUID(),
             role: .user,
-            content: text,
+            content: request.text,
             timestamp: Date(),
-            images: contextualImages
+            images: request.images
         )
         let userMessageID = userMessage.id
         await MainActor.run {
@@ -312,14 +326,6 @@ class CommandRunner: ObservableObject {
         case .handleAgentSuggestion(let suggestion, let input):
             await handleAgentSuggestion(suggestion, input: input, images: plan.envelope.images)
 
-        case .routeParallelLinkResearch(let input):
-            await handleParallelLinkResearch(
-                input: input,
-                originalText: plan.envelope.originalText,
-                images: plan.envelope.images,
-                anchorMessageID: anchorMessageID
-            )
-
         case .routeMainConversation(let input):
             await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
         }
@@ -340,6 +346,9 @@ class CommandRunner: ObservableObject {
 
     private func presentProjectSkillOverview() async {
         let currentAgentName = orchestrator.currentAgent?.name
+        LogInfo(
+            "Presenting project skill overview currentAgent=\(currentAgentName ?? "none")"
+        )
         let content = await openClawSkillOverviewMessage()
         let message = ChatMessage(
             id: UUID(),
@@ -358,6 +367,9 @@ class CommandRunner: ObservableObject {
             messages.append(message)
             isProcessing = false
         }
+        LogInfo(
+            "Project skill overview appended currentAgent=\(currentAgentName ?? "none")"
+        )
     }
 
     private func projectSkillOverviewMessage() -> String {
@@ -388,13 +400,13 @@ class CommandRunner: ObservableObject {
         直接告诉我目标就行，例如：
         • “帮我审查这个 PR”
         • “打开 Safari”
-        • “查一下上海未来三天天气”
+        • “总结这个设计文档的核心结论”
         """
     }
 
     private func openClawSkillOverviewMessage() async -> String {
         do {
-            let report = try await gatewayClient.skillsStatus()
+            let report = try await fetchSkillsStatusForOverview(timeoutSeconds: 4)
             let eligibleSkills = report.skills.filter { $0.eligible && !$0.disabled }
             let unavailableSkills = report.skills.filter { !$0.eligible || $0.disabled }
             var sections: [String] = [
@@ -425,19 +437,53 @@ class CommandRunner: ObservableObject {
                 也可以直接说目标，我会自己选最合适的能力，比如：
                 • 帮我审查这个 PR
                 • 检查这台 Mac 的安全配置
-                • 查下上海未来三天天气
+                • 总结这份会议纪要
                 """
             )
             return sections.joined(separator: "\n\n")
         } catch {
+            LogWarning(
+                "OpenClaw skills overview fallback triggered error=\(error.localizedDescription)"
+            )
             return projectSkillOverviewMessage()
+        }
+    }
+
+    private func fetchSkillsStatusForOverview(timeoutSeconds: Double) async throws -> OpenClawSkillsStatusReport {
+        let runtimeAdapter = self.runtimeAdapter
+        return try await withThrowingTaskGroup(of: OpenClawSkillsStatusReport.self) { group in
+            group.addTask {
+                try await runtimeAdapter.skillsStatus()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 0) * 1_000_000_000))
+                throw NSError(
+                    domain: "CommandRunner",
+                    code: 18,
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "skills.status timed out after \(Int(timeoutSeconds))s"
+                    ]
+                )
+            }
+
+            guard let result = try await group.next() else {
+                group.cancelAll()
+                throw NSError(
+                    domain: "CommandRunner",
+                    code: 19,
+                    userInfo: [NSLocalizedDescriptionKey: "skills.status returned no result"]
+                )
+            }
+
+            group.cancelAll()
+            return result
         }
     }
 
     private func builtInSkillAudienceSummary() -> String {
         let availableSkills = skillRegistry.skills.filter(skillRegistry.isAvailable)
         let grouped = Dictionary(grouping: availableSkills, by: builtInSkillAudienceGroupTitle(for:))
-        let orderedTitles = ["视觉与截图", "文本与代码", "联网与检索"]
+        let orderedTitles = ["视觉与截图", "文本与代码"]
 
         let lines = orderedTitles.compactMap { title -> String? in
             guard let skills = grouped[title], !skills.isEmpty else { return nil }
@@ -462,8 +508,6 @@ class CommandRunner: ObservableObject {
             return "视觉与截图"
         case .codeReview, .explainSelection, .translateText, .summarizeText:
             return "文本与代码"
-        case .webSearch:
-            return "联网与检索"
         }
     }
 
@@ -509,9 +553,7 @@ class CommandRunner: ObservableObject {
         • 主 Planner：\(preferences.plannerPrimaryStrategy.displayName)
         • Planner Agent：\(preferredPlannerAgentName)
         • 影子对比：\(shadowStatus)
-        • Dispatcher：已启用，会决定主会话 / side task / 并行子任务
-        • Link Research：已启用，URL 研究类请求会拆成主回答 + 链接抓取子任务
-        • Result Collector：已启用，会在主回答后补充 side task 的研究结果
+        • Dispatcher：已启用，会决定主会话 / side task
         • Local System Guard：已启用，只在高置信度系统操作时才会本地截走
         • Self-heal：已启用，负责 Agent 回退、Kimi CLI 登录恢复和 OpenClaw 自愈
 
@@ -991,38 +1033,6 @@ class CommandRunner: ObservableObject {
         return session.id
     }
 
-    private func preferredOpenClawToolAgent(for images: [String]) -> Agent? {
-        let requiredCapability: Capability = images.isEmpty ? .textChat : .vision
-        return agentStore.preferredSubtaskWorker(
-            for: requiredCapability,
-            requireToolSupport: true
-        )
-    }
-
-    private func supportsOpenClawTools(_ agent: Agent) -> Bool {
-        agent.provider != .ollama
-    }
-
-    private func effectiveAgentForLinkHandlingIfNeeded(
-        requestedAgent: Agent,
-        text: String,
-        images: [String]
-    ) -> (agent: Agent, rerouted: Bool) {
-        guard WebContextAgent.shared.hasLinkRequest(for: text, images: images),
-              !RequestPlanningHeuristics.shouldRespectCurrentAgentSelection(
-                for: text,
-                images: images,
-                currentAgent: requestedAgent
-              ),
-              !supportsOpenClawTools(requestedAgent),
-              let helperAgent = preferredOpenClawToolAgent(for: images),
-              helperAgent.id != requestedAgent.id else {
-            return (requestedAgent, false)
-        }
-
-        return (helperAgent, true)
-    }
-
     private func handleToolSkillCommand(_ skillName: String, input: String) async {
         guard let skill = toolSkillRegistry.getSkill(skillName) else {
             await MainActor.run {
@@ -1145,29 +1155,6 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func handleParallelLinkResearch(
-        input: String,
-        originalText: String,
-        images: [String],
-        anchorMessageID: UUID
-    ) async {
-        let groupID = await resultCollector.startParallelGroup(originalRequest: originalText)
-        let sessionID = await MainActor.run {
-            createLinkResearchTaskSession(request: originalText, linkedMessageID: anchorMessageID)
-        }
-
-        Task {
-            await executeLinkResearchTask(
-                sessionID: sessionID,
-                originalText: originalText,
-                groupID: groupID
-            )
-        }
-
-        await processCleanInput(input, images: images, anchorMessageID: anchorMessageID)
-        await deliverCollectedParallelSummaryIfReady(groupID: groupID)
-    }
-    
     /// 处理截图命令
     func handleScreenshot() {
         Task {
@@ -1414,16 +1401,10 @@ class CommandRunner: ObservableObject {
     private func handleSkillResult(_ result: SkillResult, for skill: AISkill) {
         switch result {
         case .success(let message):
-            let content: String
-            if skill == .webSearch {
-                content = message
-            } else {
-                content = "✅ \(skill.name) 执行成功：\(message)"
-            }
             let successMessage = ChatMessage(
                 id: UUID(),
                 role: MessageRole.assistant,
-                content: content,
+                content: "✅ \(skill.name) 执行成功：\(message)",
                 timestamp: Date()
             )
             messages.append(successMessage)
@@ -1497,6 +1478,7 @@ class CommandRunner: ObservableObject {
             inputImages: images,
             canResume: false
         )
+        session.gatewaySessionKey = gatewaySessionKey(forTaskSessionID: session.id)
 
         let linkedMessageID: UUID
         let linkedTimestamp: Date
@@ -1535,42 +1517,6 @@ class CommandRunner: ObservableObject {
             TaskSessionMessage(role: .user, content: request, timestamp: linkedTimestamp, agentName: orchestrator.currentAgent?.name)
         ]
 
-        taskSessions.append(session)
-        return session.id
-    }
-
-    @MainActor
-    private func createLinkResearchTaskSession(request: String, linkedMessageID: UUID) -> String {
-        var session = AgentTaskSession(
-            title: "🔗 链接研究 · 独立抓取",
-            originalRequest: request,
-            status: .running,
-            statusSummary: "秘书层已拆出链接抓取子任务，正在后台处理",
-            mainAgentName: orchestrator.currentAgent?.name,
-            delegateAgentID: "builtin-link-researcher",
-            delegateAgentName: "链接研究子任务",
-            intentName: "并行抓取",
-            isExpanded: true,
-            inputImages: [],
-            canResume: false
-        )
-
-        let timestamp = messages.first(where: { $0.id == linkedMessageID })?.timestamp ?? Date()
-        let taskCardMessage = ChatMessage(
-            id: UUID(),
-            role: .system,
-            content: "已拆出链接抓取子任务，不阻塞主会话回答。",
-            timestamp: timestamp,
-            linkedTaskSessionID: session.id
-        )
-
-        session.linkedMainMessageID = taskCardMessage.id
-        session.messages = [
-            TaskSessionMessage(role: .system, content: "该链接抓取任务由秘书层并行执行，用于补充研究上下文。"),
-            TaskSessionMessage(role: .user, content: request, timestamp: timestamp, agentName: orchestrator.currentAgent?.name)
-        ]
-
-        messages.append(taskCardMessage)
         taskSessions.append(session)
         return session.id
     }
@@ -1681,93 +1627,6 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func executeLinkResearchTask(
-        sessionID: String,
-        originalText: String,
-        groupID: String
-    ) async {
-        await MainActor.run {
-            appendTaskSessionMessage(
-                sessionID: sessionID,
-                role: .assistant,
-                content: "正在抓取链接内容并提炼补充上下文...",
-                agentName: "链接研究子任务"
-            )
-            updateTaskSessionStatus(
-                sessionID: sessionID,
-                status: .running,
-                summary: "正在并行抓取链接内容"
-            )
-        }
-
-        do {
-            guard let summary = try await WebContextAgent.shared.backgroundResearchSummary(for: originalText, images: []) else {
-                await MainActor.run {
-                    appendTaskSessionMessage(
-                        sessionID: sessionID,
-                        role: .system,
-                        content: "没有额外抓到可补充的链接内容。",
-                        agentName: "链接研究子任务"
-                    )
-                    updateTaskSessionStatus(
-                        sessionID: sessionID,
-                        status: .completed,
-                        summary: "链接抓取完成，但没有新增补充",
-                        isExpanded: false,
-                        resultSummary: nil,
-                        errorMessage: nil
-                    )
-                }
-                return
-            }
-
-            await MainActor.run {
-                appendTaskSessionMessage(
-                    sessionID: sessionID,
-                    role: .assistant,
-                    content: summary,
-                    agentName: "链接研究子任务"
-                )
-                updateTaskSessionStatus(
-                    sessionID: sessionID,
-                    status: .completed,
-                    summary: "链接抓取已完成",
-                    isExpanded: true,
-                    resultSummary: summarizeTaskResult(summary),
-                    errorMessage: nil
-                )
-            }
-
-            if let supplement = await resultCollector.recordSubtaskResult(
-                groupID: groupID,
-                title: "链接抓取",
-                content: summary
-            ) {
-                await MainActor.run {
-                    appendAssistantConversationMessage(supplement)
-                }
-            }
-        } catch {
-            let message = "链接抓取失败：\((error as NSError).localizedDescription)"
-            await MainActor.run {
-                appendTaskSessionMessage(
-                    sessionID: sessionID,
-                    role: .system,
-                    content: message,
-                    agentName: "链接研究子任务"
-                )
-                updateTaskSessionStatus(
-                    sessionID: sessionID,
-                    status: .failed,
-                    summary: "链接抓取没有完成",
-                    isExpanded: true,
-                    resultSummary: nil,
-                    errorMessage: message
-                )
-            }
-        }
-    }
-
     @MainActor
     private func resolveDetectedSkillSuggestionMessage(messageID: UUID, content: String) {
         guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
@@ -1801,32 +1660,23 @@ class CommandRunner: ObservableObject {
         intent: Intent,
         anchorMessageID: UUID
     ) async {
-        let resolved = effectiveAgentForLinkHandlingIfNeeded(
-            requestedAgent: agent,
-            text: text,
-            images: images
-        )
-        let effectiveAgent = resolved.agent
-
-        if resolved.rerouted {
-            await MainActor.run {
-                appendSystemMessage(
-                    "当前选中的 \(agent.displayName) 走的是 text-only CLI backend，不能直接调用 Claw tools；这次链接任务已自动交给 \(effectiveAgent.displayName) 通过 Claw tools 继续处理。"
-                )
-            }
-        }
-
         let traceID = await MainActor.run {
             startExecutionTrace(
                 anchorMessageID: anchorMessageID,
-                agentName: effectiveAgent.displayName,
+                agentName: agent.displayName,
                 intentName: intent.displayName,
-                summary: "OpenClaw 正在把这次请求交给 \(effectiveAgent.displayName)"
+                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)"
             )
         }
         
         // 发送给 OpenClaw
-        await sendToOpenClaw(agent: effectiveAgent, text: text, images: images, traceID: traceID)
+        await sendToOpenClaw(
+            agent: agent,
+            text: text,
+            images: images,
+            traceID: traceID,
+            allowMemoryRecall: true
+        )
     }
     
     /// 处理能力缺口（聊天内引导）
@@ -1912,9 +1762,18 @@ class CommandRunner: ObservableObject {
         agent: Agent,
         text: String,
         images: [String],
-        traceID: UUID? = nil
+        traceID: UUID? = nil,
+        allowMemoryRecall: Bool = false
     ) async {
         let startTime = Date()
+        let mainSession = conversationControl.currentTopology()
+        if allowMemoryRecall {
+            _ = await prepareMemoryRecallPreludeIfNeeded(
+                for: text,
+                sessionKey: mainSession.mainSessionKey,
+                traceID: traceID
+            )
+        }
         let assistantMessage = ChatMessage(
             id: UUID(),
             role: .assistant,
@@ -1940,8 +1799,8 @@ class CommandRunner: ObservableObject {
 
             let fullContent = try await sendViaGateway(
                 agent: agent,
-                sessionKey: "main",
-                sessionLabel: "Main",
+                sessionKey: mainSession.mainSessionKey,
+                sessionLabel: mainSession.mainSessionLabel,
                 text: text,
                 images: images,
                 assistantMessageID: assistantMessage.id
@@ -2018,8 +1877,8 @@ class CommandRunner: ObservableObject {
                     terminalAgent = fallbackAgent
                     let fallbackContent = try await sendViaGateway(
                         agent: fallbackAgent,
-                        sessionKey: "main",
-                        sessionLabel: "Main",
+                        sessionKey: mainSession.mainSessionKey,
+                        sessionLabel: mainSession.mainSessionLabel,
                         text: text,
                         images: images,
                         assistantMessageID: assistantMessage.id
@@ -2090,6 +1949,54 @@ class CommandRunner: ObservableObject {
                 )
                 isProcessing = false
             }
+        }
+    }
+
+    private func prepareMemoryRecallPreludeIfNeeded(
+        for text: String,
+        sessionKey: String,
+        traceID: UUID?
+    ) async -> MemoryRecallPrelude? {
+        let turns = await MainActor.run {
+            self.messages.map {
+                ConversationRecallTurn(role: $0.role.rawValue, content: $0.content)
+            }
+        }
+
+        if let traceID, MemoryRecallCoordinator.isMemorySensitive(text) {
+            await MainActor.run {
+                self.updateExecutionTrace(
+                    traceID: traceID,
+                    state: .running,
+                    summary: "正在调取相关记忆并准备本轮上下文"
+                )
+            }
+        }
+
+        guard let prelude = await memoryRecallCoordinator.recallPreludeIfNeeded(
+            text: text,
+            turns: turns
+        ) else {
+            return nil
+        }
+
+        do {
+            try await runtimeAdapter.injectAssistantMessage(
+                sessionKey: sessionKey,
+                message: prelude.message,
+                label: "Internal Recall"
+            )
+            LogInfo(
+                "Injected memory recall prelude " +
+                "sessionKey=\(sessionKey) hits=\(prelude.hitCount) forcedReindex=\(prelude.forcedReindex)"
+            )
+            return prelude
+        } catch {
+            LogWarning(
+                "Failed to inject memory recall prelude " +
+                "sessionKey=\(sessionKey) error=\(error.localizedDescription)"
+            )
+            return nil
         }
     }
 
@@ -2306,11 +2213,7 @@ class CommandRunner: ObservableObject {
     }
 
     private func gatewaySessionKey(forTaskSessionID sessionID: String) -> String {
-        let sanitized = sessionID
-            .lowercased()
-            .replacingOccurrences(of: "task-", with: "")
-            .replacingOccurrences(of: "_", with: "-")
-        return "agent:desktop:subagent:\(sanitized)"
+        conversationControl.currentTopology().taskSessionKey(for: sessionID)
     }
 
     private func gatewaySessionLabel(forTaskSessionID sessionID: String, baseLabel: String?) -> String? {
@@ -2365,10 +2268,11 @@ class CommandRunner: ObservableObject {
         assistantMessageID: UUID
     ) async throws -> String {
         do {
-            let content = try await gatewayClient.sendMessage(
+            let content = try await runtimeAdapter.sendMessage(
                 agent: agent,
                 sessionKey: sessionKey,
                 sessionLabel: sessionLabel,
+                requestID: assistantMessageID.uuidString.lowercased(),
                 text: text,
                 images: images,
                 onAssistantText: { [weak self] partialText in
@@ -2441,7 +2345,7 @@ class CommandRunner: ObservableObject {
         taskSessionID: String?,
         assistantMessageID: UUID
     ) async throws -> String? {
-        guard shouldFallbackToDirectKimiCLI(after: error, agent: agent) else {
+        guard shouldFallbackToDirectKimiCLI(after: error, agent: agent, sessionKey: sessionKey) else {
             return nil
         }
 
@@ -2521,12 +2425,24 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func shouldFallbackToDirectKimiCLI(after error: Error, agent: Agent) -> Bool {
+    private func shouldFallbackToDirectKimiCLI(
+        after error: Error,
+        agent: Agent,
+        sessionKey: String
+    ) -> Bool {
         guard agent.provider == .ollama else {
             return false
         }
 
         if UserFacingErrorFormatter.isAuthenticationError(error) {
+            return false
+        }
+
+        if isClawManagedConversationSessionKey(sessionKey) {
+            LogWarning(
+                "Direct Kimi CLI fallback suppressed for Claw-managed conversation session " +
+                "sessionKey=\(sessionKey)"
+            )
             return false
         }
 
@@ -2545,6 +2461,13 @@ class CommandRunner: ObservableObject {
             "启动超时"
         ]
         return markers.contains { description.contains($0) }
+    }
+
+    private func isClawManagedConversationSessionKey(_ sessionKey: String) -> Bool {
+        let normalized = sessionKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.hasPrefix("conversation:") || normalized.contains(":conversation:")
     }
 
     private func delegateRequest(
@@ -2601,6 +2524,15 @@ class CommandRunner: ObservableObject {
     func toggleTaskSessionExpansion(_ id: String) {
         guard let index = taskSessions.firstIndex(where: { $0.id == id }) else { return }
         taskSessions[index].isExpanded.toggle()
+        taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    func dismissTaskSessionFromTabs(_ id: String) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == id }) else { return }
+        guard taskSessions[index].status == .completed else { return }
+        guard taskSessions[index].dismissedAt == nil else { return }
+        taskSessions[index].dismissedAt = Date()
         taskSessions[index].updatedAt = Date()
     }
 
@@ -2745,6 +2677,10 @@ class CommandRunner: ObservableObject {
             taskSessions[index].errorMessage = nil
             didChange = true
         }
+        if status != .completed, taskSessions[index].dismissedAt != nil {
+            taskSessions[index].dismissedAt = nil
+            didChange = true
+        }
 
         guard didChange else { return }
         taskSessions[index].updatedAt = Date()
@@ -2860,7 +2796,7 @@ class CommandRunner: ObservableObject {
             return false
         }
 
-        if let recovery = await gatewayClient.recoverInterruptedTaskOutput(
+        if let recovery = await runtimeAdapter.recoverInterruptedTaskOutput(
             sessionKey: sessionKey,
             requestStartedAt: requestStartedAt,
             latestAssistantText: snapshot.latestAssistantText ?? ""
@@ -4416,16 +4352,6 @@ class CommandRunner: ObservableObject {
         return nil
     }
 
-    private func deliverCollectedParallelSummaryIfReady(groupID: String) async {
-        guard let summary = await resultCollector.recordMainConversationCompleted(groupID: groupID) else {
-            return
-        }
-
-        await MainActor.run {
-            appendAssistantConversationMessage(summary)
-        }
-    }
-
     private func restorePersistedState() {
         isRestoringPersistedState = true
         defer { isRestoringPersistedState = false }
@@ -4439,6 +4365,9 @@ class CommandRunner: ObservableObject {
         let restoredAt = Date()
         return sessions.map { session in
             var normalized = session
+            if normalized.gatewaySessionKey == nil {
+                normalized.gatewaySessionKey = gatewaySessionKey(forTaskSessionID: normalized.id)
+            }
             switch normalized.status {
             case .queued, .running:
                 normalized.status = .partial
@@ -4507,6 +4436,7 @@ class CommandRunner: ObservableObject {
         taskSessions.removeAll()
         StorageManager.shared.clearHistory()
         executionJournal.clear()
+        conversationControl.resetConversation()
     }
 
     func screenshotAndAsk() {

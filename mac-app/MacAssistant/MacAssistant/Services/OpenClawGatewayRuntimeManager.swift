@@ -165,6 +165,14 @@ class OpenClawGatewayRuntimeManager {
         self.openclawExecutablePath
     }
 
+    func currentProfileName() -> String {
+        self.profileName
+    }
+
+    func currentProcessEnvironment() -> [String: String] {
+        self.processEnvironment()
+    }
+
     func stopGateway() async throws {
         try await self.stopGatewayIfNeeded()
     }
@@ -249,7 +257,6 @@ class OpenClawGatewayRuntimeManager {
         try self.prepareWorkspace(at: workspaceURL)
 
         let usableAgents = self.agentStore.usableAgents
-        let currentAgentID = self.agentStore.currentAgent?.id
         let workspaceDir = workspaceURL.path
 
         var modelRefsByAgentID: [String: String] = [:]
@@ -313,7 +320,6 @@ class OpenClawGatewayRuntimeManager {
         }
 
         let primaryModelRef = self.resolvePrimaryModelRef(
-            currentAgentID: currentAgentID,
             usableAgents: usableAgents,
             modelRefsByAgentID: modelRefsByAgentID
         )
@@ -321,6 +327,13 @@ class OpenClawGatewayRuntimeManager {
             "workspace": workspaceDir,
             "skipBootstrap": true,
             "models": allowlistedModels,
+            "memorySearch": [
+                "enabled": true,
+                "sources": ["memory", "sessions"],
+                "experimental": [
+                    "sessionMemory": true,
+                ],
+            ],
         ]
         if let primaryModelRef {
             defaults["model"] = [
@@ -472,14 +485,9 @@ class OpenClawGatewayRuntimeManager {
     }
 
     private func resolvePrimaryModelRef(
-        currentAgentID: String?,
         usableAgents: [Agent],
         modelRefsByAgentID: [String: String]
     ) -> String? {
-        if let currentAgentID, let modelRef = modelRefsByAgentID[currentAgentID] {
-            return modelRef
-        }
-
         if let defaultAgent = usableAgents.first(where: \.isDefault),
            let modelRef = modelRefsByAgentID[defaultAgent.id] {
             return modelRef
@@ -552,6 +560,9 @@ class OpenClawGatewayRuntimeManager {
 
         let skillsURL = workspaceURL.appendingPathComponent("skills", isDirectory: true)
         try fileManager.createDirectory(at: skillsURL, withIntermediateDirectories: true)
+
+        let memoryURL = workspaceURL.appendingPathComponent("memory", isDirectory: true)
+        try fileManager.createDirectory(at: memoryURL, withIntermediateDirectories: true)
 
         let entries = try fileManager.contentsOfDirectory(
             at: workspaceURL,
