@@ -29,6 +29,12 @@ actor MemoryCoordinator: MemoryCoordinating {
     // Phase 2: Distillation
     private var distillationWorker: DistillationWorker?
     
+    // Phase 3: L2 Cognition
+    private var l2Worker: L2DistillationWorker?
+    private var contextBuilder: MemoryContextBuilder?
+    private var vectorStore: VectorStore?
+    private var graphStore: KnowledgeGraphStore?
+    
     // MARK: - Initialization
     
     init() {
@@ -50,7 +56,24 @@ actor MemoryCoordinator: MemoryCoordinating {
             }
         }
         
-        LogInfo("[MemoryCoordinator] Initialized with in-memory stores (L1 enabled: \(MemoryFeatureFlags.enableL1Filter))")
+        // Phase 3: 初始化 L2 组件
+        if MemoryFeatureFlags.enableL2Distill {
+            self.l2Worker = L2DistillationWorker(
+                l1Store: l1,
+                l2Store: self.l2Store
+            )
+            self.vectorStore = InMemoryVectorStore()
+            self.graphStore = InMemoryKnowledgeGraphStore()
+            self.contextBuilder = MemoryContextBuilder(
+                l0Store: l0,
+                l1Store: l1,
+                l2Store: self.l2Store,
+                vectorStore: self.vectorStore,
+                graphStore: self.graphStore
+            )
+        }
+        
+        LogInfo("[MemoryCoordinator] Initialized: L1=\(MemoryFeatureFlags.enableL1Filter), L2=\(MemoryFeatureFlags.enableL2Distill)")
     }
     
     /// 使用指定后端初始化
@@ -434,8 +457,87 @@ actor MemoryCoordinator: MemoryCoordinating {
     }
     
     private func triggerFinalL2Distillation(planId: String) async throws {
-        // 从 L1 聚合生成 L2
+        // Phase 3: 从 L1 聚合生成 L2
         LogInfo("[MemoryCoordinator] Triggering final L2 distillation for plan: \(planId)")
+        
+        guard let l2Worker = l2Worker else { return }
+        
+        do {
+            if let l2Entry = try await l2Worker.processBatch(planId: planId) {
+                // 同步到向量存储
+                if let vectorStore = vectorStore {
+                    let metadata = VectorMetadata(
+                        planId: l2Entry.id.planId,
+                        segmentId: l2Entry.id.segmentId,
+                        layer: .distilled,
+                        timestamp: Date(),
+                        tags: l2Entry.concepts.map(\.name)
+                    )
+                    try await vectorStore.store(
+                        id: l2Entry.id,
+                        vector: l2Entry.embedding,
+                        metadata: metadata
+                    )
+                }
+                
+                // 同步到知识图谱
+                if let graphStore = graphStore {
+                    try await l2Store.syncToKnowledgeGraph(graphStore)
+                }
+            }
+        } catch {
+            LogError("[MemoryCoordinator] L2 distillation failed: \(error)")
+        }
+    }
+    
+    // MARK: - Phase 3 Public API
+    
+    /// 构建认知上下文
+    func buildContext(
+        planId: String? = nil,
+        preferences: ContextPreferences = .default
+    ) async throws -> RetrievedContext? {
+        guard let builder = contextBuilder else {
+            return nil
+        }
+        
+        let state = MemorySystemState(
+            planId: planId,
+            taskId: nil,
+            agentId: nil,
+            recentKeywords: [],
+            currentIntent: nil
+        )
+        
+        return try await builder.buildContext(for: state, preferences: preferences)
+    }
+    
+    /// 语义搜索
+    func semanticSearch(
+        query: String,
+        limit: Int = 5
+    ) async throws -> [VectorSearchResult] {
+        guard let vectorStore = vectorStore else {
+            return []
+        }
+        
+        // Mock：生成查询向量
+        let mockQuery = EmbeddingVector(
+            model: "mock",
+            dimensions: 1536,
+            vector: (0..<1536).map { _ in Float.random(in: -1...1) },
+            normalized: true
+        )
+        
+        return try await vectorStore.search(query: mockQuery, limit: limit)
+    }
+    
+    /// 知识图谱查询
+    func queryKnowledgeGraph(conceptName: String) async throws -> [GraphQueryResult] {
+        guard let graphStore = graphStore else {
+            return []
+        }
+        return try await graphStore.query(conceptName: conceptName)
     }
     
     private func l2ToContextEntry(_ entry: DistilledMemoryEntry) -> ContextEntry {
