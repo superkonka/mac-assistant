@@ -41,17 +41,17 @@ struct PromptInjectionConfig {
     )
 }
 
-enum InjectionPosition {
-    case afterSystem      // 在 System Prompt 后
-    case beforeUser       // 在用户消息前
-    case asSystemPrefix   // 作为 System Prompt 前缀
+public enum InjectionPosition: String, Codable, CaseIterable {
+    case afterSystem = "afterSystem"      // 在 System Prompt 后
+    case beforeUser = "beforeUser"        // 在用户消息前
+    case asSystemPrefix = "asSystemPrefix" // 作为 System Prompt 前缀
 }
 
-enum InjectionFormat {
-    case structured       // 结构化 XML/JSON 格式
-    case natural          // 自然语言段落
-    case compact          // 极简格式
-    case markdown         // Markdown 列表
+public enum InjectionFormat: String, Codable, CaseIterable {
+    case structured = "structured"        // 结构化 XML/JSON 格式
+    case natural = "natural"              // 自然语言段落
+    case compact = "compact"              // 极简格式
+    case markdown = "markdown"            // Markdown 列表
 }
 
 // MARK: - Prompt Builder
