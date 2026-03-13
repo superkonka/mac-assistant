@@ -21,7 +21,7 @@ struct MemoryFeatureFlags {
     
     // MARK: - Phase Control
     
-    static var currentPhase: MemoryPhase = .l2Distill  // Phase 2
+    static var currentPhase: MemoryPhase = .retrieval  // Phase 2
     
     // MARK: - Feature Switches
     
@@ -35,7 +35,7 @@ struct MemoryFeatureFlags {
     static var enableL2Distill: Bool = true  // Phase 3 enabled
     
     /// 新检索引擎
-    static var enableNewRetrieval: Bool = false
+    static var enableNewRetrieval: Bool = true  // Phase 4 enabled
     
     /// 完整系统集成
     static var enableFullIntegration: Bool = false

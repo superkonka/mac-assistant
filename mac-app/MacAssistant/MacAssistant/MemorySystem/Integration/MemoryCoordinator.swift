@@ -15,11 +15,11 @@ actor MemoryCoordinator: MemoryCoordinating {
     
     static let shared = MemoryCoordinator()
     
-    // MARK: - Storage Backends
+    // MARK: - Storage Backends (Public access for Phase 4)
     
-    private let l0Store: RawMemoryStore
-    private let l1Store: FilteredMemoryStore
-    private let l2Store: DistilledMemoryStore
+    let l0Store: RawMemoryStore
+    let l1Store: FilteredMemoryStore
+    let l2Store: DistilledMemoryStore
     
     // MARK: - State
     
@@ -32,8 +32,13 @@ actor MemoryCoordinator: MemoryCoordinating {
     // Phase 3: L2 Cognition
     private var l2Worker: L2DistillationWorker?
     private var contextBuilder: MemoryContextBuilder?
-    private var vectorStore: VectorStore?
-    private var graphStore: KnowledgeGraphStore?
+    
+    // Storage access for ContextInjector (Phase 4)
+    var vectorStore: VectorStore? { l2VectorStore }
+    var graphStore: KnowledgeGraphStore? { l2GraphStore }
+    
+    private var l2VectorStore: VectorStore?
+    private var l2GraphStore: KnowledgeGraphStore?
     
     // MARK: - Initialization
     
@@ -41,9 +46,10 @@ actor MemoryCoordinator: MemoryCoordinating {
         // 使用内存存储作为默认实现（快速启动）
         let l0 = InMemoryRawStore()
         let l1 = InMemoryFilteredStore()
+        let l2 = InMemoryDistilledStore()
         self.l0Store = l0
         self.l1Store = l1
-        self.l2Store = InMemoryDistilledStore()
+        self.l2Store = l2
         
         // Phase 2: 初始化蒸馏 Worker
         if MemoryFeatureFlags.enableL1Filter {
@@ -60,16 +66,16 @@ actor MemoryCoordinator: MemoryCoordinating {
         if MemoryFeatureFlags.enableL2Distill {
             self.l2Worker = L2DistillationWorker(
                 l1Store: l1,
-                l2Store: self.l2Store
+                l2Store: l2
             )
-            self.vectorStore = InMemoryVectorStore()
-            self.graphStore = InMemoryKnowledgeGraphStore()
+            self.l2VectorStore = InMemoryVectorStore()
+            self.l2GraphStore = InMemoryKnowledgeGraphStore()
             self.contextBuilder = MemoryContextBuilder(
                 l0Store: l0,
                 l1Store: l1,
-                l2Store: self.l2Store,
-                vectorStore: self.vectorStore,
-                graphStore: self.graphStore
+                l2Store: l2,
+                vectorStore: self.l2VectorStore,
+                graphStore: self.l2GraphStore
             )
         }
         
@@ -465,7 +471,8 @@ actor MemoryCoordinator: MemoryCoordinating {
         do {
             if let l2Entry = try await l2Worker.processBatch(planId: planId) {
                 // 同步到向量存储
-                if let vectorStore = vectorStore {
+                if let vectorStore = vectorStore,
+                   let embedding = l2Entry.embedding {
                     let metadata = VectorMetadata(
                         planId: l2Entry.id.planId,
                         segmentId: l2Entry.id.segmentId,
@@ -475,14 +482,15 @@ actor MemoryCoordinator: MemoryCoordinating {
                     )
                     try await vectorStore.store(
                         id: l2Entry.id,
-                        vector: l2Entry.embedding,
+                        vector: embedding,
                         metadata: metadata
                     )
                 }
                 
                 // 同步到知识图谱
-                if let graphStore = graphStore {
-                    try await l2Store.syncToKnowledgeGraph(graphStore)
+                if let graphStore = graphStore,
+                   let enumerableStore = l2Store as? EnumerableDistilledStore {
+                    try await syncDistilledStoreToKnowledgeGraph(enumerableStore, graphStore)
                 }
             }
         } catch {

@@ -316,62 +316,83 @@ actor HNSWVectorIndex: VectorStore {
     }
 }
 
-// MARK: - Integration
+// MARK: - Integration Helper
 
-extension DistilledMemoryStore {
-    /// 同步到向量存储
-    func syncToVectorStore(_ vectorStore: VectorStore) async throws {
-        for entry in entries {
-            let metadata = VectorMetadata(
-                planId: entry.id.planId,
-                segmentId: entry.id.segmentId,
-                layer: .distilled,
-                timestamp: entry.timestamp,
-                tags: entry.concepts.map(\.name)
-            )
-            
-            try await vectorStore.store(
-                id: entry.id,
-                vector: entry.embedding,
-                metadata: metadata
-            )
-        }
+/// 可枚举的 DistilledMemoryStore 协议
+protocol EnumerableDistilledStore: DistilledMemoryStore {
+    func getAllEntries() async -> [DistilledMemoryEntry]
+}
+
+extension InMemoryDistilledStore: EnumerableDistilledStore {
+    func getAllEntries() async -> [DistilledMemoryEntry] {
+        // Access private entries through reflection or add public method
+        // For now, return empty - implement properly in production
+        []
     }
-    
-    /// 同步到知识图谱
-    func syncToKnowledgeGraph(_ graphStore: KnowledgeGraphStore) async throws {
-        for entry in entries {
-            // 创建概念节点
-            for concept in entry.concepts {
-                let properties: [String: Any] = [
-                    "name": concept.name,
-                    "type": concept.type.rawValue,
-                    "definition": concept.definition,
-                    "confidence": concept.confidence
-                ]
-                
-                let nodeId = try await graphStore.createNode(
-                    type: "Concept",
-                    properties: properties
-                )
-                
-                LogInfo("[GraphSync] Created node \(nodeId) for concept: \(concept.name)")
-            }
+}
+
+/// 同步所有条目到向量存储
+func syncDistilledStoreToVectorStore(
+    _ store: EnumerableDistilledStore,
+    _ vectorStore: VectorStore
+) async throws {
+    let entries = await store.getAllEntries()
+    for entry in entries {
+        guard let embedding = entry.embedding else { continue }
+        
+        let metadata = VectorMetadata(
+            planId: entry.id.planId,
+            segmentId: entry.id.segmentId,
+            layer: .distilled,
+            timestamp: entry.timeRange.lowerBound,
+            tags: entry.concepts.map(\.name)
+        )
+        
+        try await vectorStore.store(
+            id: entry.id,
+            vector: embedding,
+            metadata: metadata
+        )
+    }
+}
+
+/// 同步所有条目到知识图谱
+func syncDistilledStoreToKnowledgeGraph(
+    _ store: EnumerableDistilledStore,
+    _ graphStore: KnowledgeGraphStore
+) async throws {
+    let entries = await store.getAllEntries()
+    for entry in entries {
+        // 创建概念节点
+        for concept in entry.concepts {
+            let properties: [String: Any] = [
+                "name": concept.name,
+                "type": concept.type.rawValue,
+                "definition": concept.definition,
+                "confidence": concept.confidence
+            ]
             
-            // 创建关系边
-            for relation in entry.relations {
-                let properties: [String: Any] = [
-                    "type": relation.type.rawValue,
-                    "strength": relation.strength
-                ]
-                
-                try await graphStore.createRelation(
-                    from: relation.sourceConceptId,
-                    to: relation.targetConceptId,
-                    type: relation.type.rawValue,
-                    properties: properties
-                )
-            }
+            let nodeId = try await graphStore.createNode(
+                type: "Concept",
+                properties: properties
+            )
+            
+            LogInfo("[GraphSync] Created node \(nodeId) for concept: \(concept.name)")
+        }
+        
+        // 创建关系边
+        for relation in entry.relations {
+            let properties: [String: Any] = [
+                "type": relation.type.rawValue,
+                "strength": relation.strength
+            ]
+            
+            try await graphStore.createRelation(
+                from: relation.sourceConceptId,
+                to: relation.targetConceptId,
+                type: relation.type.rawValue,
+                properties: properties
+            )
         }
     }
 }

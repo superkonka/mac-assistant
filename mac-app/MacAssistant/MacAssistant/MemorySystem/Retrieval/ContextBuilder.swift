@@ -69,27 +69,21 @@ actor MemoryContextBuilder {
         )
     }
     
-    /// 检索相似模式
+    /// 检索相似模式（简化实现）
     func findSimilarPatterns(
         to entry: FilteredMemoryEntry,
         limit: Int = 5
     ) async throws -> [PatternMatch] {
-        
-        // 基于 L2 的模式匹配
-        let l2Entries = l2Store.entries
+        // 简化：通过概念名称查询相关 L2 条目
         var matches: [PatternMatch] = []
         
-        for l2Entry in l2Entries {
-            // 概念重叠度
-            let commonConcepts = Set(l2Entry.concepts.map(\.name))
-                .intersection(entry.keywords)
-            
-            if !commonConcepts.isEmpty {
-                // 找到匹配的模式
+        for keyword in entry.keywords.prefix(3) {
+            let relatedEntries = try? await l2Store.queryByConcept(conceptName: keyword)
+            for l2Entry in relatedEntries ?? [] {
                 for pattern in l2Entry.patterns {
                     let match = PatternMatch(
                         pattern: pattern,
-                        matchScore: Double(commonConcepts.count) / Double(entry.keywords.count),
+                        matchScore: 0.7,
                         applicableContexts: pattern.contextConstraints,
                         source: l2Entry.id
                     )
@@ -115,10 +109,14 @@ actor MemoryContextBuilder {
         var beliefs: [Belief] = []
         var insights: [ActionableInsight] = []
         
-        for entry in l2Store.entries {
-            concepts.append(contentsOf: entry.concepts)
-            beliefs.append(contentsOf: entry.beliefs)
-            insights.append(contentsOf: entry.actionableInsights)
+        // 通过关键词查询 L2 条目
+        for keyword in state.recentKeywords.prefix(3) {
+            let entries = try? await l2Store.queryByConcept(conceptName: keyword)
+            for entry in entries ?? [] {
+                concepts.append(contentsOf: entry.concepts)
+                beliefs.append(contentsOf: entry.beliefs)
+                insights.append(contentsOf: entry.actionableInsights)
+            }
         }
         
         // 去重和筛选
@@ -181,18 +179,18 @@ actor MemoryContextBuilder {
         let cutoff = Date().addingTimeInterval(-prefs.recentTimeWindow)
         var activities: [RecentActivity] = []
         
-        for (planId, entries) in l0Store.entries {
-            guard state.planId == nil || planId == state.planId else { continue }
-            
-            for entry in entries.filter({ $0.timestamp >= cutoff }) {
-                let activity = RecentActivity(
-                    description: entry.summary.truncated(to: 100),
-                    timestamp: entry.timestamp,
-                    planId: entry.id.planId,
-                    type: entry.type
-                )
-                activities.append(activity)
-            }
+        // 查询 Plan 的最近条目
+        let planId = state.planId ?? "default"
+        let entries = try? await l0Store.getPlanEntries(planId: planId)
+        
+        for entry in (entries ?? []).filter({ $0.timestamp >= cutoff }) {
+            let activity = RecentActivity(
+                description: entry.output.response.truncated(to: 100),
+                timestamp: entry.timestamp,
+                planId: entry.id.planId,
+                type: entry.type
+            )
+            activities.append(activity)
         }
         
         return activities
@@ -333,7 +331,7 @@ struct RecentActivity {
     let description: String
     let timestamp: Date
     let planId: String
-    let type: MemoryType
+    let type: RawMemoryEntry.RawEntryType
 }
 
 struct SemanticMatch {

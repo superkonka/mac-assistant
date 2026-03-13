@@ -52,11 +52,39 @@ actor OpenClawGatewayClient {
         requestID: String,
         text: String,
         images: [String],
+        systemPrompt: String? = nil,  // Phase 4: Accept system prompt
+        contextBudget: Int = 2000,     // Phase 4: Token budget for memory
         onAssistantText: (@Sendable (String) async -> Void)? = nil
     ) async throws -> String {
         // MARK: - Memory System Hook (Phase 1: L0 Storage)
         let memoryStartTime = Date()
         let planId = Self.derivePlanId(from: sessionKey)
+        
+        // Phase 4: Prepare memory context injection
+        var preparedPrompt = text
+        var preparedSystemPrompt = systemPrompt
+        var injectionResult: ContextInjectionResult?
+        
+        if MemoryFeatureFlags.enableNewRetrieval {
+            do {
+                let injection = try await prepareMemoryContext(
+                    planId: planId,
+                    agent: agent,
+                    userMessage: text,
+                    systemPrompt: systemPrompt,
+                    contextBudget: contextBudget
+                )
+                preparedPrompt = injection.userMessage
+                preparedSystemPrompt = injection.systemPrompt
+                injectionResult = injection.injectionResult
+                
+                if injection.injectionResult.isSuccess {
+                    LogInfo("[OpenClaw] Injected \(injection.injectionResult.tokenCount) tokens of memory context")
+                }
+            } catch {
+                LogWarning("[OpenClaw] Memory context injection failed: \(error)")
+            }
+        }
         
         let state = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
         guard let modelRef = state.modelRefsByAgentID[agent.id] else {
@@ -76,7 +104,8 @@ actor OpenClawGatewayClient {
         )
 
         let attachments = try self.buildAttachments(from: images)
-        let prompt = self.normalizedPrompt(text, hasImages: !attachments.isEmpty)
+        // Phase 4: Use memory-prepared prompt
+        let prompt = self.normalizedPrompt(preparedPrompt, hasImages: !attachments.isEmpty)
         let startCursor = self.nextPushOrdinal
         let requestStartedAtMs = Date().timeIntervalSince1970 * 1000
         let allowRelaxedHistoryRecovery = agent.provider != .ollama
@@ -769,6 +798,42 @@ actor OpenClawGatewayClient {
                 "agentProvider": AnyCodable(agent.provider.rawValue),
                 "model": AnyCodable(agent.model)
             ]
+        )
+    }
+    
+    // MARK: - Phase 4: Memory Context Injection
+    
+    private func prepareMemoryContext(
+        planId: String,
+        agent: Agent,
+        userMessage: String,
+        systemPrompt: String?,
+        contextBudget: Int
+    ) async throws -> PreparedExecution {
+        
+        let coordinator = MemoryCoordinator.shared
+        
+        // Create context builder if not exists
+        let contextBuilder = MemoryContextBuilder(
+            l0Store: await coordinator.l0Store,
+            l1Store: await coordinator.l1Store,
+            l2Store: await coordinator.l2Store,
+            vectorStore: await coordinator.vectorStore,
+            graphStore: await coordinator.graphStore
+        )
+        
+        let contextInjector = ContextInjector(
+            contextBuilder: contextBuilder,
+            config: PromptInjectionConfig.default
+        )
+        
+        return await contextInjector.prepareExecution(
+            planId: planId,
+            taskId: nil,
+            agentId: agent.id,
+            userMessage: userMessage,
+            systemPrompt: systemPrompt,
+            availableBudget: contextBudget
         )
     }
     
