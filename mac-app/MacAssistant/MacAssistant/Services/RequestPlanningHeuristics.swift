@@ -341,4 +341,77 @@ enum RequestPlanningHeuristics {
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: "_", with: "")
     }
+
+    // MARK: - 复杂任务检测（自动拆分子任务）
+
+    /// 判断请求是否应该作为复杂任务拆分为子任务异步执行
+    /// 这类任务通常需要：多步骤规划、长时间执行、创建/构建类操作
+    static func shouldRouteAsComplexSubtask(_ text: String) -> Bool {
+        let normalized = normalized(text)
+
+        // 1. 创建/构建类任务
+        let creationPatterns = [
+            "创建一个", "创建个", "帮我创建", "给我创建",
+            "设计一个", "设计个", "帮我设计",
+            "搭建一个", "搭建个", "构建一个", "构建个",
+            "生成一个", "生成个", "制作一个", "制作个",
+            "写一个", "写个", "帮我写", "给我写",
+            "开发一个", "开发个", "实现一个", "实现个",
+            "列一个", "列个", "整理一个", "建一个", "建立一个"
+        ]
+        if creationPatterns.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        // 2. 复杂分析/研究类任务
+        let complexAnalysisPatterns = [
+            "深入研究", "详细分析", "全面调研",
+            "对比分析", "竞品分析", "市场调研",
+            "代码审查", "代码重构", "系统重构",
+            "架构设计", "方案设计", "技术选型",
+            "分析下", "分析这几个", "分析所有", "遍历"
+        ]
+        if complexAnalysisPatterns.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        // 3. 多步骤/批处理类任务
+        let multiStepPatterns = [
+            "批量处理", "批量修改", "批量创建",
+            "自动化", "自动处理", "定时任务",
+            "循环处理", "遍历所有", "逐个处理",
+            "整理一下", "整理所有", "归类整理",
+            "清理一下", "清理所有", "批量清理",
+            "作一个索引", "做一个索引", "建立索引", "创建索引",
+            "统计一下", "统计所有"
+        ]
+        if multiStepPatterns.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        // 4. 长文本/文档类任务
+        let documentPatterns = [
+            "写一篇", "写一份", "写个文档",
+            "总结文档", "整理文档", "生成文档",
+            "写报告", "写总结", "写方案",
+            "翻译文档", "翻译这篇", "翻译所有"
+        ]
+        if documentPatterns.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        // 5. 代码/项目类复杂任务
+        let codeProjectPatterns = [
+            "写个程序", "写个脚本", "写个工具",
+            "做个项目", "做个页面", "做个网站",
+            "封装一个", "封装个", "抽象一个",
+            "优化性能", "性能优化", "代码优化",
+            "调试一下", "排查问题", "解决问题"
+        ]
+        if codeProjectPatterns.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        return false
+    }
 }

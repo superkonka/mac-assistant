@@ -136,6 +136,7 @@ enum RequestPlannerPrimaryAction {
     case handleDetectedSkill(skill: AISkill, input: String, executionInput: String)
     case handleAgentSuggestion(AgentSuggestion, input: String)
     case routeParallelLinkResearch(input: String)
+    case routeComplexTaskAsSubtask(input: String)
     case routeMainConversation(input: String)
 }
 
@@ -198,6 +199,8 @@ struct RequestPlan {
             return .sideSession
         case .routeParallelLinkResearch:
             return .parallelSubtasks
+        case .routeComplexTaskAsSubtask:
+            return .sideSession
         default:
             return .mainSession
         }
@@ -425,6 +428,17 @@ struct RequestPlan {
                     returnsToMainConversation: true
                 )
             ]
+        case .routeComplexTaskAsSubtask:
+            return [
+                PlannedTaskSpec(
+                    id: "complex-task-subtask",
+                    kind: .detectedSkill,
+                    title: "复杂任务独立处理",
+                    executorLabel: envelope.currentAgent?.displayName ?? "自动路由",
+                    summary: "识别为复杂任务，拆出独立子任务异步执行，主会话不阻塞。",
+                    returnsToMainConversation: true
+                )
+            ]
         case .routeMainConversation:
             return [
                 PlannedTaskSpec(
@@ -491,6 +505,8 @@ struct RequestPlan {
             return "handle_agent_suggestion"
         case .routeParallelLinkResearch:
             return "route_parallel_link_research"
+        case .routeComplexTaskAsSubtask:
+            return "route_complex_task_as_subtask"
         case .routeMainConversation:
             return "route_main_conversation"
         }

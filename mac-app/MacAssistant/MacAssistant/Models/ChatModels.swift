@@ -149,6 +149,7 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
     var latestAssistantText: String?
     var canResume: Bool
     var lastReconciledAt: Date?
+    var dismissedAt: Date?
 
     init(
         id: String = "task-\(UUID().uuidString.prefix(8))",

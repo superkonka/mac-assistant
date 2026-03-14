@@ -58,11 +58,38 @@ class CommandRunner: ObservableObject {
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
     private let initialSetupPromptKey = "initial_setup_prompt"
+    
+    // MARK: - 用户输入增强
+    
+    /// 自动增强用户输入，添加时间等元信息
+    private func enhanceUserInput(_ text: String) -> String {
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        
+        // 格式化日期时间
+        formatter.dateFormat = "yyyy年MM月dd日 HH:mm"
+        let dateTimeString = formatter.string(from: now)
+        
+        // 格式化星期
+        formatter.dateFormat = "EEEE"
+        let weekdayString = formatter.string(from: now)
+        
+        // 构建增强的输入
+        let enhancedInput = """
+        [系统上下文] 当前时间：\(dateTimeString)（\(weekdayString)）
+        
+        [用户输入]
+        \(text)
+        """
+        
+        return enhancedInput
+    }
     private let pendingWorkflowDesignKey = "pending_workflow_design"
     private let workflowOriginalInputKey = "workflow_original_input"
     private let workflowTaskSessionIDKey = "workflow_task_session_id"
-    private let directKimiCLIFallbackTimeout: TimeInterval = 90
-    private let directKimiCLIInterruptedStreamFallbackTimeout: TimeInterval = 60
+    private let directKimiCLIFallbackTimeout: TimeInterval = 180
+    private let directKimiCLIInterruptedStreamFallbackTimeout: TimeInterval = 120
     private let screenRecordingSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
     
     private var cancellables: Set<AnyCancellable> = []
@@ -131,7 +158,6 @@ class CommandRunner: ObservableObject {
             RequestEnvelope(
                 originalText: text,
                 images: contextualImages,
-                sessionTopology: conversationControl.currentTopology(),
                 currentAgent: orchestrator.currentAgent,
                 needsInitialSetup: agentStore.needsInitialSetup,
                 lastMessage: messages.last,
@@ -140,10 +166,18 @@ class CommandRunner: ObservableObject {
                 activeWorkflowDesignContext: activeWorkflowDesignContext()
             )
         }
+        let topology = conversationControl.currentTopology()
         let request = AssembledConversationContext(
+            userMessage: text,
+            attachedImages: contextualImages.map { AttachedImage(path: $0, mimeType: "image/jpeg", description: nil) },
+            envelope: envelope,
             text: text,
             images: contextualImages,
-            envelope: envelope
+            sessionTopology: ConversationTopologySnapshot(
+                mainSessionKey: topology.mainSessionKey,
+                mainSessionLabel: topology.mainSessionLabel,
+                activeTaskSessionKeys: topology.activeTaskSessions.map { $0.id }
+            )
         )
         let plan = await requestPlanner.plan(envelope)
         await processPreparedRequest(request, plan: plan)
@@ -326,6 +360,17 @@ class CommandRunner: ObservableObject {
         case .handleAgentSuggestion(let suggestion, let input):
             await handleAgentSuggestion(suggestion, input: input, images: plan.envelope.images)
 
+        case .routeParallelLinkResearch(let input):
+            await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
+
+        case .routeComplexTaskAsSubtask(let input):
+            await runComplexTaskAsSubtask(
+                input: input,
+                images: plan.envelope.images,
+                plan: plan,
+                anchorMessageID: anchorMessageID
+            )
+
         case .routeMainConversation(let input):
             await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
         }
@@ -506,7 +551,7 @@ class CommandRunner: ObservableObject {
         switch skill {
         case .screenshot, .createVisionAgent, .analyzeImage:
             return "视觉与截图"
-        case .codeReview, .explainSelection, .translateText, .summarizeText:
+        case .codeReview, .explainSelection, .translateText, .summarizeText, .webSearch:
             return "文本与代码"
         }
     }
@@ -2267,13 +2312,16 @@ class CommandRunner: ObservableObject {
         taskSessionID: String? = nil,
         assistantMessageID: UUID
     ) async throws -> String {
+        // 增强用户输入，添加时间等元信息
+        let enhancedText = enhanceUserInput(text)
+        
         do {
             let content = try await runtimeAdapter.sendMessage(
                 agent: agent,
                 sessionKey: sessionKey,
                 sessionLabel: sessionLabel,
                 requestID: assistantMessageID.uuidString.lowercased(),
-                text: text,
+                text: enhancedText,
                 images: images,
                 onAssistantText: { [weak self] partialText in
                     guard let self else { return }
@@ -2383,9 +2431,12 @@ class CommandRunner: ObservableObject {
             }
         }
 
+        // 增强用户输入，添加时间等元信息
+        let enhancedText = enhanceUserInput(text)
+        
         do {
             let content = try await localKimiCLIService.sendMessage(
-                text: text,
+                text: enhancedText,
                 attachments: images,
                 sessionKey: sessionKey,
                 timeout: policy.timeout,
@@ -2516,6 +2567,339 @@ class CommandRunner: ObservableObject {
         )
     }
 
+    /// 将复杂任务作为子任务异步执行，不阻塞主会话
+    private func runComplexTaskAsSubtask(
+        input: String,
+        images: [String],
+        plan: RequestPlan,
+        anchorMessageID: UUID
+    ) async {
+        let agent = plan.requestedAgentSwitch?.agent ?? orchestrator.currentAgent ?? agentStore.defaultAgent
+        guard let delegateAgent = agent else {
+            await MainActor.run {
+                let errorMessage = ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: "❌ 没有可用的 Agent 来执行此任务",
+                    timestamp: Date()
+                )
+                messages.append(errorMessage)
+                isProcessing = false
+            }
+            return
+        }
+
+        await MainActor.run {
+            isProcessing = true
+        }
+
+        let mainAgent = await MainActor.run { orchestrator.currentAgent }
+
+        // 分析意图
+        let intent = await orchestrator.analyzeIntent(input)
+
+        // 收集主会话历史上下文（最近10条消息）
+        let mainConversationContext = await MainActor.run {
+            let recentMessages = messages.suffix(10)
+            return recentMessages.map { msg in
+                let role = msg.role == .user ? "用户" : "助手"
+                return "[\(role)]: \(msg.content.prefix(100))\(msg.content.count > 100 ? "..." : "")"
+            }.joined(separator: "\n")
+        }
+
+        // 构建带上下文的请求
+        let contextualizedRequest = """
+        这是从主会话拆分出的子任务。以下是主会话的最近上下文，供你参考：
+
+        --- 主会话历史 ---
+        \(mainConversationContext)
+        --- 结束 ---
+
+        基于以上上下文，请处理以下任务：
+        \(input)
+        """
+
+        // 创建子任务会话
+        let sessionID = await MainActor.run {
+            createTaskSession(
+                mainAgent: mainAgent,
+                delegateAgent: delegateAgent,
+                request: input,  // 保留原始请求作为标题
+                images: images,
+                intent: intent,
+                reason: "复杂任务自动拆分为子任务异步执行"
+            )
+        }
+
+        // 在主会话中立即返回提示，不阻塞
+        await MainActor.run {
+            let noticeMessage = ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: """
+                📝 已创建子任务异步处理
+
+                「\(input.prefix(50))\(input.count > 50 ? "..." : "")」
+
+                这是一个复杂任务，已拆分为独立子任务在后台执行。
+                你可以在顶部「子任务」面板查看进度。
+                """,
+                timestamp: Date()
+            )
+            messages.append(noticeMessage)
+            isProcessing = false
+        }
+
+        // 异步执行子任务（不阻塞主会话）
+        Task {
+            let result = await runTaskSession(
+                sessionID: sessionID,
+                agent: delegateAgent,
+                text: contextualizedRequest,  // 使用带上下文的请求
+                images: images
+            )
+
+            guard !result.failed else {
+                LogWarning("复杂任务子任务执行失败: \(sessionID)")
+                await MainActor.run {
+                    let failureMessage = ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        ❌ 子任务执行失败
+
+                        「\(input.prefix(50))\(input.count > 50 ? "..." : "")」
+
+                        子任务执行过程中遇到问题，请查看子任务面板了解详情。
+                        """,
+                        timestamp: Date()
+                    )
+                    messages.append(failureMessage)
+                }
+                return
+            }
+
+            // 子任务完成后，由 Planner（秘书）评估并决定下一步
+            LogInfo("复杂任务子任务执行完成: \(sessionID)")
+            
+            await MainActor.run {
+                // 获取子任务的最终结果摘要
+                let taskSummary = result.content.count > 300 
+                    ? String(result.content.prefix(300)) + "..." 
+                    : result.content
+                
+                let completionMessage = ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: """
+                    ✅ 子任务已完成
+
+                    「\(input.prefix(50))\(input.count > 50 ? "..." : "")」
+
+                    📋 执行结果：
+                    \(taskSummary)
+                    """,
+                    timestamp: Date(),
+                    agentId: delegateAgent.id,
+                    agentName: delegateAgent.name
+                )
+                messages.append(completionMessage)
+            }
+            
+            // Planner（秘书）评估是否需要下一步
+            await evaluateNextStepsWithPlanner(
+                originalRequest: input,
+                taskResult: result.content,
+                sessionID: sessionID,
+                agent: delegateAgent
+            )
+        }
+    }
+    
+    /// Planner（秘书）评估子任务结果并决定下一步
+    private func evaluateNextStepsWithPlanner(
+        originalRequest: String,
+        taskResult: String,
+        sessionID: String,
+        agent: Agent
+    ) async {
+        // 构建 Planner 评估提示
+        let plannerPrompt = """
+        你是一位专业的任务规划秘书（Planner）。请评估刚刚完成的子任务，并决定下一步行动。
+
+        【原始任务】
+        \(originalRequest)
+
+        【执行结果】
+        \(taskResult)
+
+        【评估要求】
+        请分析：
+        1. 任务是否已完全达成目标？
+        2. 是否需要补充信息或澄清？
+        3. 是否需要创建后续子任务？
+        4. 用户是否需要确认某些事项？
+
+        请以以下格式回复：
+        - 如果任务已完成：回复 "[完成] 任务总结：xxx"
+        - 如果需要下一步：回复 "[继续] 建议下一步：xxx"
+        - 如果需要用户确认：回复 "[确认] 需要用户确认：xxx"
+        """
+        
+        // 使用当前 Agent 进行 Planner 评估
+        let plannerSessionKey = gatewaySessionKey(forTaskSessionID: sessionID) + "-planner"
+        let assistantMessageID = UUID()
+        
+        do {
+            let plannerResponse = try await sendViaGateway(
+                agent: agent,
+                sessionKey: plannerSessionKey,
+                sessionLabel: "Planner评估-\(sessionID)",
+                text: plannerPrompt,
+                images: [],
+                assistantMessageID: assistantMessageID
+            )
+            
+            // 解析 Planner 决策
+            let decision = parsePlannerDecision(plannerResponse)
+            
+            await MainActor.run {
+                switch decision.type {
+                case .completed:
+                    // 任务完成，通知用户
+                    let finalMessage = ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        📌 Planner（秘书）评估完成
+
+                        \(decision.content)
+
+                        ✅ 整个任务流程已结束，所有目标已达成。
+                        """,
+                        timestamp: Date()
+                    )
+                    messages.append(finalMessage)
+                    
+                case .nextStep:
+                    // 需要继续，创建下一步子任务
+                    let continueMessage = ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        📌 Planner（秘书）评估完成
+
+                        \(decision.content)
+
+                        🔄 正在自动创建下一步子任务...
+                        """,
+                        timestamp: Date()
+                    )
+                    messages.append(continueMessage)
+                    
+                    // 自动创建下一步子任务
+                    Task {
+                        await createFollowUpSubtask(
+                            originalRequest: originalRequest,
+                            previousResult: taskResult,
+                            nextStepDescription: decision.content,
+                            agent: agent
+                        )
+                    }
+                    
+                case .needConfirmation:
+                    // 需要用户确认
+                    let confirmMessage = ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        📌 Planner（秘书）评估完成
+
+                        \(decision.content)
+
+                        ⏳ 请确认以上事项后，我可以继续下一步。
+                        """,
+                        timestamp: Date()
+                    )
+                    messages.append(confirmMessage)
+                }
+            }
+            
+        } catch {
+            LogWarning("Planner 评估失败: \(error)")
+            // Planner 失败不影响主流程，静默处理
+        }
+    }
+    
+    /// 解析 Planner 决策
+    private func parsePlannerDecision(_ response: String) -> PlannerDecision {
+        let trimmed = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if trimmed.contains("[完成]") || trimmed.contains("任务已完成") {
+            return PlannerDecision(type: .completed, content: extractDecisionContent(trimmed, prefix: "[完成]"))
+        } else if trimmed.contains("[继续]") || trimmed.contains("需要下一步") {
+            return PlannerDecision(type: .nextStep, content: extractDecisionContent(trimmed, prefix: "[继续]"))
+        } else if trimmed.contains("[确认]") || trimmed.contains("需要确认") {
+            return PlannerDecision(type: .needConfirmation, content: extractDecisionContent(trimmed, prefix: "[确认]"))
+        }
+        
+        // 默认视为完成
+        return PlannerDecision(type: .completed, content: "任务已处理完毕")
+    }
+    
+    private func extractDecisionContent(_ response: String, prefix: String) -> String {
+        if let range = response.range(of: prefix) {
+            let afterPrefix = String(response[range.upperBound...])
+            return afterPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return response
+    }
+    
+    /// 创建后续子任务
+    private func createFollowUpSubtask(
+        originalRequest: String,
+        previousResult: String,
+        nextStepDescription: String,
+        agent: Agent
+    ) async {
+        let followUpRequest = """
+        基于之前的任务结果，执行下一步：
+        
+        前序任务：\(originalRequest)
+        前序结果：\(previousResult.prefix(200))...
+        
+        当前步骤：\(nextStepDescription)
+        """
+        
+        // 直接使用 planRequest 处理后续任务
+        let envelope = RequestEnvelope(
+            originalText: followUpRequest,
+            images: [],
+            currentAgent: agent,
+            needsInitialSetup: false,
+            lastMessage: nil,
+            creationFlowActive: false,
+            resumableTaskSessionID: nil,
+            activeWorkflowDesignContext: nil
+        )
+        
+        let followUpPlan = await requestPlanner.plan(envelope)
+        
+        // 递归调用，创建新的复杂任务子任务
+        await executeRequestPlan(followUpPlan, anchorMessageID: UUID())
+    }
+    
+    /// Planner 决策结构
+    private struct PlannerDecision {
+        enum DecisionType {
+            case completed      // 任务完成
+            case nextStep       // 继续下一步
+            case needConfirmation // 需要用户确认
+        }
+        let type: DecisionType
+        let content: String
+    }
+
     func taskSession(for id: String?) -> AgentTaskSession? {
         guard let id else { return nil }
         return taskSessions.first { $0.id == id }
@@ -2534,6 +2918,11 @@ class CommandRunner: ObservableObject {
         guard taskSessions[index].dismissedAt == nil else { return }
         taskSessions[index].dismissedAt = Date()
         taskSessions[index].updatedAt = Date()
+    }
+
+    @MainActor
+    func deleteTaskSession(_ id: String) {
+        taskSessions.removeAll { $0.id == id }
     }
 
     @MainActor

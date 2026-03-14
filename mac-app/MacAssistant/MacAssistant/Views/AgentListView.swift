@@ -191,110 +191,172 @@ struct AgentRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
+            // MARK: 左侧 - Agent 基本信息
             Text(agent.emoji)
-                .font(.title2)
+                .font(.system(size: 28))
+                .frame(width: 36, height: 36)
+                .background(Color.gray.opacity(0.08))
+                .cornerRadius(8)
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text(agent.name)
-                        .font(.system(size: 13, weight: .medium))
+            VStack(alignment: .leading, spacing: 4) {
+                // 名称行
+                Text(agent.name)
+                    .font(.system(size: 14, weight: .semibold))
 
-                    if agent.isDefault {
-                        inlineLabel("默认主")
-                    }
-
-                    if isCurrentMain {
-                        inlineLabel("当前主会话", tint: .blue)
-                    }
-
-                    if isPlannerPreferred {
-                        inlineLabel("Planner", tint: .orange)
-                    }
-                }
-
+                // 描述
                 Text(agent.description)
-                    .font(.caption)
+                    .font(.system(size: 11))
                     .foregroundColor(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
 
+                // 提供商信息
                 Text("\(agent.provider.displayName) • \(agent.model)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.8))
 
+                // 角色标签
                 FlowLayout(spacing: 6) {
                     ForEach(roleProfile.sortedRoles) { role in
                         AgentRoleBadge(role: role)
                     }
                 }
+                .padding(.top, 2)
             }
 
-            Spacer(minLength: 12)
+            Spacer(minLength: 16)
 
-            VStack(alignment: .trailing, spacing: 8) {
-                HStack(spacing: 8) {
-                    if !isCurrentMain && roleProfile.contains(.primaryChat) {
-                        Button("切到主会话") {
-                            onSwitchCurrent()
-                        }
-                        .font(.caption)
-                        .buttonStyle(.link)
+            // MARK: 右侧 - 状态与操作
+            VStack(alignment: .trailing, spacing: 10) {
+                // 状态标签组
+                HStack(spacing: 6) {
+                    if agent.isDefault {
+                        StatusBadge(text: "默认主", color: .green)
                     }
-
-                    if !agent.isDefault {
-                        Button("设默认") {
-                            onSetDefault()
-                        }
-                        .font(.caption)
-                        .buttonStyle(.link)
+                    if isCurrentMain {
+                        StatusBadge(text: "当前主会话", color: .blue)
+                    }
+                    if isPlannerPreferred {
+                        StatusBadge(text: "Planner", color: .orange)
                     }
                 }
 
-                HStack(spacing: 8) {
-                    if !isPlannerPreferred {
-                        Button("设为 Planner") {
-                            onSetPlanner()
-                        }
-                        .font(.caption)
-                        .buttonStyle(.link)
+                // 操作按钮组
+                HStack(spacing: 6) {
+                    // 快速操作按钮
+                    if !isCurrentMain && roleProfile.contains(.primaryChat) {
+                        IconButton(
+                            icon: "arrow.right.circle",
+                            tooltip: "切到主会话",
+                            action: onSwitchCurrent
+                        )
                     }
 
-                    Menu("角色") {
+                    if !agent.isDefault {
+                        IconButton(
+                            icon: "star.circle",
+                            tooltip: "设为默认",
+                            action: onSetDefault
+                        )
+                    }
+
+                    if !isPlannerPreferred && roleProfile.contains(.planner) {
+                        IconButton(
+                            icon: "point.topleft.down.curvedto.point.bottomright.up.circle",
+                            tooltip: "设为 Planner",
+                            action: onSetPlanner
+                        )
+                    }
+
+                    Divider()
+                        .frame(height: 20)
+                        .padding(.horizontal, 2)
+
+                    // 角色 Menu
+                    Menu {
                         ForEach(AgentRole.allCases) { role in
                             Button {
                                 onToggleRole(role, !roleProfile.contains(role))
                             } label: {
                                 HStack {
+                                    Image(systemName: role.icon)
+                                        .font(.system(size: 12))
                                     Text(role.displayName)
                                     Spacer()
                                     if roleProfile.contains(role) {
                                         Image(systemName: "checkmark")
+                                            .font(.system(size: 10, weight: .bold))
                                     }
                                 }
                             }
                         }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "person.2.badge.gearshape")
+                                .font(.system(size: 12))
+                            Text("角色")
+                                .font(.system(size: 11))
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.blue.opacity(0.1))
+                        .foregroundColor(.blue)
+                        .cornerRadius(6)
                     }
-                    .font(.caption)
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
 
+                    // 删除按钮
                     Button(action: onDelete) {
                         Image(systemName: "trash")
                             .font(.system(size: 12))
-                            .foregroundColor(.red.opacity(0.75))
+                            .foregroundColor(.red.opacity(0.8))
+                            .frame(width: 28, height: 28)
+                            .background(Color.red.opacity(0.08))
+                            .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
+                    .help("删除 Agent")
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 10)
+        .padding(.horizontal, 4)
     }
+}
 
-    private func inlineLabel(_ text: String, tint: Color = .green) -> some View {
+// MARK: - 辅助组件
+
+private struct StatusBadge: View {
+    let text: String
+    let color: Color
+
+    var body: some View {
         Text(text)
-            .font(.system(size: 9, weight: .medium))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(tint.opacity(0.14))
-            .foregroundColor(tint)
+            .font(.system(size: 9, weight: .semibold))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.12))
+            .foregroundColor(color)
             .cornerRadius(4)
+    }
+}
+
+private struct IconButton: View {
+    let icon: String
+    let tooltip: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 13))
+                .foregroundColor(.secondary)
+                .frame(width: 28, height: 28)
+                .background(Color.gray.opacity(0.1))
+                .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .help(tooltip)
     }
 }
 
@@ -362,15 +424,15 @@ struct AgentRoleBadge: View {
     var body: some View {
         HStack(spacing: 4) {
             Image(systemName: role.icon)
-                .font(.system(size: 9, weight: .semibold))
+                .font(.system(size: 9, weight: .medium))
             Text(role.displayName)
                 .font(.system(size: 10, weight: .medium))
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.black.opacity(0.05))
+        .padding(.horizontal, 7)
+        .padding(.vertical, 3)
+        .background(Color.gray.opacity(0.12))
         .foregroundColor(.secondary)
-        .clipShape(Capsule())
+        .cornerRadius(4)
     }
 }
 

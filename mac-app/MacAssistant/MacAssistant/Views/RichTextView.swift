@@ -63,6 +63,8 @@ private struct MarkdownBlockView: View, Equatable {
                 .fill(Color.gray.opacity(0.14))
                 .frame(height: 1)
                 .padding(.vertical, 2)
+        case let .specialTag(type, content):
+            SpecialTagBlock(type: type, content: content)
         }
     }
 }
@@ -135,6 +137,53 @@ private struct QuoteBlock: View, Equatable {
         .overlay(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(Color.gray.opacity(0.1), lineWidth: 1)
+        )
+    }
+}
+
+private struct SpecialTagBlock: View, Equatable {
+    let type: MarkdownBlock.SpecialTagType
+    let content: String
+    
+    static func == (lhs: SpecialTagBlock, rhs: SpecialTagBlock) -> Bool {
+        lhs.type == rhs.type && lhs.content == rhs.content
+    }
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // 标签头部
+            HStack(spacing: 8) {
+                Image(systemName: type.icon)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(type.color)
+                    .frame(width: 24, height: 24)
+                    .background(type.color.opacity(0.12))
+                    .clipShape(Circle())
+                
+                Text(type.displayName)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(type.color)
+                
+                Spacer()
+            }
+            
+            // 分隔线
+            Rectangle()
+                .fill(type.color.opacity(0.2))
+                .frame(height: 1)
+            
+            // 内容
+            MarkdownInlineText(content, style: .body)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(type.color.opacity(0.05))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(type.color.opacity(0.2), lineWidth: 1)
         )
     }
 }
@@ -535,6 +584,37 @@ private struct MarkdownBlock: Identifiable, Equatable {
         case table(MarkdownTable)
         case codeBlock(code: String, language: String)
         case divider
+        case specialTag(type: SpecialTagType, content: String)
+    }
+    
+    enum SpecialTagType: Equatable {
+        case gatewayRecovery
+        case clawFallback
+        case systemNotice
+        
+        var displayName: String {
+            switch self {
+            case .gatewayRecovery: return "Gateway Recovery"
+            case .clawFallback: return "Claw Fallback"
+            case .systemNotice: return "系统通知"
+            }
+        }
+        
+        var icon: String {
+            switch self {
+            case .gatewayRecovery: return "arrow.triangle.2.circlepath"
+            case .clawFallback: return "arrow.2.circlepath"
+            case .systemNotice: return "info.circle"
+            }
+        }
+        
+        var color: Color {
+            switch self {
+            case .gatewayRecovery: return .orange
+            case .clawFallback: return .blue
+            case .systemNotice: return .gray
+            }
+        }
     }
 }
 
@@ -662,6 +742,29 @@ private enum MarkdownBlockParser {
                 append(.orderedList(items))
                 continue
             }
+            
+            // 检测特殊标签
+            if let specialTag = specialTagInfo(from: trimmed) {
+                var contentLines: [String] = []
+                index += 1
+                
+                // 收集标签后的内容，直到遇到空行或新块
+                while index < lines.count {
+                    let contentLine = lines[index]
+                    let contentTrimmed = contentLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                    
+                    if contentTrimmed.isEmpty || lineStartsNewBlock(lines, at: index) {
+                        break
+                    }
+                    
+                    contentLines.append(contentLine)
+                    index += 1
+                }
+                
+                let content = contentLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                append(.specialTag(type: specialTag.type, content: content.isEmpty ? specialTag.title : content))
+                continue
+            }
 
             var paragraphLines: [String] = []
             while index < lines.count {
@@ -701,6 +804,10 @@ private enum MarkdownBlockParser {
         }
 
         if isTableStart(lines, at: index) || isQuoteLine(line) {
+            return true
+        }
+        
+        if specialTagInfo(from: trimmed) != nil {
             return true
         }
 
@@ -773,6 +880,25 @@ private enum MarkdownBlockParser {
 
         guard !content.isEmpty else { return nil }
         return OrderedListItem(marker: marker, content: content)
+    }
+    
+    private static func specialTagInfo(from line: String) -> (type: MarkdownBlock.SpecialTagType, title: String)? {
+        // 匹配 [Gateway Recovery], [Claw Fallback], [System Notice] 等格式
+        let patterns: [(String, MarkdownBlock.SpecialTagType)] = [
+            ("[Gateway Recovery]", .gatewayRecovery),
+            ("[Claw Fallback]", .clawFallback),
+            ("[System Notice]", .systemNotice),
+            ("[网关恢复]", .gatewayRecovery),
+            ("[系统通知]", .systemNotice)
+        ]
+        
+        for (pattern, type) in patterns {
+            if line.hasPrefix(pattern) {
+                return (type, pattern)
+            }
+        }
+        
+        return nil
     }
 
     private static func listContinuation(from line: String) -> String? {

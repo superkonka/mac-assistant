@@ -67,8 +67,11 @@ class AgentOrchestrator: ObservableObject {
             return .codeAnalysis(language)
         }
         
-        // 文档分析
-        let docKeywords = ["分析 pdf", "分析文档", "总结 pdf", "总结文档", "pdf 内容", "word 文档", "docx"]
+        // 文档分析（仅限明确的PDF/Word文档处理请求，不包含通用的"读取文件"）
+        let docKeywords = [
+            "分析 pdf", "分析文档", "总结 pdf", "总结文档",
+            "pdf 内容", "word 文档", "docx", "解析 pdf"
+        ]
         if docKeywords.contains(where: { lowerInput.contains($0) }) {
             let fileType = detectFileType(lowerInput)
             return .documentAnalysis(fileType)
@@ -94,8 +97,14 @@ class AgentOrchestrator: ObservableObject {
         // 简化版：基于上下文判断
         // 实际实现可以调用轻量级模型进行分类
         
-        // 检查是否包含文件路径
-        if input.contains("/") && (input.contains(".pdf") || input.contains(".doc") || input.contains(".txt")) {
+        // 检查是否包含明确的文档处理请求（路径 + 特定格式）
+        let lowerInput = input.lowercased()
+        let isExplicitDocRequest = [
+            "分析这个pdf", "分析这个pdf", "总结这个pdf", "总结这个pdf",
+            "解析pdf", "解析文档", "提取pdf内容", "提取文档内容"
+        ].contains(where: { lowerInput.contains($0) })
+        
+        if isExplicitDocRequest || (input.contains("/") && input.contains(".pdf")) {
             return .documentAnalysis("pdf")
         }
         
@@ -104,7 +113,7 @@ class AgentOrchestrator: ObservableObject {
             return .imageAnalysis
         }
         
-        // 默认文本对话
+        // 默认文本对话（包含通用的"读取文件"、"建立索引"等）
         return .textChat
     }
     
@@ -160,7 +169,23 @@ class AgentOrchestrator: ObservableObject {
             return .ambiguous(candidates)
         }
         
-        // 3. 无匹配的 Agent，发现能力缺口
+        // 3. 对于文档分析意图，如果没有专门的 Agent，降级使用通用文本 Agent
+        if analyzedIntent == .documentAnalysis {
+            LogInfo("📝 文档分析：尝试降级到通用文本 Agent")
+            if let current = currentAgent,
+               current.capabilities.contains(.textChat) {
+                LogInfo("✅ 当前 Agent 支持文本对话，可以处理简单文档")
+                return .success(current)
+            }
+            
+            let textAgents = agentStore.agents.filter { $0.capabilities.contains(.textChat) }
+            if let firstTextAgent = textAgents.first {
+                LogInfo("✅ 找到文本 Agent: \(firstTextAgent.name)")
+                return .success(firstTextAgent)
+            }
+        }
+        
+        // 4. 无匹配的 Agent，发现能力缺口
         LogInfo("❌ 无匹配的 Agent，发现能力缺口")
         let missingCapabilities = analyzedIntent.requiredCapabilities.filter { req in
             !agentStore.allCapabilities.contains(req)
@@ -172,7 +197,7 @@ class AgentOrchestrator: ObservableObject {
             return .missingAgent(gap)
         }
         
-        // 4. 默认使用 Core Agent
+        // 5. 默认使用 Core Agent
         if let defaultAgent = agentStore.agents.first(where: { $0.isDefault }) {
             return .success(defaultAgent)
         }

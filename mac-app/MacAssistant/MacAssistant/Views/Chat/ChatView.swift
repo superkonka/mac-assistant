@@ -24,6 +24,7 @@ struct ChatView: View {
     @State private var showClawDoctor: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
+    @State private var showCreateSubtask: Bool = false
     @State private var hasAutoPresentedInitialSetup = false
     @State private var lastStreamingScrollAt: Date = .distantPast
     @State private var shouldFollowLatest = true
@@ -103,6 +104,14 @@ struct ChatView: View {
                 }
             )
         }
+        .sheet(isPresented: $showCreateSubtask) {
+            SubtaskCreationView { description, requirements in
+                showCreateSubtask = false
+                createSubtask(description: description, requirements: requirements)
+            } onCancel: {
+                showCreateSubtask = false
+            }
+        }
         .popover(isPresented: $showSkills, attachmentAnchor: .point(.top), arrowEdge: .top) {
             SkillsListView()
                 .frame(width: 760, height: 540)
@@ -137,14 +146,18 @@ struct ChatView: View {
                 showClawDoctor = true
             }
 
-            if !taskSessionsForDisplay.isEmpty {
-                TaskSessionTabsView(
-                    sessions: taskSessionsForDisplay,
-                    selectedSessionID: selectedTaskSessionID,
-                    onToggleSelection: toggleTaskSessionPanel
-                )
-                .frame(maxWidth: 520)
-            }
+            SubtaskManagerView(
+                sessions: taskSessionsForDisplay,
+                onSelectSession: { session in
+                    toggleTaskSessionPanel(session.id)
+                },
+                onCreateSubtask: {
+                    showCreateSubtask = true
+                },
+                onDeleteSession: { sessionID in
+                    deleteTaskSession(sessionID)
+                }
+            )
 
             Spacer(minLength: 12)
 
@@ -531,6 +544,42 @@ struct ChatView: View {
         guard taskSessionIDs.contains(selectedTaskSessionID) else {
             self.selectedTaskSessionID = nil
             return
+        }
+    }
+    
+    private func createSubtask(description: String, requirements: String) {
+        // 创建子任务的具体实现
+        // 这里应该调用 CommandRunner 或其他服务来创建子任务
+        let fullRequest = requirements.isEmpty ? description : """
+            \(description)
+            
+            具体要求：
+            \(requirements)
+            """
+        
+        // 添加到消息中，由 Planner 处理
+        let userMessage = ChatMessage(
+            id: UUID(),
+            role: .user,
+            content: fullRequest,
+            timestamp: Date(),
+            metadata: ["isSubtask": "true"]
+        )
+        
+        commandRunner.messages.append(userMessage)
+        
+        // 清空输入框并发送
+        inputText = fullRequest
+        sendMessage(fullRequest)
+    }
+    
+    private func deleteTaskSession(_ sessionID: String) {
+        // 删除子任务
+        commandRunner.deleteTaskSession(sessionID)
+        
+        // 如果当前选中的被删除了，清空选中状态
+        if selectedTaskSessionID == sessionID {
+            selectedTaskSessionID = nil
         }
     }
 }

@@ -467,7 +467,7 @@ private struct TaskSessionPathRow: View {
     }
 }
 
-private extension TaskSessionStatus {
+extension TaskSessionStatus {
     var taskAccentColor: Color {
         switch self {
         case .queued:

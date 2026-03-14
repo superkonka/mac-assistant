@@ -513,6 +513,20 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             )
         }
 
+        // 判断是否为复杂任务，如果是则拆分为子任务异步执行
+        if RequestPlanningHeuristics.shouldRouteAsComplexSubtask(envelope.originalText) {
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: prepared.text,
+                notices: prepared.notices + ["📝 识别为复杂任务，将拆分为独立子任务异步执行"],
+                requestedAgentSwitch: requestedAgentSwitch,
+                primaryAction: .routeComplexTaskAsSubtask(input: prepared.text),
+                confidence: .medium,
+                reason: "识别为复杂任务（创建/分析/多步骤/长文档），拆出子任务异步执行避免阻塞主会话。"
+            )
+        }
+
         return RequestPlan(
             envelope: envelope,
             parsedInput: parsed,

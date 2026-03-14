@@ -89,6 +89,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
                 agent: agent,
                 sessionKey: sessionKey,
                 sessionLabel: resolvedSessionLabel,
+                requestID: envelope.id.uuidString,
                 text: prompt,
                 images: []
             )

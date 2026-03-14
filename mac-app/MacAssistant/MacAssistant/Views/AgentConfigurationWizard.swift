@@ -85,40 +85,43 @@ struct AgentConfigurationWizard: View {
                 let isActive = index == viewModel.currentStep.rawValue
                 let isCompleted = index < viewModel.currentStep.rawValue
                 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     // 步骤圆圈
                     ZStack {
                         Circle()
                             .fill(backgroundColor(for: step))
-                            .frame(width: 28, height: 28)
+                            .frame(width: 24, height: 24)
                         
                         if isCompleted {
                             Image(systemName: "checkmark")
-                                .font(.system(size: 12, weight: .bold))
+                                .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(.white)
                         } else {
                             Text("\(index + 1)")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.system(size: 11, weight: .medium))
                                 .foregroundColor(isActive ? .white : .secondary)
                         }
                     }
                     
-                    // 步骤标题
+                    // 步骤标题 - 限制宽度防止挤压
                     Text(step.title)
-                        .font(.system(size: 12))
+                        .font(.system(size: 11, weight: isActive ? .medium : .regular))
                         .foregroundColor(isActive ? .primary : (isCompleted ? .primary : .secondary))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
+                .frame(minWidth: 70)
                 
                 // 连接线
                 if index < ConfigurationStep.allCases.count - 1 {
                     Rectangle()
                         .fill(isCompleted ? Color.blue : Color.gray.opacity(0.3))
-                        .frame(height: 2)
-                        .padding(.horizontal, 8)
+                        .frame(height: 1.5)
+                        .padding(.horizontal, 4)
                 }
             }
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 20)
     }
     
     @ViewBuilder
