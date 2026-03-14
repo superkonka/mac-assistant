@@ -8,6 +8,23 @@
 import Foundation
 import OpenClawKit
 
+// MARK: - Prepared Execution
+
+/// 准备好的执行上下文
+struct PreparedExecution {
+    /// 最终 System Prompt
+    let systemPrompt: String?
+    
+    /// 最终 User Message
+    let userMessage: String
+    
+    /// 完整的记忆上下文（用于后续存储）
+    let memoryContext: RetrievedContext?
+    
+    /// 注入结果详情
+    let injectionResult: ContextInjectionResult
+}
+
 /// 上下文注入器：在 Agent 执行前自动注入记忆上下文
 actor ContextInjector {
     
@@ -389,23 +406,6 @@ actor ContextInjector {
             tokenEstimate: current.tokenEstimate
         )
     }
-}
-
-// MARK: - Prepared Execution
-
-/// 准备好的执行上下文
-struct PreparedExecution {
-    /// 最终 System Prompt
-    let systemPrompt: String?
-    
-    /// 最终 User Message
-    let userMessage: String
-    
-    /// 完整的记忆上下文（用于后续存储）
-    let memoryContext: RetrievedContext?
-    
-    /// 注入结果详情
-    let injectionResult: ContextInjectionResult
 }
 
 // MARK: - Array Extension
