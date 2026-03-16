@@ -272,7 +272,6 @@ class OpenClawGatewayRuntimeManager {
                 modelRefsByAgentID[agent.id] = modelRef
                 allowlistedModels[modelRef] = ["alias": agent.name]
                 cliBackends[agent.id] = [
-                    "type": "kimi",
                     "command": "kimi",
                     "args": [
                         "-y",
