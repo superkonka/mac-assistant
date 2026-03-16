@@ -18,6 +18,10 @@ class AgentStore: ObservableObject {
     private let userDefaults = UserDefaults.standard
     private let agentsKey = "macassistant.agents"
     
+    // OpenClaw profile 配置（必须与 OpenClawGatewayRuntimeManager 一致）
+    private let openclawProfileName = "macassistant-wrapper"
+    private let openclawAgentID = "desktop"
+    
     init() {
         loadAgents()
         
@@ -158,8 +162,9 @@ class AgentStore: ObservableObject {
     
     /// 配置 OpenClaw Agent
     private func configureOpenClawAgent(_ agent: Agent, apiKey: String) async throws {
+        // 使用与 OpenClawGatewayRuntimeManager 一致的 profile 路径
         let agentDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/agents/\(agent.id)/agent")
+            .appendingPathComponent(".openclaw-\(openclawProfileName)/agents/\(openclawAgentID)/agent")
         
         // 创建目录
         try FileManager.default.createDirectory(at: agentDir, withIntermediateDirectories: true)
@@ -189,18 +194,18 @@ class AgentStore: ObservableObject {
         let configPath = agentDir.appendingPathComponent("config.json")
         try configData.write(to: configPath)
         
-        // 2. 创建 auth-profiles
+        // 2. 创建 auth-profiles（使用 agent.id 作为 profile key）
         let authProfile: [String: Any] = [
             "version": 1,
             "profiles": [
-                "\(agent.provider.rawValue)-primary": [
+                "\(agent.id)": [
                     "type": "api_key",
                     "provider": agent.provider.rawValue,
                     "key": apiKey
                 ]
             ],
             "lastGood": [
-                agent.provider.rawValue: "\(agent.provider.rawValue)-primary"
+                agent.provider.rawValue: "\(agent.id)"
             ]
         ]
         
@@ -212,13 +217,14 @@ class AgentStore: ObservableObject {
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: configPath.path)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: authPath.path)
         
-        LogInfo("🔧 配置 OpenClaw Agent: \(agent.id)")
+        LogInfo("🔧 配置 OpenClaw Agent: \(agent.id) at \(agentDir.path)")
     }
     
     /// 删除 OpenClaw Agent
     private func deleteOpenClawAgent(_ agent: Agent) async throws {
+        // 使用与 OpenClawGatewayRuntimeManager 一致的 profile 路径
         let agentDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/agents/\(agent.id)")
+            .appendingPathComponent(".openclaw-\(openclawProfileName)/agents/\(openclawAgentID)")
         
         if FileManager.default.fileExists(atPath: agentDir.path) {
             try FileManager.default.removeItem(at: agentDir)
