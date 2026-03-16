@@ -441,20 +441,6 @@ struct TestConnectionStep: View {
                     viewModel.testConnection()
                 }
                 .buttonStyle(SecondaryButtonStyle())
-
-                if viewModel.selectedProvider == .ollama {
-                    HStack(spacing: 12) {
-                        Button("终端执行 kimi login") {
-                            launchKimiLogin()
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-
-                        Button("打开 ~/.kimi/config.toml") {
-                            openKimiConfig()
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-                    }
-                }
             } else if viewModel.testSuccess {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 48))

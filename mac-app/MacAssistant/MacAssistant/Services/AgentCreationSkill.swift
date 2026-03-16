@@ -343,16 +343,16 @@ class AgentCreationSkill {
     }
     
     private func createAPIKeyMessage(provider: ProviderType) -> String {
-        if provider == .ollama {
-            return """
-            ⚙️ \(provider.displayName) 需要先完成 CLI 认证
-
-            这个入口不会直接保存 Kimi CLI 的 API Key。
-            如果你的 Kimi CLI 首次启动时需要选择 provider、登录或输入 API Key，请先在终端执行 `kimi login` 或按 CLI 引导完成。
-
-            完成后回到这里，我会继续帮你验证。
-            """
-        }
+//        if provider == .ollama {
+//            return """
+//            ⚙️ \(provider.displayName) 需要先完成 CLI 认证
+//
+//            这个入口不会直接保存 Kimi CLI 的 API Key。
+//            如果你的 Kimi CLI 首次启动时需要选择 provider、登录或输入 API Key，请先在终端执行 `kimi login` 或按 CLI 引导完成。
+//
+//            完成后回到这里，我会继续帮你验证。
+//            """
+//        }
 
         var message = """
         🔑 请输入 \(provider.displayName) 的 API Key
@@ -401,8 +401,8 @@ class AgentCreationSkill {
             return key.hasPrefix("sk-") && key.count > 20
         case .doubao, .zhipu:
             return key.count > 20
-        case .ollama:
-            return true
+//        case .ollama:
+//            return true
         }
     }
     
@@ -460,9 +460,9 @@ class AgentCreationSkill {
         try await Task.sleep(nanoseconds: 2_000_000_000)
         
         // 简单验证
-        if provider == .ollama {
-            return await AgentStore.shared.validateLocalCodingRuntime()
-        }
+//        if provider == .ollama {
+//            return await AgentStore.shared.validateLocalCodingRuntime()
+//        }
         if provider.requiresAPIKey {
             return validateAPIKey(apiKey, for: provider)
         }

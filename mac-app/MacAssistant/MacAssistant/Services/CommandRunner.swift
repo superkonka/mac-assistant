@@ -2074,7 +2074,7 @@ class CommandRunner: ObservableObject {
     }
 
     private func isKimiCLIAuthenticationFailure(_ error: Error, agent: Agent) -> Bool {
-        agent.provider == .ollama && UserFacingErrorFormatter.isAuthenticationError(error)
+        false
     }
 
     private func maybeStartKimiCLILoginRecovery(after error: Error, for agent: Agent) async {
@@ -2117,14 +2117,6 @@ class CommandRunner: ObservableObject {
         guard UserFacingErrorFormatter.isAuthenticationError(error) ||
                 UserFacingErrorFormatter.isMissingConfigurationError(error) else {
             return nil
-        }
-
-        if failingAgent.provider == .ollama {
-            return """
-            我刚刚尝试让 \(failingAgent.displayName) 调用 Kimi CLI，但检测到 CLI 登录已经失效，所以这次请求没有成功。
-
-            我已经帮你拉起 `kimi login` 登录流程。通常完成网页授权后回到应用就行；如果没有自动弹出终端，也可以手动执行一次 `kimi login`。登录完成后，把刚才的问题再发一次，我会继续处理。
-            """
         }
 
         let requiredCapability = recoveryCapability(for: images)
@@ -2488,10 +2480,6 @@ class CommandRunner: ObservableObject {
         agent: Agent,
         sessionKey: String
     ) -> Bool {
-        guard agent.provider == .ollama else {
-            return false
-        }
-
         if UserFacingErrorFormatter.isAuthenticationError(error) {
             return false
         }
@@ -3812,12 +3800,6 @@ class CommandRunner: ObservableObject {
                 images: images,
                 profile: profile
             )
-        case .ollama:
-            throw NSError(
-                domain: "CommandRunner",
-                code: 17,
-                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
-            )
         }
 
         let finalText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3940,12 +3922,6 @@ class CommandRunner: ObservableObject {
                 text: text,
                 images: images,
                 profile: profile
-            )
-        case .ollama:
-            throw NSError(
-                domain: "CommandRunner",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
             )
         }
 

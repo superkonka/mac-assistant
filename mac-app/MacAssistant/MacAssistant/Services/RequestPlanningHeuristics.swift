@@ -215,7 +215,7 @@ enum RequestPlanningHeuristics {
     }
 
     static func supportsOpenClawTools(_ agent: Agent) -> Bool {
-        agent.provider != .ollama
+        true
     }
 
     static func preferredOpenClawToolAgent(
@@ -277,10 +277,6 @@ enum RequestPlanningHeuristics {
             return true
         }
 
-        if currentAgent.provider == .ollama, hasLink(in: text) {
-            return true
-        }
-
         return false
     }
 
@@ -326,10 +322,6 @@ enum RequestPlanningHeuristics {
             agent.provider.displayName,
             agent.model
         ]
-
-        if agent.provider == .ollama {
-            keywords.append(contentsOf: ["kimi cli", "kimicli", "kimi", "kimi coder", "kimi-local"])
-        }
 
         return keywords
     }

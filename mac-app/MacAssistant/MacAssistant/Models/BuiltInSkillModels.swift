@@ -138,12 +138,11 @@ enum AISkill: String, CaseIterable, Identifiable {
             return .vision
         case .codeReview:
             return .codeAnalysis
-        case .explainSelection, .summarizeText:
-            return .textChat
-        case .translateText:
+        case .explainSelection, .summarizeText, .translateText:
             return .textChat
         case .webSearch:
-            return .webSearch
+            // 网络搜索不需要配置，直接可用
+            return nil
         }
     }
     

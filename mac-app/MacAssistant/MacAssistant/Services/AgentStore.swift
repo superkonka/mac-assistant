@@ -323,7 +323,7 @@ class AgentStore: ObservableObject {
         let candidates = subtaskWorkerAgents(usableOnly: true).filter { agent in
             !excludedIDs.contains(agent.id) &&
             agent.supports(capability) &&
-            (!requireToolSupport || agent.provider != .ollama)
+            true
         }
 
         if let current = currentAgent,
@@ -335,7 +335,7 @@ class AgentStore: ObservableObject {
             !excludedIDs.contains(agent.id) &&
             isAutoRoutable(agent) &&
             agent.supports(capability) &&
-            (!requireToolSupport || agent.provider != .ollama)
+            true
         })
     }
 
@@ -493,8 +493,6 @@ class AgentStore: ObservableObject {
                 return try await validateAnthropic(urlString: urlString, apiKey: cleanKey)
             case .google:
                 return try await validateGoogle(urlString: urlString, apiKey: cleanKey)
-            case .ollama:
-                return await validateLocalCodingRuntimeStatus()
             }
         } catch {
             LogError("API Key 验证失败", error: error)
@@ -934,8 +932,6 @@ class AgentStore: ObservableObject {
         
         // 基础能力
         switch provider {
-        case .ollama:
-            capabilities.append(.codeAnalysis)
         case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])
         }
@@ -959,7 +955,6 @@ class AgentStore: ObservableObject {
     
     private func getEmojiForProvider(_ provider: ProviderType) -> String {
         switch provider {
-        case .ollama: return "🦙"
         case .deepseek: return "🧠"
         case .doubao: return "🎯"
         case .zhipu: return "🟣"
@@ -1153,7 +1148,6 @@ class AgentStore: ObservableObject {
     }
 
     private func isLegacyBootstrapAgent(_ agent: Agent) -> Bool {
-        agent.provider == .ollama &&
         agent.model == "kimi-local" &&
         agent.name == "Kimi Local" &&
         agent.description == "本地运行的 Kimi 助手，快速且私密"

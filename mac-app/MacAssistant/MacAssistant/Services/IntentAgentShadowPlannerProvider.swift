@@ -117,10 +117,6 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
             return preferred
         }
 
-        if let apiAgent = usable.first(where: { $0.provider != .ollama }) {
-            return apiAgent
-        }
-
         if let current = envelope.currentAgent,
            usable.contains(where: { $0.id == current.id }) {
             return current

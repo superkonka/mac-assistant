@@ -266,30 +266,6 @@ class OpenClawGatewayRuntimeManager {
 
         for agent in usableAgents {
             switch agent.provider {
-            case .ollama:
-                guard let commandPath = self.resolveExecutable(named: "kimi") else { continue }
-
-                let providerID = self.providerID(prefix: "kimi-cli", agentID: agent.id)
-                let modelRef = "\(providerID)/default"
-                modelRefsByAgentID[agent.id] = modelRef
-                allowlistedModels[modelRef] = ["alias": agent.name]
-                cliBackends[providerID] = [
-                    "command": commandPath,
-                    "args": [
-                        "--quiet",
-                        "-y",
-                        "--print",
-                        "--input-format", "text",
-                        "--output-format", "text",
-                        "--final-message-only",
-                    ],
-                    "output": "text",
-                    "input": "stdin",
-                    "sessionArg": "--session",
-                    "sessionMode": "always",
-                    "serialize": true,
-                ]
-
             case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
                 guard let profile = self.agentStore.runtimeProfile(for: agent) else { continue }
 
@@ -507,8 +483,6 @@ class OpenClawGatewayRuntimeManager {
         case .google:
             return "google-generative-ai"
         case .moonshot:
-            return "openai-completions"
-        case .ollama:
             return "openai-completions"
         }
     }

@@ -75,7 +75,7 @@ actor OpenClawGatewayClient {
         let prompt = self.normalizedPrompt(text, hasImages: !attachments.isEmpty)
         let startCursor = self.nextPushOrdinal
         let requestStartedAtMs = Date().timeIntervalSince1970 * 1000
-        let allowRelaxedHistoryRecovery = agent.provider != .ollama
+        let allowRelaxedHistoryRecovery = true
         let response = try await self.chatSend(
             sessionKey: resolvedSessionKey,
             message: prompt,

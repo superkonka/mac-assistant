@@ -10,7 +10,7 @@ import Foundation
 // MARK: - Provider Type
 
 enum ProviderType: String, CaseIterable, Codable, Identifiable {
-    case ollama
+    // 已移除: ollama (Kimi CLI)
     case deepseek
     case doubao
     case zhipu
@@ -21,7 +21,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var displayName: String {
         switch self {
-        case .ollama: return "Kimi CLI"
         case .deepseek: return "DeepSeek"
         case .doubao: return "Doubao"
         case .zhipu: return "Zhipu"
@@ -36,7 +35,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var icon: String {
         switch self {
-        case .ollama: return "terminal"
         case .deepseek: return "bolt.circle"
         case .doubao: return "sparkles.rectangle.stack"
         case .zhipu: return "brain"
@@ -49,7 +47,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var emoji: String {
         switch self {
-        case .ollama: return "🦙"
         case .deepseek: return "🧠"
         case .doubao: return "🎯"
         case .zhipu: return "🟣"
@@ -61,12 +58,12 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     }
     
     var requiresAPIKey: Bool {
-        self != .ollama
+        true  // 所有提供商都需要 API Key
     }
 
     var isOpenAICompatible: Bool {
         switch self {
-        case .ollama, .anthropic, .google:
+        case .anthropic, .google:
             return false
         case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             return true
@@ -75,8 +72,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var defaultBaseURL: String {
         switch self {
-        case .ollama:
-            return "http://localhost:11434"
         case .openai:
             return "https://api.openai.com/v1"
         case .anthropic:
@@ -105,8 +100,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var modelPlaceholder: String {
         switch self {
-        case .ollama:
-            return "kimi-local"
         case .openai:
             return "gpt-4o"
         case .anthropic:
@@ -140,9 +133,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 获取最新的可用模型列表
     var availableModels: [String] {
         switch self {
-        case .ollama:
-            return ["kimi-local"]
-
         case .deepseek:
             return [
                 "deepseek-chat",
@@ -208,7 +198,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 默认推荐模型（最新最强）
     var recommendedModel: String {
         switch self {
-        case .ollama: return "kimi-local"
         case .deepseek: return "deepseek-chat"
         case .doubao: return "Doubao-1.5-pro-32k"
         case .zhipu: return "glm-4.7"
@@ -222,8 +211,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 支持视觉/图片分析的模型
     var visionModels: [String] {
         switch self {
-        case .ollama:
-            return []
         case .deepseek:
             return []
         case .doubao:
@@ -243,7 +230,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var apiKeyPlaceholder: String {
         switch self {
-        case .ollama: return "无需 API Key，请先安装并登录 Kimi CLI"
         case .deepseek: return "sk-..."
         case .doubao: return "火山方舟 API Key"
         case .zhipu: return "智谱 API Key"
@@ -256,7 +242,6 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var apiDocsURL: String {
         switch self {
-        case .ollama: return "https://ollama.com/library"
         case .deepseek: return "https://api-docs.deepseek.com/"
         case .doubao: return "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?"
         case .zhipu: return "https://open.bigmodel.cn/"
@@ -423,14 +408,12 @@ struct AgentRoleProfile: Codable, Hashable {
     ) -> AgentRoleProfile {
         var roles: Set<AgentRole> = [.fallback]
 
-        if isFirstAgent || provider == .ollama || capabilities.contains(.codeAnalysis) {
+        if isFirstAgent || capabilities.contains(.codeAnalysis) {
             roles.insert(.primaryChat)
         }
 
-        if provider != .ollama {
-            roles.insert(.planner)
-            roles.insert(.subtaskWorker)
-        }
+        roles.insert(.planner)
+        roles.insert(.subtaskWorker)
 
         if capabilities.contains(.vision) || capabilities.contains(.documentAnalysis) {
             roles.insert(.subtaskWorker)
@@ -581,7 +564,7 @@ struct CapabilityGap: Identifiable, Codable {
 private extension ProviderType {
     var defaultEmoji: String {
         switch self {
-        case .ollama: return "🦙"
+
         case .deepseek: return "🧠"
         case .doubao: return "🎯"
         case .zhipu: return "🟣"

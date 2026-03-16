@@ -133,10 +133,6 @@ class OpenClawBridge {
             return "我这次没有拿到要发送的文字内容，所以还没法继续调用本地 Kimi CLI。你可以把刚才的问题再发一次。"
         }
 
-        guard hasConfiguredLocalAgent else {
-            return "当前还没有配置可用的本地 Kimi CLI Agent，请先在应用里完成首次设置。"
-        }
-
         if let attachmentError = unsupportedAttachmentMessage(for: files) {
             return attachmentError
         }
@@ -221,13 +217,8 @@ class OpenClawBridge {
         return "附件文件: \(path)\n\(content)"
     }
 
-    private var hasConfiguredLocalAgent: Bool {
-        AgentStore.shared.usableAgents.contains { $0.provider == .ollama }
-    }
-
     private func localModelsResponseBody() -> String {
         let models = AgentStore.shared.usableAgents
-            .filter { $0.provider == .ollama }
             .map { agent in
                 [
                     "name": agent.model,

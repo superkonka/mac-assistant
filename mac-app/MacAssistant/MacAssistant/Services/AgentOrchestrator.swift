@@ -200,7 +200,7 @@ class AgentOrchestrator: ObservableObject {
             suggestedProviders = [.google, .moonshot, .openai, .zhipu]
             description = "需要网络搜索能力来获取实时信息"
         default:
-            suggestedProviders = ProviderType.allCases.filter { $0 != .ollama }
+            suggestedProviders = ProviderType.allCases
             description = "需要 \(requiredCapability.displayName) 能力"
         }
         

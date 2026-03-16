@@ -84,15 +84,9 @@ class WizardViewModel: ObservableObject {
         
         // 自动生成名称
         if agentName.isEmpty {
-            if provider == .ollama {
-                agentName = "Kimi Coder"
-                agentDescription = "本地 Kimi CLI 编程 Agent"
-                agentEmoji = "🌙"
-            } else {
-                agentName = "\(provider.displayName) Agent"
-                agentDescription = "基于 \(provider.displayName) 的智能 Agent"
-                agentEmoji = provider.emoji
-            }
+            agentName = "\(provider.displayName) Agent"
+            agentDescription = "基于 \(provider.displayName) 的智能 Agent"
+            agentEmoji = provider.emoji
         }
 
         roleProfile = AgentRoleProfile.suggested(
@@ -199,8 +193,6 @@ class WizardViewModel: ObservableObject {
         try await Task.sleep(nanoseconds: 300_000_000)
 
         switch provider {
-        case .ollama:
-            return await AgentStore.shared.validateLocalCodingRuntime()
         case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             return try await testOpenAICompatibleProvider(provider: provider, apiKey: apiKey)
         case .anthropic:
