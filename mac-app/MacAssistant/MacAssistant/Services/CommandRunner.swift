@@ -1866,6 +1866,13 @@ class CommandRunner: ObservableObject {
                 isProcessing = false
             }
             
+            // 自动保存对话记忆
+            await MemoryWriter.shared.autoSaveFromConversation(
+                userMessage: text,
+                assistantResponse: fullContent,
+                conversationId: mainSession.mainSessionKey
+            )
+            
         } catch {
             logger.logError(error, context: "发送请求到 OpenClaw")
 

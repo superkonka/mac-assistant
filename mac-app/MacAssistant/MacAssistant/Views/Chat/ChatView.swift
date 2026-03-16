@@ -196,14 +196,35 @@ struct ChatView: View {
                             }
                         }
 
-                        // 简化消息显示 - 直接使用 Text 避免复杂渲染
                         ForEach(visibleMessages) { message in
-                            Text(message.content.prefix(500))
-                                .font(.body)
-                                .lineLimit(20)
-                                .padding(8)
-                                .background(message.role == .user ? Color.blue.opacity(0.2) : Color.gray.opacity(0.2))
-                                .cornerRadius(8)
+                            let trace = commandRunner.executionTrace(forMessageID: message.id)
+                            let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
+                            let detectedSkillSuggestion = message.detectedSkillSuggestion
+
+                            if !hidesPlaceholderBubble {
+                                MessageBubble(
+                                    message: message,
+                                    availableWidth: availableBubbleWidth,
+                                    taskSession: nil,
+                                    detectedSkillSuggestion: detectedSkillSuggestion,
+                                    onDetectedSkillSuggestionAction: { action in
+                                        Task {
+                                            await commandRunner.handleDetectedSkillSuggestionAction(
+                                                messageID: message.id,
+                                                action: action
+                                            )
+                                        }
+                                    }
+                                )
+                                .id(message.id.uuidString)
+                            }
+
+                            if let trace {
+                                TraceStripView(
+                                    trace: trace,
+                                    availableWidth: availableBubbleWidth
+                                )
+                            }
                         }
 
                         Color.clear
