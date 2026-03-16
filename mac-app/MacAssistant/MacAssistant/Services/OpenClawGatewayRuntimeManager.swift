@@ -486,12 +486,17 @@ class OpenClawGatewayRuntimeManager {
         usableAgents: [Agent],
         modelRefsByAgentID: [String: String]
     ) -> String? {
-        if let defaultAgent = usableAgents.first(where: \.isDefault),
+        // 优先使用默认 Agent（排除 Kimi CLI，因为它使用 cliBackends 而非 customProviders）
+        if let defaultAgent = usableAgents.first(where: { $0.isDefault && $0.provider != .kimiCLI }),
            let modelRef = modelRefsByAgentID[defaultAgent.id] {
             return modelRef
         }
 
-        return usableAgents.compactMap { modelRefsByAgentID[$0.id] }.first
+        // 如果没有默认 Agent，返回第一个非 Kimi CLI 的 Agent
+        return usableAgents
+            .filter { $0.provider != .kimiCLI }
+            .compactMap { modelRefsByAgentID[$0.id] }
+            .first
     }
 
     private func gatewayAdapter(for provider: ProviderType) -> String {
