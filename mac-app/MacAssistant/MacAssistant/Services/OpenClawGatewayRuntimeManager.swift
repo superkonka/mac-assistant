@@ -266,7 +266,29 @@ class OpenClawGatewayRuntimeManager {
 
         for agent in usableAgents {
             switch agent.provider {
-            case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot, .kimiCLI:
+            case .kimiCLI:
+                // Kimi CLI 配置为 cliBackends，不需要 API Key
+                let modelRef = "kimi-cli/\(agent.id)"
+                modelRefsByAgentID[agent.id] = modelRef
+                allowlistedModels[modelRef] = ["alias": agent.name]
+                cliBackends[agent.id] = [
+                    "type": "kimi",
+                    "command": "kimi",
+                    "args": [
+                        "-y",
+                        "--print",
+                        "--input-format", "text",
+                        "--output-format", "text",
+                        "--final-message-only",
+                    ],
+                    "output": "text",
+                    "input": "stdin",
+                    "sessionArg": "--session",
+                    "sessionMode": "always",
+                    "serialize": true,
+                ]
+                
+            case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
                 guard let profile = self.agentStore.runtimeProfile(for: agent) else { continue }
 
                 let providerID = self.providerID(prefix: agent.provider.rawValue, agentID: agent.id)
