@@ -199,6 +199,8 @@ class WizardViewModel: ObservableObject {
             return try await testAnthropicProvider(apiKey: apiKey)
         case .google:
             return try await testGoogleProvider(apiKey: apiKey)
+        case .kimiCLI:
+            return await AgentStore.shared.validateLocalCodingRuntime()
         }
     }
 
@@ -370,7 +372,7 @@ class WizardViewModel: ObservableObject {
         var capabilities: [Capability] = [.textChat]
 
         switch provider {
-        case .ollama:
+        case .kimiCLI:
             capabilities.append(.codeAnalysis)
         case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])

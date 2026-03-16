@@ -28,7 +28,43 @@ final class WebSearchService {
             return try await githubSummary(for: query)
         }
 
-        return try await duckDuckGoSummary(for: query)
+        // 首先尝试 DuckDuckGo
+        do {
+            return try await duckDuckGoSummary(for: query)
+        } catch {
+            // 如果 DuckDuckGo 失败，尝试使用 Kimi CLI 搜索
+            if let kimiResult = try? await kimiCLISearch(query: query) {
+                return kimiResult
+            }
+            throw error
+        }
+    }
+    
+    /// 使用 Kimi CLI 进行搜索（fallback）
+    private func kimiCLISearch(query: String) async throws -> String {
+        let process = Process()
+        let pipe = Pipe()
+        
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["kimi", "search", query]
+        process.standardOutput = pipe
+        process.standardError = pipe
+        
+        try process.run()
+        process.waitUntilExit()
+        
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        
+        guard process.terminationStatus == 0, !output.isEmpty else {
+            throw WebSearchError.noResults(query: query)
+        }
+        
+        return """
+        🔎 网络搜索结果（Kimi CLI）：\(query)
+        
+        \(output)
+        """
     }
 }
 

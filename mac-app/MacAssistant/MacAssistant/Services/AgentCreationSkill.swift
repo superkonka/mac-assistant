@@ -401,6 +401,8 @@ class AgentCreationSkill {
             return key.hasPrefix("sk-") && key.count > 20
         case .doubao, .zhipu:
             return key.count > 20
+        case .kimiCLI:
+            return true
 //        case .ollama:
 //            return true
         }

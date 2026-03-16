@@ -493,6 +493,8 @@ class AgentStore: ObservableObject {
                 return try await validateAnthropic(urlString: urlString, apiKey: cleanKey)
             case .google:
                 return try await validateGoogle(urlString: urlString, apiKey: cleanKey)
+            case .kimiCLI:
+                return await validateLocalCodingRuntimeStatus()
             }
         } catch {
             LogError("API Key 验证失败", error: error)
@@ -932,7 +934,7 @@ class AgentStore: ObservableObject {
         
         // 基础能力
         switch provider {
-        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot, .kimiCLI:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])
         }
         
@@ -962,6 +964,7 @@ class AgentStore: ObservableObject {
         case .anthropic: return "🅰️"
         case .google: return "🇬"
         case .moonshot: return "🌙"
+        case .kimiCLI: return "🦙"
         }
     }
     

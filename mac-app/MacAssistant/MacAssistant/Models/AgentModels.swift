@@ -10,7 +10,7 @@ import Foundation
 // MARK: - Provider Type
 
 enum ProviderType: String, CaseIterable, Codable, Identifiable {
-    // 已移除: ollama (Kimi CLI)
+    case kimiCLI = "kimi_cli"  // Kimi CLI 本地运行时
     case deepseek
     case doubao
     case zhipu
@@ -21,6 +21,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var displayName: String {
         switch self {
+        case .kimiCLI: return "Kimi CLI"
         case .deepseek: return "DeepSeek"
         case .doubao: return "Doubao"
         case .zhipu: return "Zhipu"
@@ -35,6 +36,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var icon: String {
         switch self {
+        case .kimiCLI: return "terminal"
         case .deepseek: return "bolt.circle"
         case .doubao: return "sparkles.rectangle.stack"
         case .zhipu: return "brain"
@@ -47,6 +49,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var emoji: String {
         switch self {
+        case .kimiCLI: return "🦙"
         case .deepseek: return "🧠"
         case .doubao: return "🎯"
         case .zhipu: return "🟣"
@@ -54,16 +57,17 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "🅰️"
         case .google: return "🇬"
         case .moonshot: return "🌙"
+        case .kimiCLI: return "🦙"
         }
     }
     
     var requiresAPIKey: Bool {
-        true  // 所有提供商都需要 API Key
+        self != .kimiCLI  // Kimi CLI 不需要 API Key
     }
 
     var isOpenAICompatible: Bool {
         switch self {
-        case .anthropic, .google:
+        case .kimiCLI, .anthropic, .google:
             return false
         case .deepseek, .doubao, .zhipu, .openai, .moonshot:
             return true
@@ -72,6 +76,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var defaultBaseURL: String {
         switch self {
+        case .kimiCLI:
+            return "http://localhost:11434"
         case .openai:
             return "https://api.openai.com/v1"
         case .anthropic:
@@ -100,6 +106,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
 
     var modelPlaceholder: String {
         switch self {
+        case .kimiCLI:
+            return "kimi-local"
         case .openai:
             return "gpt-4o"
         case .anthropic:
@@ -133,6 +141,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 获取最新的可用模型列表
     var availableModels: [String] {
         switch self {
+        case .kimiCLI:
+            return ["kimi-local"]
         case .deepseek:
             return [
                 "deepseek-chat",
@@ -198,6 +208,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 默认推荐模型（最新最强）
     var recommendedModel: String {
         switch self {
+        case .kimiCLI: return "kimi-local"
         case .deepseek: return "deepseek-chat"
         case .doubao: return "Doubao-1.5-pro-32k"
         case .zhipu: return "glm-4.7"
@@ -211,6 +222,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     /// 支持视觉/图片分析的模型
     var visionModels: [String] {
         switch self {
+        case .kimiCLI:
+            return []
         case .deepseek:
             return []
         case .doubao:
@@ -230,6 +243,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var apiKeyPlaceholder: String {
         switch self {
+        case .kimiCLI: return "无需 API Key，请先安装并登录 Kimi CLI"
         case .deepseek: return "sk-..."
         case .doubao: return "火山方舟 API Key"
         case .zhipu: return "智谱 API Key"
@@ -242,6 +256,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     
     var apiDocsURL: String {
         switch self {
+        case .kimiCLI: return "https://kimi-cli.moonshot.cn/"
         case .deepseek: return "https://api-docs.deepseek.com/"
         case .doubao: return "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey?"
         case .zhipu: return "https://open.bigmodel.cn/"
@@ -564,7 +579,7 @@ struct CapabilityGap: Identifiable, Codable {
 private extension ProviderType {
     var defaultEmoji: String {
         switch self {
-
+        case .kimiCLI: return "🦙"
         case .deepseek: return "🧠"
         case .doubao: return "🎯"
         case .zhipu: return "🟣"

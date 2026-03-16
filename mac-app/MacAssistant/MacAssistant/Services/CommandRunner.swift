@@ -3800,6 +3800,12 @@ class CommandRunner: ObservableObject {
                 images: images,
                 profile: profile
             )
+        case .kimiCLI:
+            throw NSError(
+                domain: "CommandRunner",
+                code: 20,
+                userInfo: [NSLocalizedDescriptionKey: "Kimi CLI provider 不支持此操作"]
+            )
         }
 
         let finalText = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3922,6 +3928,12 @@ class CommandRunner: ObservableObject {
                 text: text,
                 images: images,
                 profile: profile
+            )
+        case .kimiCLI:
+            throw NSError(
+                domain: "CommandRunner",
+                code: 20,
+                userInfo: [NSLocalizedDescriptionKey: "Kimi CLI provider 不支持此操作"]
             )
         }
 

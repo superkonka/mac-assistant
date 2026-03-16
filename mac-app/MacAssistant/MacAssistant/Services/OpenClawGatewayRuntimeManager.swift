@@ -266,7 +266,7 @@ class OpenClawGatewayRuntimeManager {
 
         for agent in usableAgents {
             switch agent.provider {
-            case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
+            case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot, .kimiCLI:
                 guard let profile = self.agentStore.runtimeProfile(for: agent) else { continue }
 
                 let providerID = self.providerID(prefix: agent.provider.rawValue, agentID: agent.id)
@@ -483,6 +483,8 @@ class OpenClawGatewayRuntimeManager {
         case .google:
             return "google-generative-ai"
         case .moonshot:
+            return "openai-completions"
+        case .kimiCLI:
             return "openai-completions"
         }
     }
