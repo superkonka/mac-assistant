@@ -2907,8 +2907,10 @@ class CommandRunner: ObservableObject {
 
     func toggleTaskSessionExpansion(_ id: String) {
         guard let index = taskSessions.firstIndex(where: { $0.id == id }) else { return }
-        taskSessions[index].isExpanded.toggle()
-        taskSessions[index].updatedAt = Date()
+        var updatedSessions = taskSessions
+        updatedSessions[index].isExpanded.toggle()
+        updatedSessions[index].updatedAt = Date()
+        taskSessions = updatedSessions
     }
 
     @MainActor
@@ -2916,8 +2918,10 @@ class CommandRunner: ObservableObject {
         guard let index = taskSessions.firstIndex(where: { $0.id == id }) else { return }
         guard taskSessions[index].status == .completed else { return }
         guard taskSessions[index].dismissedAt == nil else { return }
-        taskSessions[index].dismissedAt = Date()
-        taskSessions[index].updatedAt = Date()
+        var updatedSessions = taskSessions
+        updatedSessions[index].dismissedAt = Date()
+        updatedSessions[index].updatedAt = Date()
+        taskSessions = updatedSessions
     }
 
     @MainActor
@@ -2989,11 +2993,13 @@ class CommandRunner: ObservableObject {
         guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else {
             return message.id
         }
-        taskSessions[index].messages.append(message)
-        taskSessions[index].updatedAt = Date()
+        var updatedSessions = taskSessions
+        updatedSessions[index].messages.append(message)
+        updatedSessions[index].updatedAt = Date()
         if role == .assistant {
-            taskSessions[index].latestAssistantText = content
+            updatedSessions[index].latestAssistantText = content
         }
+        taskSessions = updatedSessions
         return message.id
     }
 
@@ -3033,46 +3039,52 @@ class CommandRunner: ObservableObject {
         guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
         var didChange = false
+        var updatedSession = taskSessions[index]
 
-        if taskSessions[index].status != status {
-            taskSessions[index].status = status
+        if updatedSession.status != status {
+            updatedSession.status = status
             didChange = true
         }
-        if taskSessions[index].statusSummary != summary {
-            taskSessions[index].statusSummary = summary
+        if updatedSession.statusSummary != summary {
+            updatedSession.statusSummary = summary
             didChange = true
         }
-        if let isExpanded, taskSessions[index].isExpanded != isExpanded {
-            taskSessions[index].isExpanded = isExpanded
+        if let isExpanded, updatedSession.isExpanded != isExpanded {
+            updatedSession.isExpanded = isExpanded
             didChange = true
         }
-        if let resultSummary, taskSessions[index].resultSummary != resultSummary {
-            taskSessions[index].resultSummary = resultSummary
+        if let resultSummary, updatedSession.resultSummary != resultSummary {
+            updatedSession.resultSummary = resultSummary
             didChange = true
         } else if resultSummary == nil,
                   status != .completed,
-                  taskSessions[index].resultSummary != nil {
-            taskSessions[index].resultSummary = nil
+                  updatedSession.resultSummary != nil {
+            updatedSession.resultSummary = nil
             didChange = true
         }
-        if let errorMessage, taskSessions[index].errorMessage != errorMessage {
-            taskSessions[index].errorMessage = errorMessage
+        if let errorMessage, updatedSession.errorMessage != errorMessage {
+            updatedSession.errorMessage = errorMessage
             didChange = true
         } else if errorMessage == nil,
                   status != .failed,
                   status != .partial,
                   status != .waitingUser,
-                  taskSessions[index].errorMessage != nil {
-            taskSessions[index].errorMessage = nil
+                  updatedSession.errorMessage != nil {
+            updatedSession.errorMessage = nil
             didChange = true
         }
-        if status != .completed, taskSessions[index].dismissedAt != nil {
-            taskSessions[index].dismissedAt = nil
+        if status != .completed, updatedSession.dismissedAt != nil {
+            updatedSession.dismissedAt = nil
             didChange = true
         }
 
         guard didChange else { return }
-        taskSessions[index].updatedAt = Date()
+        updatedSession.updatedAt = Date()
+        
+        // Create a new array to trigger @Published notification properly
+        var updatedSessions = taskSessions
+        updatedSessions[index] = updatedSession
+        taskSessions = updatedSessions
     }
 
     @MainActor
@@ -3081,9 +3093,11 @@ class CommandRunner: ObservableObject {
         agent: Agent
     ) {
         guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
-        taskSessions[index].delegateAgentID = agent.id
-        taskSessions[index].delegateAgentName = agent.name
-        taskSessions[index].updatedAt = Date()
+        var updatedSessions = taskSessions
+        updatedSessions[index].delegateAgentID = agent.id
+        updatedSessions[index].delegateAgentName = agent.name
+        updatedSessions[index].updatedAt = Date()
+        taskSessions = updatedSessions
     }
 
     @MainActor
@@ -3099,28 +3113,30 @@ class CommandRunner: ObservableObject {
     ) {
         guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
 
+        var updatedSessions = taskSessions
         if let gatewaySessionKey {
-            taskSessions[index].gatewaySessionKey = gatewaySessionKey
+            updatedSessions[index].gatewaySessionKey = gatewaySessionKey
         }
         if let gatewayRunID {
-            taskSessions[index].gatewayRunID = gatewayRunID
+            updatedSessions[index].gatewayRunID = gatewayRunID
         }
         if let gatewayConversationSessionID {
-            taskSessions[index].gatewayConversationSessionID = gatewayConversationSessionID
+            updatedSessions[index].gatewayConversationSessionID = gatewayConversationSessionID
         }
         if let requestStartedAt {
-            taskSessions[index].requestStartedAt = requestStartedAt
+            updatedSessions[index].requestStartedAt = requestStartedAt
         }
         if let latestAssistantText {
-            taskSessions[index].latestAssistantText = latestAssistantText
+            updatedSessions[index].latestAssistantText = latestAssistantText
         }
         if let canResume {
-            taskSessions[index].canResume = canResume
+            updatedSessions[index].canResume = canResume
         }
         if let lastReconciledAt {
-            taskSessions[index].lastReconciledAt = lastReconciledAt
+            updatedSessions[index].lastReconciledAt = lastReconciledAt
         }
-        taskSessions[index].updatedAt = Date()
+        updatedSessions[index].updatedAt = Date()
+        taskSessions = updatedSessions
     }
 
     @MainActor

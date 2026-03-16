@@ -139,13 +139,22 @@ struct MessageBubble: View, Equatable {
                 )
                 .padding(8)
             } else {
-                RichTextView(
-                    text: message.content,
-                    availableWidth: richContentWidth
-                )
-                    .equatable()
-                    .padding(.horizontal, message.role == .user ? 14 : 16)
-                    .padding(.vertical, message.role == .user ? 10 : 12)
+                // 对于超长内容使用简单的 Text，避免 RichTextView 解析性能问题
+                if message.content.count > 5000 {
+                    Text(message.content)
+                        .font(.system(size: 14))
+                        .lineLimit(50)
+                        .padding(.horizontal, message.role == .user ? 14 : 16)
+                        .padding(.vertical, message.role == .user ? 10 : 12)
+                } else {
+                    RichTextView(
+                        text: message.content,
+                        availableWidth: richContentWidth
+                    )
+                        .equatable()
+                        .padding(.horizontal, message.role == .user ? 14 : 16)
+                        .padding(.vertical, message.role == .user ? 10 : 12)
+                }
             }
         }
         .frame(

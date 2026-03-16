@@ -30,7 +30,6 @@ struct ChatView: View {
     @State private var shouldFollowLatest = true
     @State private var isNearBottom = true
     @State private var hasPerformedInitialBottomAlignment = false
-
     private let bottomAnchorID = "chat-bottom-anchor"
     
     var body: some View {
@@ -45,11 +44,12 @@ struct ChatView: View {
             // 消息列表
             messageList
 
-            if shouldShowProcessingStatusDock {
-                processingStatusDock
-            }
+            // 暂时禁用 processingStatusDock 以排查 CPU 问题
+            // if shouldShowProcessingStatusDock {
+            //     processingStatusDock
+            // }
             
-            Divider()
+            // Divider()
             
             // 当前 Agent 指示器
             currentAgentBar
@@ -196,88 +196,58 @@ struct ChatView: View {
                             }
                         }
 
+                        // 简化消息显示 - 直接使用 Text 避免复杂渲染
                         ForEach(visibleMessages) { message in
-                            let trace = commandRunner.executionTrace(forMessageID: message.id)
-                            let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
-                            let detectedSkillSuggestion = message.detectedSkillSuggestion
-
-                            if !hidesPlaceholderBubble {
-                                MessageBubble(
-                                    message: message,
-                                    availableWidth: availableBubbleWidth,
-                                    taskSession: nil,
-                                    detectedSkillSuggestion: detectedSkillSuggestion,
-                                    onDetectedSkillSuggestionAction: { action in
-                                        Task {
-                                            await commandRunner.handleDetectedSkillSuggestionAction(
-                                                messageID: message.id,
-                                                action: action
-                                            )
-                                        }
-                                    }
-                                )
-                                .id(messageRenderIdentity(for: message))
-                            }
-
-                            if let trace {
-                                TraceStripView(
-                                    trace: trace,
-                                    availableWidth: availableBubbleWidth
-                                )
-                            }
-                        }
-
-                        if commandRunner.isProcessing && commandRunner.currentExecutionTrace == nil {
-                            TypingIndicator()
+                            Text(message.content.prefix(500))
+                                .font(.body)
+                                .lineLimit(20)
+                                .padding(8)
+                                .background(message.role == .user ? Color.blue.opacity(0.2) : Color.gray.opacity(0.2))
+                                .cornerRadius(8)
                         }
 
                         Color.clear
                             .frame(height: 1)
-                            .id(bottomAnchorID)
-                            .background(
-                                GeometryReader { anchorGeometry in
-                                    Color.clear.preference(
-                                        key: ChatBottomAnchorPreferenceKey.self,
-                                        value: anchorGeometry.frame(in: .named("chat-scroll")).maxY
-                                    )
-                                }
-                            )
                     }
-                    .id(messageListRevision)
                     .padding(.vertical, 16)
                     .padding(.horizontal, 12)
                 }
                 .coordinateSpace(name: "chat-scroll")
                 .onAppear {
                     scrollProxy = proxy
-                    performInitialBottomAlignment(using: proxy)
+                    // 暂时禁用自动滚动
+                    // performInitialBottomAlignment(using: proxy)
                 }
-                .onPreferenceChange(ChatBottomAnchorPreferenceKey.self) { bottomMaxY in
-                    let nearBottom = bottomMaxY <= geometry.size.height + 32
-                    isNearBottom = nearBottom
-                    if nearBottom {
-                        shouldFollowLatest = true
-                    }
-                }
-                .onChange(of: commandRunner.messages.count) { _ in
-                    handleMessageCountChange(using: proxy)
-                }
-                .onChange(of: latestMessageRenderIdentity) { _ in
-                    handleLatestMessageMutation(using: proxy)
-                }
-                .onChange(of: commandRunner.currentExecutionTrace?.id) { _ in
-                    if shouldFollowLatest {
-                        scrollToBottom(proxy: proxy, animated: false)
-                    }
-                }
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 4)
-                        .onEnded { _ in
-                            if !isNearBottom {
-                                shouldFollowLatest = false
-                            }
-                        }
-                )
+                // 暂时禁用 onPreferenceChange
+                // .onPreferenceChange(ChatBottomAnchorPreferenceKey.self) { bottomMaxY in
+                //     let nearBottom = bottomMaxY <= geometry.size.height + 32
+                //     DispatchQueue.main.async {
+                //         isNearBottom = nearBottom
+                //         if nearBottom {
+                //             shouldFollowLatest = true
+                //         }
+                //     }
+                // }
+                // 暂时禁用 onChange 以排查 CPU 问题
+                // .onChange(of: commandRunner.messages.count) { _ in
+                //     handleMessageCountChange(using: proxy)
+                // }
+                // .onChange(of: latestMessageRenderIdentity) { _ in
+                //     handleLatestMessageMutation(using: proxy)
+                // }
+                // .onChange(of: commandRunner.currentExecutionTrace?.id) { _ in
+                //     if shouldFollowLatest {
+                //         scrollToBottom(proxy: proxy, animated: false)
+                //     }
+                // }
+                // .simultaneousGesture(
+                //     DragGesture(minimumDistance: 4)
+                //         .onEnded { _ in
+                //             if !isNearBottom {
+                //                 shouldFollowLatest = false
+                //             }
+                //         }
+                // )
             }
         }
     }
