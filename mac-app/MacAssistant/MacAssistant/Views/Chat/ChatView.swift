@@ -15,6 +15,7 @@ struct ChatView: View {
     @StateObject private var intelligence = ConversationIntelligence.shared
     @StateObject private var clawDoctor = OpenClawDoctor.shared
     @StateObject private var skillsBrowserState = SkillsBrowserState.shared
+    @StateObject private var taskManager = TaskManager.shared
     
     @State private var inputText: String = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
@@ -22,6 +23,8 @@ struct ChatView: View {
     @State private var showWizard: Bool = false
     @State private var showSkills: Bool = false
     @State private var showClawDoctor: Bool = false
+    @State private var showDiskMonitor: Bool = false
+    @State private var showToDoList: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
@@ -29,6 +32,9 @@ struct ChatView: View {
     @State private var shouldFollowLatest = true
     @State private var isNearBottom = true
     @State private var hasPerformedInitialBottomAlignment = false
+    
+    // 磁盘监控
+    @ObservedObject private var diskManager = DiskManager.shared
 
     private let bottomAnchorID = "chat-bottom-anchor"
     private let taskShelfTopInset: CGFloat = 88
@@ -48,12 +54,21 @@ struct ChatView: View {
             setupNotifications()
             presentInitialSetupIfNeeded()
             clawDoctor.startMonitoring()
+            Task {
+                await diskManager.startMonitoring()
+            }
+            // 应用回到前台时刷新任务状态
+            refreshTaskSessionsOnForeground()
         }
         .onChange(of: agentStore.usableAgents.count) { _ in
             presentInitialSetupIfNeeded()
         }
         .onChange(of: taskSessionIDs) { _ in
             synchronizeSelectedTaskSession()
+        }
+        // 监听应用从后台进入前台
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshTaskSessionsOnForeground()
         }
         .sheet(isPresented: $showAgentList) {
             AgentListView()
@@ -92,6 +107,13 @@ struct ChatView: View {
         .popover(isPresented: $showClawDoctor, attachmentAnchor: .point(.top), arrowEdge: .top) {
             OpenClawDoctorPanelView(doctor: clawDoctor)
         }
+        .sheet(isPresented: $showDiskMonitor) {
+            DiskMonitorView()
+                .frame(minWidth: 600, minHeight: 500)
+        }
+        .popover(isPresented: $showToDoList, attachmentAnchor: .point(.topTrailing), arrowEdge: .top) {
+            ToDoListView()
+        }
     }
     
     // MARK: - 子视图
@@ -129,6 +151,34 @@ struct ChatView: View {
                     .frame(maxWidth: 220, alignment: .trailing)
             }
 
+            // 子任务按钮
+            SubtaskEntryButton()
+            
+            // 任务列表按钮（ToDoList）
+            Button(action: { showToDoList = true }) {
+                HStack(spacing: 4) {
+                    Image(systemName: "checklist")
+                        .font(.system(size: 14))
+                    let taskCount = TaskManager.shared.pendingTasks.count + TaskManager.shared.runningTasks.count
+                    if taskCount > 0 {
+                        Text("\(taskCount)")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                }
+                .foregroundColor(.primary)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help("任务列表")
+            
+            // 磁盘管理按钮
+            Button(action: { showDiskMonitor = true }) {
+                Image(systemName: "internaldrive")
+                    .font(.system(size: 14))
+                    .foregroundColor(.primary)
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help("磁盘管理")
+            
             // 设置按钮
             Button(action: { showSkills = true }) {
                 Image(systemName: "wand.and.stars")
@@ -435,7 +485,7 @@ struct ChatView: View {
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("ShowCapabilityWizard"),
             object: nil,
-            queue: .main
+            queue: nil
         ) { notification in
             if let gap = notification.object as? CapabilityGap {
                 currentGap = gap
@@ -446,7 +496,7 @@ struct ChatView: View {
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("ShowInitialSetupWizard"),
             object: nil,
-            queue: .main
+            queue: nil
         ) { _ in
             currentGap = nil
             showWizard = true
@@ -455,13 +505,57 @@ struct ChatView: View {
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("ShowSkillsBrowser"),
             object: nil,
-            queue: .main
+            queue: nil
         ) { notification in
             Task { @MainActor in
                 if let panel = notification.object as? String {
                     skillsBrowserState.selectedPanelRawValue = panel
                 }
                 showSkills = true
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("ShowDiskMonitor"),
+            object: nil,
+            queue: nil
+        ) { _ in
+            Task { @MainActor in
+                showDiskMonitor = true
+            }
+        }
+
+        // 监听后台任务状态变化，自动滚动到底部显示新消息
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("TaskSessionStatusChanged"),
+            object: nil,
+            queue: nil
+        ) { [weak conversationController] notification in
+            Task { @MainActor in
+                // 记录任务状态变化
+                if let userInfo = notification.userInfo,
+                   let status = userInfo["status"] as? String {
+                    LogInfo("[ChatView] 收到任务状态变化: \(status)")
+                }
+                
+                // 触发对话控制器刷新
+                conversationController?.objectWillChange.send()
+            }
+        }
+        
+        // 监听子任务状态变化
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("SubtaskStatusChanged"),
+            object: nil,
+            queue: nil
+        ) { notification in
+            Task { @MainActor in
+                // 子任务完成时记录日志
+                if let userInfo = notification.userInfo,
+                   let title = userInfo["title"] as? String,
+                   let status = userInfo["status"] as? String {
+                    LogInfo("[ChatView] 子任务 \(status): \(title)")
+                }
             }
         }
     }
@@ -551,6 +645,26 @@ struct ChatView: View {
             return
         }
     }
+    
+    /// 应用回到前台时刷新任务状态
+    private func refreshTaskSessionsOnForeground() {
+        LogInfo("[ChatView] 应用回到前台，刷新任务状态")
+        
+        // 检查是否有新完成的任务需要显示
+        let completedSessions = conversationController.stores.taskSessionsForDisplay.filter {
+            $0.status == .completed || $0.status == .failed || $0.status == .partial
+        }
+        
+        // 如果有已完成的任务，滚动到底部显示
+        if !completedSessions.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                if let proxy = self.scrollProxy {
+                    self.shouldFollowLatest = true
+                    self.scrollToBottom(proxy: proxy, animated: true, force: true)
+                }
+            }
+        }
+    }
 }
 
 private struct ChatBottomAnchorPreferenceKey: PreferenceKey {
@@ -603,6 +717,71 @@ struct InitialSetupCard: View {
     }
 }
 
+// MARK: - 磁盘警告卡片
+
+struct DiskWarningCard: View {
+    let disk: DiskUsageInfo
+    let onTap: () -> Void
+    
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 12) {
+                Image(systemName: disk.isCritical ? "exclamationmark.triangle.fill" : "internaldrive.fill")
+                    .font(.title2)
+                    .foregroundColor(disk.isCritical ? .red : .orange)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("内置磁盘空间不足")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(.primary)
+                        
+                        Spacer()
+                        
+                        Text("\(Int(disk.usagePercentage))%")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundColor(disk.isCritical ? .red : .orange)
+                    }
+                    
+                    Text("剩余 \(String(format: "%.1f", disk.freeSizeGB)) GB，建议清理缓存或迁移文件到外置磁盘")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                    
+                    // 进度条
+                    GeometryReader { geometry in
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.gray.opacity(0.2))
+                                .frame(height: 4)
+                            
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(disk.isCritical ? Color.red : Color.orange)
+                                .frame(width: geometry.size.width * CGFloat(disk.usagePercentage / 100), height: 4)
+                        }
+                    }
+                    .frame(height: 4)
+                }
+                
+                Image(systemName: "chevron.right")
+                    .foregroundColor(.secondary)
+                    .font(.system(size: 12))
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(disk.isCritical ? Color.red.opacity(0.08) : Color.orange.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(disk.isCritical ? Color.red.opacity(0.3) : Color.orange.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+    }
+}
+
 struct TypingIndicator: View {
     @State private var offset: CGFloat = 0
     
@@ -635,6 +814,7 @@ struct TypingIndicator: View {
 }
 
 private struct InlineProcessingBar: View {
+    @StateObject private var cliProgress = CLIProgressManager.shared
     let trace: ExecutionTrace?
     let fallbackAgentName: String
 
@@ -659,6 +839,38 @@ private struct InlineProcessingBar: View {
             }
 
             Spacer(minLength: 8)
+
+            // 中断按钮
+            if cliProgress.isActive && !cliProgress.isCancelling {
+                Button(action: {
+                    cliProgress.requestCancel()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10))
+                        Text("中断")
+                            .font(.system(size: 10.5, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.red.opacity(0.85))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .help("中断当前执行")
+            } else if cliProgress.isCancelling {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.6)
+                    Text("正在中断...")
+                        .font(.system(size: 10.5, weight: .medium))
+                }
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+            }
 
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 Text(elapsedText(referenceDate: context.date))

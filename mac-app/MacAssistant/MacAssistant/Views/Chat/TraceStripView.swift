@@ -77,6 +77,9 @@ struct TraceStripView: View, Equatable {
             Spacer(minLength: 8)
 
             ElapsedTimeView(trace: trace)
+            
+            // 日志入口按钮
+            ExecutionLogButton(sessionID: trace.id.uuidString)
         }
     }
 

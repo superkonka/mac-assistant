@@ -66,69 +66,77 @@ enum SkillResult {
 // MARK: - Built-in Skills
 
 /// 系统内置 AI 技能
+/// 
+/// 注意：新代码请使用 CoreSkill（在 SimplifiedSkillModels.swift 中定义）
+/// 保留此类型用于向后兼容，建议迁移到 CoreSkill
 enum AISkill: String, CaseIterable, Identifiable {
+    // 系统工具
     case screenshot = "screenshot"
-    case createVisionAgent = "create_vision_agent"
-    case analyzeImage = "analyze_image"
-    case codeReview = "code_review"
+    case analyzeDisk = "analyze_disk"
+    
+    // 文本处理（建议迁移到 CoreSkill.textProcessing）
     case explainSelection = "explain_selection"
     case translateText = "translate_text"
     case summarizeText = "summarize_text"
+    
+    // 代码相关
+    case codeReview = "code_review"
+    
+    // 以下 case 已废弃，将在未来版本移除：
+    // - createVisionAgent → 使用 Agent 模板
+    // - analyzeImage → 合并到 screenshot
     
     var id: String { rawValue }
     
     var name: String {
         switch self {
         case .screenshot: return "截图分析"
-        case .createVisionAgent: return "创建 Vision Agent"
-        case .analyzeImage: return "图片分析"
         case .codeReview: return "代码审查"
         case .explainSelection: return "解释选中内容"
         case .translateText: return "翻译文本"
         case .summarizeText: return "总结文本"
+        case .analyzeDisk: return "磁盘分析"
         }
     }
     
     var emoji: String {
         switch self {
         case .screenshot: return "📸"
-        case .createVisionAgent: return "👁️"
-        case .analyzeImage: return "🖼️"
         case .codeReview: return "📝"
         case .explainSelection: return "💡"
         case .translateText: return "🌐"
         case .summarizeText: return "📋"
+        case .analyzeDisk: return "💾"
         }
     }
     
     var description: String {
         switch self {
         case .screenshot: return "截取屏幕并分析内容"
-        case .createVisionAgent: return "创建支持图片分析的 AI Agent"
-        case .analyzeImage: return "分析图片中的内容和细节"
         case .codeReview: return "审查代码质量并提供建议"
         case .explainSelection: return "解释当前选中的文本或代码"
         case .translateText: return "将文本翻译成其他语言"
         case .summarizeText: return "总结长文本的核心内容"
+        case .analyzeDisk: return "分析磁盘使用情况，发现大文件和优化建议"
         }
     }
     
     var category: SkillCategory {
         switch self {
-        case .screenshot, .analyzeImage:
+        case .screenshot:
             return .analysis
-        case .createVisionAgent:
-            return .agent
         case .codeReview, .explainSelection:
             return .analysis
         case .translateText, .summarizeText:
             return .productivity
+        case .analyzeDisk:
+            return .system
         }
     }
     
     var requiredCapability: Capability? {
         switch self {
-        case .screenshot, .analyzeImage, .createVisionAgent:
+        case .screenshot:
             return .vision
         case .codeReview:
             return .codeAnalysis
@@ -136,18 +144,19 @@ enum AISkill: String, CaseIterable, Identifiable {
             return .textChat
         case .translateText:
             return .textChat
+        case .analyzeDisk:
+            return nil // 不需要特定能力，本地执行
         }
     }
     
     var shortcut: String? {
         switch self {
         case .screenshot: return "⌘⇧5"
-        case .createVisionAgent: return nil
-        case .analyzeImage: return nil
         case .codeReview: return nil
         case .explainSelection: return "⌘⇧E"
         case .translateText: return nil
         case .summarizeText: return nil
+        case .analyzeDisk: return nil
         }
     }
 
@@ -157,11 +166,9 @@ enum AISkill: String, CaseIterable, Identifiable {
              .codeReview,
              .explainSelection,
              .translateText,
-             .summarizeText:
+             .summarizeText,
+             .analyzeDisk:
             return true
-        case .createVisionAgent,
-             .analyzeImage:
-            return false
         }
     }
 }
@@ -181,10 +188,6 @@ class AISkillRegistry: ObservableObject {
     
     /// 检查技能是否可用
     func isAvailable(_ skill: AISkill) -> Bool {
-        if skill == .createVisionAgent || skill == .screenshot {
-            return true
-        }
-
         guard let requiredCapability = skill.requiredCapability else {
             return true
         }
@@ -211,12 +214,6 @@ class AISkillRegistry: ObservableObject {
         case .screenshot:
             return await executeScreenshot(context: context)
             
-        case .createVisionAgent:
-            return await executeCreateVisionAgent(context: context)
-            
-        case .analyzeImage:
-            return await executeAnalyzeImage(context: context)
-            
         case .codeReview:
             return await executeCodeReview(context: context)
             
@@ -228,6 +225,9 @@ class AISkillRegistry: ObservableObject {
             
         case .summarizeText:
             return await executeSummarizeText(context: context)
+            
+        case .analyzeDisk:
+            return await executeAnalyzeDisk(context: context)
         }
     }
     
@@ -237,33 +237,6 @@ class AISkillRegistry: ObservableObject {
         // 触发截图
         context.runner.handleScreenshot()
         return .success(message: "已触发截图")
-    }
-    
-    private func executeCreateVisionAgent(context: MacAssistant.SkillContext) async -> SkillResult {
-        // 检查是否已有 Vision Agent
-        if AgentStore.shared.visionAgents.isEmpty {
-            let gap = CapabilityGap(
-                missingCapability: .vision,
-                suggestedProviders: [.openai, .anthropic, .moonshot, .doubao, .zhipu],
-                description: "需要创建支持视觉理解的 Agent"
-            )
-            return .requiresAgentCreation(gap: gap)
-        }
-        
-        return .success(message: "已有 Vision Agent 可用")
-    }
-    
-    private func executeAnalyzeImage(context: MacAssistant.SkillContext) async -> SkillResult {
-        guard let imagePath = context.images?.first else {
-            return .requiresInput(prompt: "请选择要分析的图片")
-        }
-        
-        // 检查能力
-        if let gap = AgentOrchestrator.shared.discoverGap(for: "分析图片") {
-            return .requiresAgentCreation(gap: gap)
-        }
-        
-        return .success(message: "正在分析图片...")
     }
     
     private func executeCodeReview(context: MacAssistant.SkillContext) async -> SkillResult {
@@ -289,6 +262,21 @@ class AISkillRegistry: ObservableObject {
         }
         
         return .success(message: "正在总结文本...")
+    }
+    
+    private func executeAnalyzeDisk(context: MacAssistant.SkillContext) async -> SkillResult {
+        // 触发磁盘分析
+        await MainActor.run {
+            // 通知显示磁盘管理界面
+            NotificationCenter.default.post(
+                name: NSNotification.Name("ShowDiskMonitor"),
+                object: nil
+            )
+            // 开始资源分析
+            ResourceAnalyzer.shared.startAnalysis()
+        }
+        
+        return .success(message: "已打开磁盘管理器并开始智能资源分析")
     }
 }
 

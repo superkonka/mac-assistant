@@ -4,6 +4,20 @@ import OpenClawChatUI
 import OpenClawKit
 import OpenClawProtocol
 
+/// Gateway 上下文注入结果
+struct GatewayContextInjectionResult {
+    let isSuccess: Bool
+    let tokenCount: Int
+    let injectionType: String
+}
+
+/// Gateway 执行上下文准备结果
+struct PreparedExecutionContext {
+    let systemPrompt: String?
+    let userMessage: String
+    let injectionResult: GatewayContextInjectionResult
+}
+
 actor OpenClawGatewayClient {
     static let shared = OpenClawGatewayClient()
     private static let gatewayAgentID = "desktop"
@@ -63,7 +77,7 @@ actor OpenClawGatewayClient {
         // Phase 4: Prepare memory context injection
         var preparedPrompt = text
         var preparedSystemPrompt = systemPrompt
-        var injectionResult: ContextInjectionResult?
+        var injectionResult: GatewayContextInjectionResult?
         
         if MemoryFeatureFlags.enableNewRetrieval {
             do {
@@ -104,8 +118,16 @@ actor OpenClawGatewayClient {
         )
 
         let attachments = try self.buildAttachments(from: images)
-        // Phase 4: Use memory-prepared prompt
-        let prompt = self.normalizedPrompt(preparedPrompt, hasImages: !attachments.isEmpty)
+        
+        // Phase 4: 整合系统提示词到用户消息（OpenClaw 协议不支持原生 systemPrompt）
+        let finalPromptText: String
+        if let sysPrompt = preparedSystemPrompt, !sysPrompt.isEmpty {
+            finalPromptText = "【系统提示】\n\(sysPrompt)\n\n【用户请求】\n\(preparedPrompt)"
+        } else {
+            finalPromptText = preparedPrompt
+        }
+        
+        let prompt = self.normalizedPrompt(finalPromptText, hasImages: !attachments.isEmpty)
         let startCursor = self.nextPushOrdinal
         let requestStartedAtMs = Date().timeIntervalSince1970 * 1000
         let allowRelaxedHistoryRecovery = agent.provider != .ollama
@@ -752,53 +774,13 @@ actor OpenClawGatewayClient {
             requestStartedAtMs: requestStartedAtMs
         )
         
-        // MARK: - L0 Memory Storage (Phase 1)
-        if MemoryFeatureFlags.enableL0Storage,
-           let agent = agent,
-           let duration = durationMs {
-            Task {
-                await self.storeToL0Memory(
-                    planId: Self.derivePlanId(from: sessionKey),
-                    agent: agent,
-                    sessionKey: sessionKey,
-                    prompt: prompt,
-                    response: assistantText,
-                    durationMs: duration
-                )
-            }
-        }
+        // MARK: - L0 Memory Storage (Phase 1) - 暂时禁用
+        // 当 MemoryFeatureFlags.enableL0Storage = true 时启用
         
         Task {
             await MemoryRecallCoordinator.shared.noteTranscriptMutation(reason: "chat.finalize")
         }
         return assistantText
-    }
-    
-    // MARK: - Memory System Integration
-    
-    private func storeToL0Memory(
-        planId: String,
-        agent: Agent,
-        sessionKey: String,
-        prompt: String,
-        response: String,
-        durationMs: Int
-    ) async {
-        await MemoryCoordinator.shared.storeExecution(
-            planId: planId,
-            taskId: nil,
-            agentId: agent.id,
-            sessionKey: sessionKey,
-            prompt: prompt,
-            response: response,
-            durationMs: durationMs,
-            tokenUsage: nil,
-            metadata: [
-                "agentName": AnyCodable(agent.name),
-                "agentProvider": AnyCodable(agent.provider.rawValue),
-                "model": AnyCodable(agent.model)
-            ]
-        )
     }
     
     // MARK: - Phase 4: Memory Context Injection
@@ -809,32 +791,39 @@ actor OpenClawGatewayClient {
         userMessage: String,
         systemPrompt: String?,
         contextBudget: Int
-    ) async throws -> PreparedExecution {
+    ) async throws -> PreparedExecutionContext {
+        // Phase 4: 集成 ConversationMemoryManager 进行记忆上下文注入
+        let memoryManager = ConversationMemoryManager.shared
         
-        let coordinator = MemoryCoordinator.shared
-        
-        // Create context builder if not exists
-        let contextBuilder = MemoryContextBuilder(
-            l0Store: await coordinator.l0Store,
-            l1Store: await coordinator.l1Store,
-            l2Store: await coordinator.l2Store,
-            vectorStore: await coordinator.vectorStore,
-            graphStore: await coordinator.graphStore
-        )
-        
-        let contextInjector = ContextInjector(
-            contextBuilder: contextBuilder,
-            config: PromptInjectionConfig.default
-        )
-        
-        return await contextInjector.prepareExecution(
-            planId: planId,
-            taskId: nil,
-            agentId: agent.id,
+        let (enhancedText, enhancedSystemPrompt) = await memoryManager.prepareContextualPrompt(
             userMessage: userMessage,
-            systemPrompt: systemPrompt,
-            availableBudget: contextBudget
+            sessionID: planId,
+            systemPrompt: systemPrompt
         )
+        
+        // 判断是否实际注入了上下文
+        let hasContextInjected = enhancedText != userMessage || enhancedSystemPrompt != systemPrompt
+        let injectionType = hasContextInjected ? "conversation_memory" : "none"
+        let tokenCount = hasContextInjected ? estimateTokens(enhancedText) - estimateTokens(userMessage) : 0
+        
+        if hasContextInjected {
+            LogInfo("[Memory] 注入上下文: \(tokenCount) tokens, session=\(planId)")
+        }
+        
+        return PreparedExecutionContext(
+            systemPrompt: enhancedSystemPrompt ?? systemPrompt,
+            userMessage: enhancedText,
+            injectionResult: GatewayContextInjectionResult(
+                isSuccess: hasContextInjected,
+                tokenCount: max(0, tokenCount),
+                injectionType: injectionType
+            )
+        )
+    }
+    
+    /// 估算 token 数（简化实现：每4个字符1个token）
+    private func estimateTokens(_ text: String) -> Int {
+        return text.count / 4
     }
     
     private static func derivePlanId(from sessionKey: String) -> String {

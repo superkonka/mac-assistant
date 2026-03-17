@@ -163,11 +163,32 @@ class CommandRunner: ObservableObject {
         logger.logUserInput(request.text, parsed: plan.parsedInput)
         logRequestPlan(plan)
 
-        // 4. 添加用户消息（显示原始输入）
+        // 4. 记录用户消息到记忆系统（秘书的基本职责：记住用户的话）
+        await MainActor.run {
+            recordConversationToMemory(
+                ChatMessage(
+                    id: UUID(),
+                    role: .user,
+                    content: request.text,
+                    timestamp: Date(),
+                    images: request.images
+                )
+            )
+        }
+        
+        // 5. 准备带记忆上下文的提示词
+        let (enhancedText, _) = await MainActor.run {
+            prepareRequestWithMemory(
+                text: request.text,
+                systemPrompt: nil
+            )
+        }
+        
+        // 6. 添加用户消息（显示原始输入）
         let userMessage = ChatMessage(
             id: UUID(),
             role: .user,
-            content: request.text,
+            content: request.text,  // 显示原始输入
             timestamp: Date(),
             images: request.images
         )
@@ -178,10 +199,29 @@ class CommandRunner: ObservableObject {
             isProcessing = true
         }
 
+        // 7. 执行请求（sendViaGateway 会自动注入记忆上下文）
         await executeRequestPlan(plan, anchorMessageID: userMessageID)
     }
 
-    private func executeRequestPlan(_ plan: RequestPlan, anchorMessageID: UUID) async {
+    private func executeRequestPlan(
+        _ plan: RequestPlan,
+        anchorMessageID: UUID
+    ) async {
+        // MARK: - 启动执行链路日志
+        let sessionID = plan.envelope.id.uuidString
+        await ExecutionLogger.shared.startSession(
+            id: sessionID,
+            userRequest: plan.envelope.originalText
+        )
+        
+        // 记录Planner决策
+        await ExecutionLogger.shared.logPlannerDecision(
+            sessionID: sessionID,
+            action: "\(plan.primaryAction)",
+            reason: plan.reason,
+            confidence: plan.confidence.rawValue
+        )
+        
         if !plan.notices.isEmpty {
             await MainActor.run {
                 for notice in plan.notices {
@@ -328,6 +368,26 @@ class CommandRunner: ObservableObject {
 
         case .routeMainConversation(let input):
             await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
+            
+        // MARK: - 异常处理场景（方案C）
+        case .handleStreamInterrupted(let sessionID, let originalRequest, let partialResult):
+            await handleStreamInterrupted(
+                sessionID: sessionID,
+                originalRequest: originalRequest,
+                partialResult: partialResult,
+                images: plan.envelope.images
+            )
+            
+        case .checkTaskStatus(let sessionID):
+            await handleCheckTaskStatus(sessionID: sessionID)
+            
+        case .autoRecoverTask(let sessionID, let delaySeconds):
+            await BackgroundTaskRecoveryService.shared.scheduleRecovery(
+                sessionID: sessionID,
+                originalRequest: "",
+                delaySeconds: delaySeconds
+            )
+            await MainActor.run { isProcessing = false }
         }
     }
 
@@ -504,10 +564,12 @@ class CommandRunner: ObservableObject {
 
     private func builtInSkillAudienceGroupTitle(for skill: AISkill) -> String {
         switch skill {
-        case .screenshot, .createVisionAgent, .analyzeImage:
+        case .screenshot:
             return "视觉与截图"
         case .codeReview, .explainSelection, .translateText, .summarizeText:
             return "文本与代码"
+        case .analyzeDisk:
+            return "磁盘管理"
         }
     }
 
@@ -1763,16 +1825,33 @@ class CommandRunner: ObservableObject {
         text: String,
         images: [String],
         traceID: UUID? = nil,
-        allowMemoryRecall: Bool = false
+        allowMemoryRecall: Bool = true
     ) async {
         let startTime = Date()
         let mainSession = conversationControl.currentTopology()
+        
+        // MARK: - 统一记忆检索（向量化匹配，无需关键词触发）
+        var memoryContext: UnifiedMemoryContext?
         if allowMemoryRecall {
-            _ = await prepareMemoryRecallPreludeIfNeeded(
-                for: text,
+            memoryContext = await retrieveUnifiedMemoryContext(
+                text: text,
                 sessionKey: mainSession.mainSessionKey,
-                traceID: traceID
+                turns: messages.map { ConversationRecallTurn(role: $0.role.rawValue, content: $0.content) }
             )
+            
+            // 如果找到相关记忆，注入到对话中
+            if let context = memoryContext, await UnifiedMemoryCoordinator.shared.shouldInjectMemory(context) {
+                do {
+                    try await runtimeAdapter.injectAssistantMessage(
+                        sessionKey: mainSession.mainSessionKey,
+                        message: context.formattedContext,
+                        label: "Memory Context"
+                    )
+                    LogInfo("[CommandRunner] 注入统一记忆上下文: \(context.summary)")
+                } catch {
+                    LogWarning("[CommandRunner] 记忆上下文注入失败: \(error)")
+                }
+            }
         }
         let assistantMessage = ChatMessage(
             id: UUID(),
@@ -1797,6 +1876,23 @@ class CommandRunner: ObservableObject {
                 }
             }
 
+            // 记录开始发送
+            let sessionID = assistantMessage.id.uuidString
+            await ExecutionLogger.shared.startSession(
+                id: sessionID, 
+                userRequest: "[AgentRequest] \(text.prefix(50))"
+            )
+            await ExecutionLogger.shared.log(
+                sessionID: sessionID,
+                level: .info,
+                component: "OpenClaw",
+                message: "开始发送请求",
+                details: [
+                    "agent": agent.name,
+                    "sessionKey": mainSession.mainSessionKey
+                ]
+            )
+            
             let fullContent = try await sendViaGateway(
                 agent: agent,
                 sessionKey: mainSession.mainSessionKey,
@@ -1809,6 +1905,19 @@ class CommandRunner: ObservableObject {
             let duration = Date().timeIntervalSince(startTime)
             logger.logSystemResponse(fullContent, agent: agent)
             logger.logPerformance(operation: "openclaw_request", duration: duration)
+            
+            // 记录成功完成
+            await ExecutionLogger.shared.log(
+                sessionID: sessionID,
+                level: .success,
+                component: "OpenClaw",
+                message: "请求处理完成",
+                details: ["duration": "\(String(format: "%.2f", duration))s"]
+            )
+            await ExecutionLogger.shared.endSession(
+                id: sessionID,
+                status: .completed
+            )
             
             await MainActor.run {
                 upsertAssistantMessage(
@@ -1919,7 +2028,9 @@ class CommandRunner: ObservableObject {
                 }
             }
 
-            let userFacingMessage = await recoveryGuidanceMessage(
+            // MARK: - 方案C：Planner驱动的异常处理决策
+            // 先显示基础错误信息
+            let baseUserFacingMessage = await recoveryGuidanceMessage(
                 after: terminalError,
                 failingAgent: terminalAgent,
                 text: text,
@@ -1929,8 +2040,87 @@ class CommandRunner: ObservableObject {
                 agentName: terminalAgent.displayName,
                 providerName: terminalAgent.provider.displayName
             )
+            
+            // 如果是流中断，让Planner做智能决策
+            var finalMessage = baseUserFacingMessage
+            var shouldScheduleBackgroundRecovery = false
+            var backgroundRecoveryDelay = 10
+            
+            if UserFacingErrorFormatter.isStreamInterruptedError(terminalError) {
+                let decision = await ExceptionHandlingPlanner.shared.planExceptionHandling(
+                    error: terminalError,
+                    sessionID: mainSession.mainSessionKey,
+                    originalRequest: text,
+                    partialResult: nil,
+                    recentUserInput: text,
+                    taskCharacteristics: TaskCharacteristics(
+                        isLongRunning: text.count > 200 || text.contains("部署") || text.contains("配置"),
+                        estimatedDuration: nil,
+                        requiresUserInteraction: false,
+                        hasSideEffects: text.contains("创建") || text.contains("删除") || text.contains("部署")
+                    )
+                )
+                
+                LogInfo("[CommandRunner] Planner异常决策: \(decision.action), 理由: \(decision.reasoning)")
+                
+                // 根据决策执行不同策略
+                switch decision.action {
+                case .autoRecoverNow:
+                    // 立即恢复，修改消息提示
+                    finalMessage = baseUserFacingMessage + "\n\n🔄 正在自动尝试恢复..."
+                    
+                case .scheduleBackgroundRecovery(let delay):
+                    // 安排后台恢复（方案A：兜底）
+                    shouldScheduleBackgroundRecovery = true
+                    backgroundRecoveryDelay = delay
+                    finalMessage = baseUserFacingMessage + "\n\n⏱️ 已安排在\(delay)秒后自动检查恢复，你也可以点击「继续处理」立即恢复。"
+                    
+                case .convertToBackgroundTask:
+                    // 转为后台任务
+                    shouldScheduleBackgroundRecovery = true
+                    backgroundRecoveryDelay = 5
+                    finalMessage = baseUserFacingMessage + "\n\n🔄 这是一个可能需要较长时间的任务，已转为后台继续执行，完成后会通知你。"
+                    
+                case .promptCheckStatus:
+                    // 提示检查状态（方案B：用户触发）
+                    finalMessage = baseUserFacingMessage + "\n\n💡 你可以发送「检查状态」查看任务当前进展。"
+                    
+                case .waitForUserInput, .offerRecoveryOptions:
+                    // 等待用户输入，保持默认消息
+                    break
+                }
+                
+                // 执行决策
+                let scenario = ExceptionScenario(
+                    type: .streamInterrupted,
+                    sessionID: mainSession.mainSessionKey,
+                    originalRequest: text,
+                    partialResult: nil,
+                    error: terminalError,
+                    context: ExceptionScenario.ExceptionContext(
+                        hasPartialResult: false,
+                        isLongRunningTask: text.count > 200,
+                        hasBackgroundRecoveryScheduled: shouldScheduleBackgroundRecovery,
+                        userIntent: .unknown
+                    )
+                )
+                await ExceptionHandlingPlanner.shared.executeDecision(decision, scenario: scenario, runner: self)
+            }
+            
             let terminalAgentID = terminalAgent.id
             let terminalAgentName = terminalAgent.name
+            
+            // 记录异常结束
+            await ExecutionLogger.shared.logError(
+                sessionID: mainSession.mainSessionKey,
+                component: "CommandRunner",
+                error: terminalError,
+                context: "请求处理失败"
+            )
+            await ExecutionLogger.shared.endSession(
+                id: mainSession.mainSessionKey,
+                status: .failed
+            )
             
             await MainActor.run {
                 if let traceID {
@@ -1940,12 +2130,12 @@ class CommandRunner: ObservableObject {
                     template: ChatMessage(
                         id: assistantMessage.id,
                         role: .assistant,
-                        content: userFacingMessage,
+                        content: finalMessage,
                         timestamp: assistantMessage.timestamp,
                         agentId: terminalAgentID,
                         agentName: terminalAgentName
                     ),
-                    content: userFacingMessage
+                    content: finalMessage
                 )
                 isProcessing = false
             }
@@ -2267,14 +2457,25 @@ class CommandRunner: ObservableObject {
         taskSessionID: String? = nil,
         assistantMessageID: UUID
     ) async throws -> String {
+        // MARK: - Memory Context Injection
+        // 秘书的基本职责：记住上下文，在发送前增强提示词
+        let (enhancedText, enhancedSystemPrompt) = await MainActor.run {
+            prepareRequestWithMemory(
+                text: text,
+                sessionID: taskSessionID ?? sessionKey,
+                systemPrompt: nil
+            )
+        }
+        
         do {
             let content = try await runtimeAdapter.sendMessage(
                 agent: agent,
                 sessionKey: sessionKey,
                 sessionLabel: sessionLabel,
                 requestID: assistantMessageID.uuidString.lowercased(),
-                text: text,
+                text: enhancedText,  // 使用增强后的文本
                 images: images,
+                systemPrompt: enhancedSystemPrompt,  // Phase 4: 传递增强的系统提示词
                 onAssistantText: { [weak self] partialText in
                     guard let self else { return }
                     guard self.gatewayReturnedError(partialText) == nil else { return }
@@ -2318,6 +2519,29 @@ class CommandRunner: ObservableObject {
                     self.updateAssistantMessage(id: assistantMessageID, content: resolvedContent)
                 }
             }
+            
+            // MARK: - 统一记忆索引（向量化存储，用于后续检索）
+            let memorySessionKey = taskSessionID ?? sessionKey
+            await MainActor.run {
+                indexToUnifiedMemory(
+                    sessionKey: memorySessionKey,
+                    userMessage: text,
+                    assistantResponse: resolvedContent
+                )
+                
+                // 同时记录到旧记忆系统（向后兼容）
+                recordConversationToMemory(
+                    ChatMessage(
+                        id: assistantMessageID,
+                        role: .assistant,
+                        content: resolvedContent,
+                        timestamp: Date(),
+                        agentId: agent.id,
+                        agentName: agent.name
+                    ),
+                    sessionID: memorySessionKey
+                )
+            }
 
             return resolvedContent
         } catch {
@@ -2328,7 +2552,8 @@ class CommandRunner: ObservableObject {
                 text: text,
                 images: images,
                 taskSessionID: taskSessionID,
-                assistantMessageID: assistantMessageID
+                assistantMessageID: assistantMessageID,
+                systemPrompt: enhancedSystemPrompt  // Phase 4: 传递增强的系统提示词
             ) {
                 return fallbackContent
             }
@@ -2343,7 +2568,8 @@ class CommandRunner: ObservableObject {
         text: String,
         images: [String],
         taskSessionID: String?,
-        assistantMessageID: UUID
+        assistantMessageID: UUID,
+        systemPrompt: String? = nil  // Phase 4: 支持记忆上下文注入
     ) async throws -> String? {
         guard shouldFallbackToDirectKimiCLI(after: error, agent: agent, sessionKey: sessionKey) else {
             return nil
@@ -2389,7 +2615,8 @@ class CommandRunner: ObservableObject {
                 attachments: images,
                 sessionKey: sessionKey,
                 timeout: policy.timeout,
-                requestSource: "openclaw-fallback:\(policy.logReason)"
+                requestSource: "openclaw-fallback:\(policy.logReason)",
+                systemPrompt: systemPrompt  // Phase 4: 传递系统提示词
             )
             let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "本地 Kimi CLI 已执行，但没有返回可显示的内容。"
@@ -2684,6 +2911,15 @@ class CommandRunner: ObservableObject {
 
         guard didChange else { return }
         taskSessions[index].updatedAt = Date()
+        
+        // 通知后台任务状态变化（插入主对话）
+        notifyTaskSessionStatusChange(
+            sessionID: sessionID,
+            title: taskSessions[index].title,
+            status: status,
+            resultSummary: resultSummary,
+            errorMessage: errorMessage
+        )
     }
 
     @MainActor
@@ -2926,39 +3162,129 @@ class CommandRunner: ObservableObject {
             }
             return true
         } catch {
-            let message = UserFacingErrorFormatter.chatMessage(
-                for: error,
-                agentName: agent.displayName,
-                providerName: agent.provider.displayName
-            )
-            await MainActor.run {
-                updateTaskSessionStatus(
-                    sessionID: sessionID,
-                    status: UserFacingErrorFormatter.isStreamInterruptedError(error) ? .partial : .failed,
-                    summary: UserFacingErrorFormatter.isStreamInterruptedError(error)
-                        ? "继续处理中再次中断，已保留现场"
-                        : "\(agent.displayName) 继续处理失败",
-                    isExpanded: true,
-                    errorMessage: message
-                )
-                updateTaskSessionRecoveryContext(
-                    sessionID: sessionID,
-                    canResume: UserFacingErrorFormatter.isStreamInterruptedError(error),
-                    lastReconciledAt: Date()
-                )
-                if let latestAssistantText = snapshot.latestAssistantText,
-                   UserFacingErrorFormatter.isStreamInterruptedError(error),
-                   let assistantMessageID = latestAssistantMessageID(forTaskSessionID: sessionID) {
+            // MARK: - Smart Recovery for Manual Resume
+            LogInfo("CommandRunner: 手动恢复失败，尝试智能恢复 taskSessionID=\(sessionID)")
+            
+            let recoveryResult = await SmartRecoveryExecutor.shared.smartRecover(
+                taskSessionID: sessionID,
+                agent: agent,
+                text: snapshot.originalRequest,
+                images: snapshot.inputImages ?? [],
+                error: error,
+                previousSnapshot: nil
+            ) { [weak self] message in
+                Task { @MainActor in
+                    self?.updateTaskSessionMessage(
+                        sessionID: sessionID,
+                        messageID: assistantMessageID,
+                        content: message
+                    )
+                }
+            }
+            
+            switch recoveryResult {
+            case .success(let content):
+                await MainActor.run {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .completed,
+                        summary: "\(agent.displayName) 通过智能恢复完成",
+                        isExpanded: false,
+                        resultSummary: summarizeTaskResult(content),
+                        errorMessage: nil
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        latestAssistantText: content,
+                        canResume: false,
+                        lastReconciledAt: Date()
+                    )
+                    appendAssistantConversationMessage("我已经通过智能恢复完成了任务：\n\n\(content)")
+                    isProcessing = false
+                }
+                return true
+                
+            case .partial(let content, let plan):
+                await MainActor.run {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .partial,
+                        summary: "智能恢复部分完成，需要继续处理",
+                        isExpanded: true,
+                        errorMessage: content
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        latestAssistantText: content,
+                        canResume: true,
+                        lastReconciledAt: Date()
+                    )
+                    isProcessing = false
+                }
+                return false
+                
+            case .needsConfirmation(_):
+                await MainActor.run {
+                    let confirmationMessage = """
+                    🤖 智能分析完成
+                    
+                    问题: 执行中断或超时
+                    建议: 自动调整超时设置、尝试备用 Agent 或拆分任务
+                    
+                    请再次点击「继续处理」确认执行调优方案。
+                    """
                     updateTaskSessionMessage(
                         sessionID: sessionID,
                         messageID: assistantMessageID,
-                        content: latestAssistantText
+                        content: confirmationMessage
                     )
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: .waitingUser,
+                        summary: "等待确认调优方案",
+                        isExpanded: true,
+                        errorMessage: confirmationMessage
+                    )
+                    isProcessing = false
                 }
-                appendSystemMessage(message)
-                isProcessing = false
+                return false
+                
+            case .failed, .inProgress:
+                // 使用原有错误处理
+                let message = UserFacingErrorFormatter.chatMessage(
+                    for: error,
+                    agentName: agent.displayName,
+                    providerName: agent.provider.displayName
+                )
+                await MainActor.run {
+                    updateTaskSessionStatus(
+                        sessionID: sessionID,
+                        status: UserFacingErrorFormatter.isStreamInterruptedError(error) ? .partial : .failed,
+                        summary: UserFacingErrorFormatter.isStreamInterruptedError(error)
+                            ? "继续处理中再次中断，已保留现场"
+                            : "\(agent.displayName) 继续处理失败",
+                        isExpanded: true,
+                        errorMessage: message
+                    )
+                    updateTaskSessionRecoveryContext(
+                        sessionID: sessionID,
+                        canResume: UserFacingErrorFormatter.isStreamInterruptedError(error),
+                        lastReconciledAt: Date()
+                    )
+                    if let latestAssistantText = snapshot.latestAssistantText,
+                       UserFacingErrorFormatter.isStreamInterruptedError(error),
+                       let assistantMessageID = latestAssistantMessageID(forTaskSessionID: sessionID) {
+                        updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: latestAssistantText
+                        )
+                    }
+                    appendSystemMessage(message)
+                    isProcessing = false
+                }
+                return false
             }
-            return false
         }
     }
 
@@ -3130,6 +3456,146 @@ class CommandRunner: ObservableObject {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
+            // MARK: - Smart Recovery Integration
+            // 尝试智能自动恢复
+            let shouldAttemptAutoRecovery = isStreamInterrupted || 
+                UserFacingErrorFormatter.isTransientServiceError(terminalError)
+            
+            if shouldAttemptAutoRecovery {
+                LogInfo("CommandRunner: 尝试智能恢复 taskSessionID=\(sessionID)")
+                
+                // 构建执行快照
+                let snapshot = ExecutionSnapshot(
+                    timestamp: Date(),
+                    taskSessionID: sessionID,
+                    agentID: UUID(uuidString: sessionID) ?? UUID(),
+                    status: "failed",
+                    progress: 0.5,
+                    duration: -requestStartedAt.timeIntervalSinceNow,
+                    retryCount: 0,
+                    lastError: terminalError.localizedDescription,
+                    partialResult: preservedAssistantText,
+                    configSnapshot: [
+                        "timeout": "120",
+                        "agentProvider": terminalAgent.provider.rawValue
+                    ]
+                )
+                
+                // 调用智能恢复执行器
+                let recoveryResult = await SmartRecoveryExecutor.shared.smartRecover(
+                    taskSessionID: sessionID,
+                    agent: terminalAgent,
+                    text: text,
+                    images: images,
+                    error: terminalError,
+                    previousSnapshot: snapshot
+                ) { [weak self] message in
+                    Task { @MainActor in
+                        self?.updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: message
+                        )
+                    }
+                }
+                
+                // 处理恢复结果
+                switch recoveryResult {
+                case .success(let content):
+                    // 恢复成功
+                    await MainActor.run {
+                        self.updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: content
+                        )
+                        self.updateTaskSessionStatus(
+                            sessionID: sessionID,
+                            status: .completed,
+                            summary: "\(terminalAgentName) 通过智能恢复完成",
+                            isExpanded: false,
+                            resultSummary: self.summarizeTaskResult(content),
+                            errorMessage: nil
+                        )
+                        self.updateTaskSessionRecoveryContext(
+                            sessionID: sessionID,
+                            latestAssistantText: content,
+                            canResume: false,
+                            lastReconciledAt: Date()
+                        )
+                    }
+                    return TaskExecutionResult(agent: terminalAgent, content: content, failed: false)
+                    
+                case .partial(let content, _):
+                    // 部分恢复，需要继续
+                    await MainActor.run {
+                        self.updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: content
+                        )
+                        self.updateTaskSessionStatus(
+                            sessionID: sessionID,
+                            status: .partial,
+                            summary: "智能恢复部分完成，需要继续处理",
+                            isExpanded: true,
+                            errorMessage: content
+                        )
+                        self.updateTaskSessionRecoveryContext(
+                            sessionID: sessionID,
+                            latestAssistantText: content,
+                            canResume: true,
+                            lastReconciledAt: Date()
+                        )
+                    }
+                    return TaskExecutionResult(agent: terminalAgent, content: content, failed: true)
+                    
+                case .needsConfirmation(_):
+                    // 需要用户确认
+                    await MainActor.run {
+                        let confirmationMessage = """
+                        🤖 智能分析完成
+                        
+                        问题: 执行中断或超时
+                        
+                        建议调优方案：
+                        自动调整超时设置、尝试备用 Agent 或拆分任务
+                        
+                        请点击任务卡片中的「继续处理」确认执行调优方案。
+                        """
+                        self.updateTaskSessionMessage(
+                            sessionID: sessionID,
+                            messageID: assistantMessageID,
+                            content: confirmationMessage
+                        )
+                        self.updateTaskSessionStatus(
+                            sessionID: sessionID,
+                            status: .waitingUser,
+                            summary: "等待确认调优方案",
+                            isExpanded: true,
+                            errorMessage: confirmationMessage
+                        )
+                        self.updateTaskSessionRecoveryContext(
+                            sessionID: sessionID,
+                            latestAssistantText: "等待用户确认调优方案",
+                            canResume: true,
+                            lastReconciledAt: Date()
+                        )
+                    }
+                    return TaskExecutionResult(agent: terminalAgent, content: userFacingMessage, failed: true)
+                    
+                case .failed(let errorMessage):
+                    // 恢复失败，显示原错误
+                    LogWarning("Smart recovery failed: \(errorMessage)")
+                    // 继续执行原有错误处理逻辑
+                    fallthrough
+                    
+                case .inProgress:
+                    // 恢复进行中
+                    return TaskExecutionResult(agent: terminalAgent, content: "恢复中...", failed: true)
+                }
+            }
+            
             await MainActor.run {
                 if isStreamInterrupted {
                     let shouldPreservePartialOutput =
@@ -4490,3 +4956,86 @@ class CommandRunner: ObservableObject {
 }
 
 // 注意: ChatMessage 定义在 ChatModels.swift 中共享使用
+
+// MARK: - 异常处理函数（方案C）
+
+extension CommandRunner {
+    
+    /// 处理流中断异常
+    func handleStreamInterrupted(
+        sessionID: String,
+        originalRequest: String,
+        partialResult: String?,
+        images: [String]
+    ) async {
+        LogInfo("[CommandRunner] 处理流中断: session=\(sessionID)")
+        
+        // 触发后台恢复作为兜底
+        await BackgroundTaskRecoveryService.shared.scheduleRecovery(
+            sessionID: sessionID,
+            originalRequest: originalRequest,
+            delaySeconds: 10
+        )
+        
+        await MainActor.run {
+            messages.append(
+                ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: """
+                    🔄 已启动自动恢复流程
+                    
+                    检测到连接中断，已安排在10秒后自动尝试恢复。你也可以：
+                    • 点击任务卡片「继续处理」立即恢复
+                    • 发送「检查状态」查看当前进展
+                    """,
+                    timestamp: Date(),
+                    agentId: "builtin-recovery",
+                    agentName: "恢复助手"
+                )
+            )
+            isProcessing = false
+        }
+    }
+    
+    /// 处理检查任务状态请求（方案B）
+    func handleCheckTaskStatus(sessionID: String) async {
+        LogInfo("[CommandRunner] 检查任务状态: session=\(sessionID)")
+        
+        let result = await TaskStatusChecker.shared.checkTaskStatus(sessionID: sessionID)
+        
+        let statusMessage: String
+        switch result.status {
+        case .running:
+            statusMessage = "⏳ 任务仍在运行中..."
+        case .completed:
+            statusMessage = "✅ 任务已完成"
+        case .stalled:
+            statusMessage = "⚠️ 任务似乎卡住了"
+        case .error:
+            statusMessage = "❌ 任务执行出错"
+        case .unknown:
+            statusMessage = "❓ 任务状态未知"
+        }
+        
+        await MainActor.run {
+            messages.append(
+                ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: """
+                    \(statusMessage)
+                    
+                    \(result.hasNewOutput ? "发现新输出:\n\(result.latestOutput ?? "")" : "暂无新进展")
+                    
+                    建议: \(TaskStatusChecker.shared.getActionDescription(result.suggestedAction))
+                    """,
+                    timestamp: Date(),
+                    agentId: "builtin-status-checker",
+                    agentName: "状态检查"
+                )
+            )
+            isProcessing = false
+        }
+    }
+}

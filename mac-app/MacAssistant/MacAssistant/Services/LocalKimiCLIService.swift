@@ -10,7 +10,8 @@ final class LocalKimiCLIService {
         attachments: [String],
         sessionKey: String?,
         timeout: TimeInterval = 180,
-        requestSource: String = "direct"
+        requestSource: String = "direct",
+        systemPrompt: String? = nil  // Phase 4: 支持记忆上下文注入
     ) async throws -> String {
         try await Task.detached(priority: .userInitiated) {
             if let attachmentError = self.unsupportedAttachmentMessage(for: attachments) {
@@ -29,7 +30,7 @@ final class LocalKimiCLIService {
                 )
             }
 
-            let prompt = self.composePrompt(text: text, attachments: attachments)
+            let prompt = self.composePrompt(text: text, attachments: attachments, systemPrompt: systemPrompt)
             let normalizedSessionKey = self.normalizedSessionKey(sessionKey)
             let process = Process()
             let inputPipe = Pipe()
@@ -165,19 +166,29 @@ final class LocalKimiCLIService {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    private func composePrompt(text: String, attachments: [String]) -> String {
+    private func composePrompt(text: String, attachments: [String], systemPrompt: String? = nil) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachmentBlock = attachments.compactMap(readTextAttachment).joined(separator: "\n\n")
-
-        if attachmentBlock.isEmpty {
-            return trimmed.isEmpty ? "你好" : trimmed
+        
+        // Phase 4: 整合系统提示词（CLI 不原生支持，拼接到用户消息中）
+        var finalPrompt = ""
+        
+        if let sysPrompt = systemPrompt, !sysPrompt.isEmpty {
+            finalPrompt += "【系统提示】\n\(sysPrompt)\n\n"
         }
-
-        if trimmed.isEmpty {
-            return attachmentBlock
+        
+        if !attachmentBlock.isEmpty {
+            finalPrompt += attachmentBlock
+            if !trimmed.isEmpty {
+                finalPrompt += "\n\n"
+            }
         }
-
-        return "\(attachmentBlock)\n\n\(trimmed)"
+        
+        if !trimmed.isEmpty {
+            finalPrompt += trimmed
+        }
+        
+        return finalPrompt.isEmpty ? "你好" : finalPrompt
     }
 
     private func readTextAttachment(at path: String) -> String? {

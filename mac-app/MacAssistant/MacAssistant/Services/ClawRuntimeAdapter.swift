@@ -13,6 +13,7 @@ protocol ClawRuntimeAdapter: Actor {
         requestID: String,
         text: String,
         images: [String],
+        systemPrompt: String?,  // Phase 4: 支持记忆上下文注入
         onAssistantText: (@Sendable (String) async -> Void)?
     ) async throws -> String
 
@@ -47,6 +48,7 @@ actor OpenClawRuntimeAdapter: ClawRuntimeAdapter {
         requestID: String,
         text: String,
         images: [String],
+        systemPrompt: String? = nil,
         onAssistantText: (@Sendable (String) async -> Void)?
     ) async throws -> String {
         try await gatewayClient.sendMessage(
@@ -56,6 +58,7 @@ actor OpenClawRuntimeAdapter: ClawRuntimeAdapter {
             requestID: requestID,
             text: text,
             images: images,
+            systemPrompt: systemPrompt,
             onAssistantText: onAssistantText
         )
     }

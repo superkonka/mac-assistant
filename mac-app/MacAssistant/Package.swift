@@ -42,7 +42,11 @@ let package = Package(
                 "MemorySystem",
             ],
             swiftSettings: [
-                .unsafeFlags(["-suppress-warnings"])
+                .unsafeFlags(["-suppress-warnings"]),
+                .define("SWIFT_DISABLE_SIL_COMBINE")
+            ],
+            linkerSettings: [
+                .unsafeFlags(["-Xlinker", "-no_warn_duplicate_libraries"])
             ]
         )
     ]

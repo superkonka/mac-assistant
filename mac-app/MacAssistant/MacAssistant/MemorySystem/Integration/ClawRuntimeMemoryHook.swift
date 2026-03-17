@@ -34,6 +34,7 @@ extension ClawRuntimeAdapter {
             requestID: requestID,
             text: text,
             images: images,
+            systemPrompt: nil,
             onAssistantText: onAssistantText
         )
         

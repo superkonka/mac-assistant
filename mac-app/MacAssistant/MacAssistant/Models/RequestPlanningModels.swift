@@ -139,6 +139,14 @@ enum RequestPlannerPrimaryAction {
     case handleDetectedSkill(skill: AISkill, input: String, executionInput: String)
     case handleAgentSuggestion(AgentSuggestion, input: String)
     case routeMainConversation(input: String)
+    
+    // MARK: - 异常处理场景（新增）
+    /// 处理流中断异常
+    case handleStreamInterrupted(sessionID: String, originalRequest: String, partialResult: String?)
+    /// 查询任务状态
+    case checkTaskStatus(sessionID: String)
+    /// 后台自动恢复
+    case autoRecoverTask(sessionID: String, delaySeconds: Int)
 }
 
 struct RequestPlan {
@@ -417,6 +425,39 @@ struct RequestPlan {
                     returnsToMainConversation: true
                 )
             ]
+        case .handleStreamInterrupted(let sessionID, _, _):
+            return [
+                PlannedTaskSpec(
+                    id: "stream-interrupted-\(sessionID)",
+                    kind: .recovery,
+                    title: "处理流中断",
+                    executorLabel: "异常恢复",
+                    summary: "处理流式响应中断，触发自动恢复机制。",
+                    returnsToMainConversation: true
+                )
+            ]
+        case .checkTaskStatus(let sessionID):
+            return [
+                PlannedTaskSpec(
+                    id: "check-status-\(sessionID)",
+                    kind: .mainConversation,
+                    title: "检查任务状态",
+                    executorLabel: "状态检查",
+                    summary: "查询指定任务会话的当前状态。",
+                    returnsToMainConversation: true
+                )
+            ]
+        case .autoRecoverTask(let sessionID, let delay):
+            return [
+                PlannedTaskSpec(
+                    id: "auto-recover-\(sessionID)",
+                    kind: .recovery,
+                    title: "自动恢复任务",
+                    executorLabel: "后台恢复",
+                    summary: "安排在\(delay)秒后自动尝试恢复任务。",
+                    returnsToMainConversation: true
+                )
+            ]
         }
     }
 
@@ -472,6 +513,12 @@ struct RequestPlan {
             return "handle_agent_suggestion"
         case .routeMainConversation:
             return "route_main_conversation"
+        case .handleStreamInterrupted(let sessionID, _, _):
+            return "handle_stream_interrupted:\(sessionID)"
+        case .checkTaskStatus(let sessionID):
+            return "check_task_status:\(sessionID)"
+        case .autoRecoverTask(let sessionID, let delay):
+            return "auto_recover_task:\(sessionID):\(delay)"
         }
     }
 

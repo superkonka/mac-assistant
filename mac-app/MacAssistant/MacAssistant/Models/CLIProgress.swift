@@ -57,9 +57,13 @@ class CLIProgressManager: ObservableObject {
     @Published var steps: [CLIStep] = []
     @Published var isActive: Bool = false
     @Published var rawOutput: String = ""
+    @Published var isCancelling: Bool = false
     
     private let maxSteps = 20
     private let maxOutputLength = 10000
+    
+    /// 取消回调，由 CommandRunner 设置
+    var onCancel: (() -> Void)?
     
     private init() {}
     
@@ -122,6 +126,16 @@ class CLIProgressManager: ObservableObject {
             self.steps.removeAll()
             self.rawOutput = ""
             self.isActive = false
+            self.isCancelling = false
+        }
+    }
+    
+    /// 请求取消当前 CLI 任务
+    func requestCancel() {
+        DispatchQueue.main.async {
+            guard self.isActive && !self.isCancelling else { return }
+            self.isCancelling = true
+            self.onCancel?()
         }
     }
 }
