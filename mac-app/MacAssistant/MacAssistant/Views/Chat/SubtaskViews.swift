@@ -39,16 +39,36 @@ struct SubtaskEntryButton: View {
     }
 }
 
+/// 子任务状态筛选
+enum SubtaskFilter: String, CaseIterable {
+    case pending = "待执行"
+    case running = "执行中"
+    case completed = "已完成"
+}
+
 /// 子任务列表面板
 struct SubtaskPanelView: View {
     @StateObject private var coordinator = SubtaskCoordinator.shared
     @State private var showSmartTaskCreation = false
+    @State private var selectedFilter: SubtaskFilter = .pending
+    
+    // 按状态过滤的任务
+    private var filteredSubtasks: [Subtask] {
+        switch selectedFilter {
+        case .pending:
+            return coordinator.pendingSubtasks
+        case .running:
+            return coordinator.runningSubtasks
+        case .completed:
+            return coordinator.completedSubtasks
+        }
+    }
     
     var body: some View {
         VStack(spacing: 0) {
             // 标题栏
             HStack {
-                Text("子任务")
+                Text("任务管理")
                     .font(.system(size: 14, weight: .semibold))
                 Spacer()
                 
@@ -68,17 +88,6 @@ struct SubtaskPanelView: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 .help("智能创建新任务")
-                .padding(.trailing, 8)
-                
-                if coordinator.isProcessing {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.trailing, 8)
-                }
-                
-                Text("\(coordinator.activeSubtasks.count) 进行中")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -87,30 +96,40 @@ struct SubtaskPanelView: View {
                 SmartTaskCreationView()
             }
             
-            Divider()
-            
-            // 子任务列表
-            if coordinator.activeSubtasks.isEmpty && coordinator.completedSubtasks.isEmpty {
-                EmptySubtaskView()
-            } else {
-                List {
-                    if !coordinator.activeSubtasks.isEmpty {
-                        Section("进行中") {
-                            ForEach(coordinator.activeSubtasks) { subtask in
-                                SubtaskRow(subtask: subtask)
-                            }
-                        }
-                    }
-                    
-                    if !coordinator.completedSubtasks.isEmpty {
-                        Section("已完成") {
-                            ForEach(coordinator.completedSubtasks) { subtask in
-                                SubtaskRow(subtask: subtask)
-                            }
+            // 三态标签切换
+            HStack(spacing: 0) {
+                ForEach(SubtaskFilter.allCases, id: \.self) { filter in
+                    FilterTab(
+                        title: filter.rawValue,
+                        count: countForFilter(filter),
+                        isSelected: selectedFilter == filter
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            selectedFilter = filter
                         }
                     }
                 }
-                .listStyle(.plain)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 8)
+            
+            Divider()
+            
+            // 子任务列表 - 使用LazyVStack优化性能
+            if filteredSubtasks.isEmpty {
+                EmptyFilterView(filter: selectedFilter)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(filteredSubtasks) { subtask in
+                            SubtaskRow(subtask: subtask)
+                                .id("subtask-\(subtask.id)")
+                                .padding(.horizontal, 12)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+                .id("list-\(selectedFilter)-\(filteredSubtasks.count)")
             }
             
             Divider()
@@ -127,6 +146,117 @@ struct SubtaskPanelView: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+        }
+    }
+    
+    // 计算各状态任务数
+    private func countForFilter(_ filter: SubtaskFilter) -> Int {
+        switch filter {
+        case .pending:
+            return coordinator.pendingSubtasks.count
+        case .running:
+            return coordinator.runningSubtasks.count
+        case .completed:
+            return coordinator.completedSubtasks.count
+        }
+    }
+}
+
+/// 筛选标签
+struct FilterTab: View {
+    let title: String
+    let count: Int
+    let isSelected: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                HStack(spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                    if count > 0 {
+                        Text("\(count)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(
+                                Capsule()
+                                    .fill(isSelected ? Color.blue : Color.secondary.opacity(0.5))
+                            )
+                    }
+                }
+                .foregroundColor(isSelected ? .primary : .secondary)
+                
+                // 选中指示器
+                Rectangle()
+                    .fill(isSelected ? Color.blue : Color.clear)
+                    .frame(height: 2)
+                    .cornerRadius(1)
+            }
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(PlainButtonStyle())
+    }
+}
+
+/// 按状态筛选的空视图
+struct EmptyFilterView: View {
+    let filter: SubtaskFilter
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            
+            Image(systemName: iconName)
+                .font(.system(size: 40))
+                .foregroundColor(.secondary.opacity(0.4))
+            
+            Text(titleText)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(.secondary)
+            
+            Text(detailText)
+                .font(.system(size: 12))
+                .foregroundColor(.secondary.opacity(0.7))
+            
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+    
+    private var iconName: String {
+        switch filter {
+        case .pending:
+            return "hourglass.circle"
+        case .running:
+            return "arrow.triangle.2.circlepath"
+        case .completed:
+            return "checkmark.circle"
+        }
+    }
+    
+    private var titleText: String {
+        switch filter {
+        case .pending:
+            return "暂无待执行任务"
+        case .running:
+            return "暂无执行中任务"
+        case .completed:
+            return "暂无已完成任务"
+        }
+    }
+    
+    private var detailText: String {
+        switch filter {
+        case .pending:
+            return "新建的任务将显示在这里"
+        case .running:
+            return "正在执行的任务将显示在这里"
+        case .completed:
+            return "已完成的任务将显示在这里"
         }
     }
 }
@@ -152,8 +282,14 @@ struct EmptySubtaskView: View {
 }
 
 /// 子任务行
-struct SubtaskRow: View {
+struct SubtaskRow: View, Equatable {
     let subtask: Subtask
+    
+    static func == (lhs: SubtaskRow, rhs: SubtaskRow) -> Bool {
+        lhs.subtask.id == rhs.subtask.id &&
+        lhs.subtask.status == rhs.subtask.status &&
+        lhs.subtask.result == rhs.subtask.result
+    }
     
     var body: some View {
         HStack(spacing: 10) {

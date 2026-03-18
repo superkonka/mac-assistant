@@ -57,6 +57,8 @@ class CommandRunner: ObservableObject {
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
+    private let taskManager = TaskManager.shared
+    private let unifiedTaskManager = UnifiedTaskManager.shared
     private let initialSetupPromptKey = "initial_setup_prompt"
     private let pendingWorkflowDesignKey = "pending_workflow_design"
     private let workflowOriginalInputKey = "workflow_original_input"
@@ -115,6 +117,26 @@ class CommandRunner: ObservableObject {
                     return
                 }
                 self?.presentSkillEvolutionProposal(proposal)
+            }
+            .store(in: &cancellables)
+        
+        // 监听统一任务管理器的恢复请求
+        NotificationCenter.default.publisher(for: .resumeTaskSessionNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let userInfo = notification.userInfo,
+                      let gatewaySessionKey = userInfo["gatewaySessionKey"] as? String,
+                      let originalRequest = userInfo["originalRequest"] as? String,
+                      let taskID = userInfo["taskID"] as? String else {
+                    return
+                }
+                Task {
+                    await self?.handleUnifiedTaskRecovery(
+                        taskID: taskID,
+                        gatewaySessionKey: gatewaySessionKey,
+                        originalRequest: originalRequest
+                    )
+                }
             }
             .store(in: &cancellables)
 
@@ -1722,12 +1744,22 @@ class CommandRunner: ObservableObject {
         intent: Intent,
         anchorMessageID: UUID
     ) async {
+        // 使用统一的 sessionID 用于日志和 trace
+        let sessionID = anchorMessageID.uuidString
+        
+        // 启动执行链路日志
+        await ExecutionLogger.shared.startSession(
+            id: sessionID,
+            userRequest: text
+        )
+        
         let traceID = await MainActor.run {
             startExecutionTrace(
                 anchorMessageID: anchorMessageID,
                 agentName: agent.displayName,
                 intentName: intent.displayName,
-                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)"
+                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)",
+                sessionID: sessionID
             )
         }
         
@@ -1737,6 +1769,7 @@ class CommandRunner: ObservableObject {
             text: text,
             images: images,
             traceID: traceID,
+            sessionID: sessionID,
             allowMemoryRecall: true
         )
     }
@@ -1825,10 +1858,13 @@ class CommandRunner: ObservableObject {
         text: String,
         images: [String],
         traceID: UUID? = nil,
+        sessionID: String? = nil,
         allowMemoryRecall: Bool = true
     ) async {
         let startTime = Date()
         let mainSession = conversationControl.currentTopology()
+        // 使用传入的 sessionID 或生成新的
+        let logSessionID = sessionID ?? UUID().uuidString
         
         // MARK: - 统一记忆检索（向量化匹配，无需关键词触发）
         var memoryContext: UnifiedMemoryContext?
@@ -1876,14 +1912,9 @@ class CommandRunner: ObservableObject {
                 }
             }
 
-            // 记录开始发送
-            let sessionID = assistantMessage.id.uuidString
-            await ExecutionLogger.shared.startSession(
-                id: sessionID, 
-                userRequest: "[AgentRequest] \(text.prefix(50))"
-            )
+            // 记录开始发送（使用统一的 sessionID）
             await ExecutionLogger.shared.log(
-                sessionID: sessionID,
+                sessionID: logSessionID,
                 level: .info,
                 component: "OpenClaw",
                 message: "开始发送请求",
@@ -1908,14 +1939,14 @@ class CommandRunner: ObservableObject {
             
             // 记录成功完成
             await ExecutionLogger.shared.log(
-                sessionID: sessionID,
+                sessionID: logSessionID,
                 level: .success,
                 component: "OpenClaw",
                 message: "请求处理完成",
                 details: ["duration": "\(String(format: "%.2f", duration))s"]
             )
             await ExecutionLogger.shared.endSession(
-                id: sessionID,
+                id: logSessionID,
                 status: .completed
             )
             
@@ -2046,65 +2077,137 @@ class CommandRunner: ObservableObject {
             var shouldScheduleBackgroundRecovery = false
             var backgroundRecoveryDelay = 10
             
-            if UserFacingErrorFormatter.isStreamInterruptedError(terminalError) {
-                let decision = await ExceptionHandlingPlanner.shared.planExceptionHandling(
-                    error: terminalError,
-                    sessionID: mainSession.mainSessionKey,
-                    originalRequest: text,
-                    partialResult: nil,
-                    recentUserInput: text,
-                    taskCharacteristics: TaskCharacteristics(
-                        isLongRunning: text.count > 200 || text.contains("部署") || text.contains("配置"),
-                        estimatedDuration: nil,
-                        requiresUserInteraction: false,
-                        hasSideEffects: text.contains("创建") || text.contains("删除") || text.contains("部署")
-                    )
+            // MARK: - 方案C：Planner驱动的异常处理决策
+            // 对所有错误类型都进行Planner决策，并创建可恢复的任务会话
+            let decision = await ExceptionHandlingPlanner.shared.planExceptionHandling(
+                error: terminalError,
+                sessionID: mainSession.mainSessionKey,
+                originalRequest: text,
+                partialResult: nil,
+                recentUserInput: text,
+                taskCharacteristics: TaskCharacteristics(
+                    isLongRunning: text.count > 200 || text.contains("部署") || text.contains("配置"),
+                    estimatedDuration: nil,
+                    requiresUserInteraction: false,
+                    hasSideEffects: text.contains("创建") || text.contains("删除") || text.contains("部署")
                 )
+            )
+            
+            LogInfo("[CommandRunner] Planner异常决策: \(decision.action), 理由: \(decision.reasoning)")
+            
+            // 根据决策执行不同策略
+            switch decision.action {
+            case .autoRecoverNow:
+                // 立即恢复，修改消息提示
+                finalMessage = baseUserFacingMessage + "\n\n🔄 正在自动尝试恢复..."
                 
-                LogInfo("[CommandRunner] Planner异常决策: \(decision.action), 理由: \(decision.reasoning)")
+            case .scheduleBackgroundRecovery(let delay):
+                // 安排后台恢复（方案A：兜底）
+                shouldScheduleBackgroundRecovery = true
+                backgroundRecoveryDelay = delay
+                finalMessage = baseUserFacingMessage + "\n\n⏱️ 已安排在\(delay)秒后自动检查恢复，你也可以点击「继续处理」立即恢复。"
                 
-                // 根据决策执行不同策略
-                switch decision.action {
-                case .autoRecoverNow:
-                    // 立即恢复，修改消息提示
-                    finalMessage = baseUserFacingMessage + "\n\n🔄 正在自动尝试恢复..."
-                    
-                case .scheduleBackgroundRecovery(let delay):
-                    // 安排后台恢复（方案A：兜底）
-                    shouldScheduleBackgroundRecovery = true
-                    backgroundRecoveryDelay = delay
-                    finalMessage = baseUserFacingMessage + "\n\n⏱️ 已安排在\(delay)秒后自动检查恢复，你也可以点击「继续处理」立即恢复。"
-                    
-                case .convertToBackgroundTask:
-                    // 转为后台任务
-                    shouldScheduleBackgroundRecovery = true
-                    backgroundRecoveryDelay = 5
-                    finalMessage = baseUserFacingMessage + "\n\n🔄 这是一个可能需要较长时间的任务，已转为后台继续执行，完成后会通知你。"
-                    
-                case .promptCheckStatus:
-                    // 提示检查状态（方案B：用户触发）
-                    finalMessage = baseUserFacingMessage + "\n\n💡 你可以发送「检查状态」查看任务当前进展。"
-                    
-                case .waitForUserInput, .offerRecoveryOptions:
-                    // 等待用户输入，保持默认消息
-                    break
-                }
+            case .convertToBackgroundTask:
+                // 转为后台任务
+                shouldScheduleBackgroundRecovery = true
+                backgroundRecoveryDelay = 5
+                finalMessage = baseUserFacingMessage + "\n\n🔄 这是一个可能需要较长时间的任务，已转为后台继续执行，完成后会通知你。"
                 
-                // 执行决策
-                let scenario = ExceptionScenario(
-                    type: .streamInterrupted,
-                    sessionID: mainSession.mainSessionKey,
-                    originalRequest: text,
-                    partialResult: nil,
-                    error: terminalError,
-                    context: ExceptionScenario.ExceptionContext(
-                        hasPartialResult: false,
-                        isLongRunningTask: text.count > 200,
-                        hasBackgroundRecoveryScheduled: shouldScheduleBackgroundRecovery,
-                        userIntent: .unknown
-                    )
+            case .promptCheckStatus:
+                // 提示检查状态（方案B：用户触发）
+                finalMessage = baseUserFacingMessage + "\n\n💡 你可以发送「检查状态」查看任务当前进展。"
+                
+            case .waitForUserInput, .offerRecoveryOptions:
+                // 等待用户输入，保持默认消息
+                break
+            }
+            
+            // 执行决策
+            let scenario = ExceptionScenario(
+                type: UserFacingErrorFormatter.isStreamInterruptedError(terminalError) ? .streamInterrupted : .agentFailure,
+                sessionID: mainSession.mainSessionKey,
+                originalRequest: text,
+                partialResult: nil,
+                error: terminalError,
+                context: ExceptionScenario.ExceptionContext(
+                    hasPartialResult: false,
+                    isLongRunningTask: text.count > 200,
+                    hasBackgroundRecoveryScheduled: shouldScheduleBackgroundRecovery,
+                    userIntent: .unknown
                 )
-                await ExceptionHandlingPlanner.shared.executeDecision(decision, scenario: scenario, runner: self)
+            )
+            await ExceptionHandlingPlanner.shared.executeDecision(decision, scenario: scenario, runner: self)
+            
+            // MARK: - 创建可恢复的任务会话
+            // 对所有异常都创建任务卡片，让用户可以「继续处理」
+            await MainActor.run {
+                // 生成唯一的任务会话ID（使用时间戳避免冲突）
+                let taskSessionID = "\(mainSession.mainSessionKey)-\(Int(Date().timeIntervalSince1970))"
+                
+                // [迁移] 同时创建统一任务（新的统一任务系统）
+                let unifiedTask = UnifiedTaskManager.shared.createExceptionRecoveryTask(
+                    title: text.prefix(30).description + (text.count > 30 ? "..." : ""),
+                    originalRequest: text,
+                    errorMessage: shouldScheduleBackgroundRecovery
+                        ? "已安排后台自动恢复，或点击「继续处理」立即重试"
+                        : "点击「继续处理」重试",
+                    gatewaySessionKey: mainSession.mainSessionKey,
+                    messages: [
+                        TaskMessage(
+                            id: UUID(),
+                            role: .user,
+                            content: text,
+                            timestamp: Date(),
+                            agentID: terminalAgent.id,
+                            agentName: terminalAgent.name
+                        ),
+                        TaskMessage(
+                            id: UUID(),
+                            role: .system,
+                            content: "请求处理中断: \(terminalError.localizedDescription)",
+                            timestamp: Date(),
+                            agentID: nil,
+                            agentName: nil
+                        )
+                    ]
+                )
+                LogInfo("[CommandRunner] 创建统一异常恢复任务: \(unifiedTask.id)")
+                
+                // [兼容] 保留旧版AgentTaskSession供过渡期间使用
+                let taskSession = AgentTaskSession(
+                    id: taskSessionID,
+                    title: text.prefix(30).description + (text.count > 30 ? "..." : ""),
+                    originalRequest: text,
+                    status: shouldScheduleBackgroundRecovery ? .partial : .waitingUser,
+                    statusSummary: finalMessage,
+                    mainAgentName: terminalAgent.name,
+                    intentName: "异常恢复",
+                    messages: [
+                        TaskSessionMessage(
+                            id: UUID(),
+                            role: .user,
+                            content: text,
+                            timestamp: Date()
+                        ),
+                        TaskSessionMessage(
+                            id: UUID(),
+                            role: .system,
+                            content: "请求处理中断: \(terminalError.localizedDescription)",
+                            timestamp: Date()
+                        )
+                    ],
+                    errorMessage: shouldScheduleBackgroundRecovery 
+                        ? "已安排后台自动恢复，或点击「继续处理」立即重试"
+                        : "点击「继续处理」重试",
+                    gatewaySessionKey: mainSession.mainSessionKey,
+                    canResume: true
+                )
+                self.taskSessions.append(taskSession)
+                LogInfo("[CommandRunner] 创建异常恢复任务会话: \(taskSessionID)")
+                LogInfo("[CommandRunner] 总任务数: \(self.taskSessions.count), 任务状态: \(taskSession.status)")
+                
+                // 强制触发 UI 更新
+                self.objectWillChange.send()
             }
             
             let terminalAgentID = terminalAgent.id
@@ -2112,13 +2215,13 @@ class CommandRunner: ObservableObject {
             
             // 记录异常结束
             await ExecutionLogger.shared.logError(
-                sessionID: mainSession.mainSessionKey,
+                sessionID: logSessionID,
                 component: "CommandRunner",
                 error: terminalError,
                 context: "请求处理失败"
             )
             await ExecutionLogger.shared.endSession(
-                id: mainSession.mainSessionKey,
+                id: logSessionID,
                 status: .failed
             )
             
@@ -2991,11 +3094,43 @@ class CommandRunner: ObservableObject {
     }
 
     private func resumeTaskSessionIfPossible(_ sessionID: String) async {
+        // 先尝试从运行时恢复已有结果
         let recovered = await reconcileTaskSession(sessionID, manualTrigger: true, allowRetry: true)
         guard !recovered else { return }
-
+        
+        // 如果无法恢复已有结果，尝试重新发送原始请求
+        // 获取任务会话的原始请求
+        let sessionSnapshot = await MainActor.run { taskSession(for: sessionID) }
+        guard let session = sessionSnapshot,
+              let originalRequest = session.messages.first(where: { $0.role == .user })?.content else {
+            await MainActor.run {
+                appendSystemMessage("无法找到原始请求，请重新输入。")
+            }
+            return
+        }
+        
+        LogInfo("[CommandRunner] 重新尝试请求: session=\(sessionID)")
+        
+        // 更新任务会话状态为运行中
         await MainActor.run {
-            appendSystemMessage("我已经重新检查了刚才中断的任务，但暂时还没有拿到新的结果。你可以先完成授权或检查本地状态，再继续一次。")
+            if let index = taskSessions.firstIndex(where: { $0.id == sessionID }) {
+                taskSessions[index].status = .running
+                taskSessions[index].statusSummary = "正在重新处理..."
+                taskSessions[index].updatedAt = Date()
+            }
+        }
+        
+        // 重新发送请求
+        await processInput(originalRequest, images: [])
+        
+        // 更新任务会话状态
+        await MainActor.run {
+            if let index = taskSessions.firstIndex(where: { $0.id == sessionID }) {
+                taskSessions[index].status = .completed
+                taskSessions[index].statusSummary = "已重新处理完成"
+                taskSessions[index].canResume = false
+                taskSessions[index].updatedAt = Date()
+            }
         }
     }
 
@@ -3017,6 +3152,78 @@ class CommandRunner: ObservableObject {
 
         if !candidateIDs.isEmpty {
             LogInfo("已完成中断任务回查，trigger=\(trigger)，任务数=\(candidateIDs.count)")
+        }
+    }
+    
+    // MARK: - Unified Task Recovery
+    
+    /// 处理统一任务管理器的恢复请求
+    private func handleUnifiedTaskRecovery(
+        taskID: String,
+        gatewaySessionKey: String,
+        originalRequest: String
+    ) async {
+        LogInfo("[CommandRunner] 处理统一任务恢复请求: taskID=\(taskID), sessionKey=\(gatewaySessionKey)")
+        
+        do {
+            // 尝试恢复任务会话
+            // 1. 先查找是否有对应的 AgentTaskSession
+            let existingSessionID = await MainActor.run {
+                taskSessions.first { $0.gatewaySessionKey == gatewaySessionKey }?.id
+            }
+            
+            var success = false
+            var resultContent: String?
+            
+            if let sessionID = existingSessionID {
+                // 使用现有的恢复逻辑
+                await resumeTaskSessionIfPossible(sessionID)
+                success = true
+                resultContent = "任务会话已恢复"
+            } else {
+                // 直接重新发送请求
+                await MainActor.run {
+                    self.isProcessing = true
+                }
+                
+                // 重新处理原始请求
+                await processInput(originalRequest, images: [])
+                
+                await MainActor.run {
+                    self.isProcessing = false
+                    success = true
+                    resultContent = "请求已重新处理"
+                }
+            }
+            
+            // 发送恢复完成通知
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: .taskRecoveryCompleted,
+                    object: nil,
+                    userInfo: [
+                        "taskID": taskID,
+                        "success": success,
+                        "content": resultContent ?? ""
+                    ]
+                )
+            }
+            
+        } catch {
+            LogError("[CommandRunner] 统一任务恢复失败: \(error)")
+            
+            // 发送失败通知
+            await MainActor.run {
+                NotificationCenter.default.post(
+                    name: .taskRecoveryCompleted,
+                    object: nil,
+                    userInfo: [
+                        "taskID": taskID,
+                        "success": false,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
         }
     }
 
@@ -4447,7 +4654,8 @@ class CommandRunner: ObservableObject {
         intentName: String,
         summary: String,
         state: ExecutionTraceState = .routing,
-        transitionLabel: String? = nil
+        transitionLabel: String? = nil,
+        sessionID: String? = nil
     ) -> UUID {
         let trace = ExecutionTrace(
             anchorMessageID: anchorMessageID,
@@ -4455,7 +4663,8 @@ class CommandRunner: ObservableObject {
             intentName: intentName,
             transitionLabel: transitionLabel,
             summary: summary,
-            state: state
+            state: state,
+            sessionID: sessionID
         )
         traceDismissTasks[trace.id]?.cancel()
         traceDismissTasks[trace.id] = nil

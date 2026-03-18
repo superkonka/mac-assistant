@@ -79,7 +79,7 @@ struct TraceStripView: View, Equatable {
             ElapsedTimeView(trace: trace)
             
             // 日志入口按钮
-            ExecutionLogButton(sessionID: trace.id.uuidString)
+            ExecutionLogButton(sessionID: trace.sessionID)
         }
     }
 

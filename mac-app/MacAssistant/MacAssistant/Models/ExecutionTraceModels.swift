@@ -69,6 +69,8 @@ struct ExecutionTrace: Identifiable, Equatable {
     var state: ExecutionTraceState
     let startedAt: Date
     var finishedAt: Date?
+    /// 关联的日志会话ID
+    let sessionID: String
 
     init(
         id: UUID = UUID(),
@@ -81,7 +83,8 @@ struct ExecutionTrace: Identifiable, Equatable {
         summary: String,
         state: ExecutionTraceState,
         startedAt: Date = Date(),
-        finishedAt: Date? = nil
+        finishedAt: Date? = nil,
+        sessionID: String? = nil
     ) {
         self.id = id
         self.anchorMessageID = anchorMessageID
@@ -94,5 +97,7 @@ struct ExecutionTrace: Identifiable, Equatable {
         self.state = state
         self.startedAt = startedAt
         self.finishedAt = finishedAt
+        // 如果没有提供sessionID，使用trace.id作为默认
+        self.sessionID = sessionID ?? id.uuidString
     }
 }

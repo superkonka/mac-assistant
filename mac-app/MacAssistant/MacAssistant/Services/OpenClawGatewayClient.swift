@@ -4,6 +4,14 @@ import OpenClawChatUI
 import OpenClawKit
 import OpenClawProtocol
 
+// MARK: - Memory Feature Flags (临时定义，避免编译问题)
+// 注: 完整的定义在 MemorySystem/Infrastructure/FeatureFlags.swift
+@MainActor
+struct MemoryFeatureFlags {
+    static var enableNewRetrieval: Bool = true
+    static var enableL0Storage: Bool = true
+}
+
 /// Gateway 上下文注入结果
 struct GatewayContextInjectionResult {
     let isSuccess: Bool
@@ -79,7 +87,8 @@ actor OpenClawGatewayClient {
         var preparedSystemPrompt = systemPrompt
         var injectionResult: GatewayContextInjectionResult?
         
-        if MemoryFeatureFlags.enableNewRetrieval {
+        let enableNewRetrieval = await MainActor.run { MemoryFeatureFlags.enableNewRetrieval }
+        if enableNewRetrieval {
             do {
                 let injection = try await prepareMemoryContext(
                     planId: planId,

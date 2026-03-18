@@ -197,18 +197,13 @@ struct ChatView: View {
             ZStack(alignment: .topTrailing) {
                 messageList
 
-                if !taskSessionsForDisplay.isEmpty {
-                    TaskSessionTabsView(
-                        sessions: taskSessionsForDisplay,
-                        selectedSessionID: selectedTaskSessionID,
-                        onToggleSelection: toggleTaskSessionPanel,
-                        onDismissSession: dismissTaskSessionTab
-                    )
-                    .padding(.trailing, taskShelfTrailingInset)
-                    .padding(.top, taskShelfTopInset)
+                // [统一任务管理] 快速任务访问入口
+                QuickTaskAccessView()
+                    .padding(.trailing, 16)
+                    .padding(.top, 12)
                     .zIndex(3)
-                }
 
+                // [兼容] 任务会话详情面板
                 taskSessionPanel
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -540,22 +535,6 @@ struct ChatView: View {
                 
                 // 触发对话控制器刷新
                 conversationController?.objectWillChange.send()
-            }
-        }
-        
-        // 监听子任务状态变化
-        NotificationCenter.default.addObserver(
-            forName: NSNotification.Name("SubtaskStatusChanged"),
-            object: nil,
-            queue: nil
-        ) { notification in
-            Task { @MainActor in
-                // 子任务完成时记录日志
-                if let userInfo = notification.userInfo,
-                   let title = userInfo["title"] as? String,
-                   let status = userInfo["status"] as? String {
-                    LogInfo("[ChatView] 子任务 \(status): \(title)")
-                }
             }
         }
     }

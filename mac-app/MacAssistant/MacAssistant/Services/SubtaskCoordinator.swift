@@ -163,8 +163,14 @@ struct TaskDecomposition {
 final class SubtaskCoordinator: ObservableObject {
     static let shared = SubtaskCoordinator()
     
-    @Published private(set) var activeSubtasks: [Subtask] = []
+    // 三态任务列表
+    @Published private(set) var pendingSubtasks: [Subtask] = []
+    @Published private(set) var runningSubtasks: [Subtask] = []
     @Published private(set) var completedSubtasks: [Subtask] = []
+    
+    // 向后兼容
+    var activeSubtasks: [Subtask] { pendingSubtasks + runningSubtasks }
+    
     @Published private(set) var isProcessing = false
     
     private let intentMatcher = IntentMatcher.shared
@@ -230,7 +236,18 @@ final class SubtaskCoordinator: ObservableObject {
     // MARK: - 子任务生命周期
     
     func addSubtasks(_ subtasks: [Subtask]) {
-        activeSubtasks.append(contentsOf: subtasks)
+        for subtask in subtasks {
+            switch subtask.status {
+            case .pending:
+                pendingSubtasks.append(subtask)
+            case .running:
+                runningSubtasks.append(subtask)
+            case .completed, .failed:
+                completedSubtasks.append(subtask)
+            case .cancelled:
+                break
+            }
+        }
         
         // 同时创建TaskItem并添加到TaskManager
         for subtask in subtasks {
@@ -240,24 +257,56 @@ final class SubtaskCoordinator: ObservableObject {
     }
     
     func updateSubtask(id: String, status: SubtaskStatus? = nil, result: String? = nil) {
-        if let index = activeSubtasks.firstIndex(where: { $0.id == id }) {
-            let oldStatus = activeSubtasks[index].status
-            let updated = activeSubtasks[index].update(status: status, result: result)
-            activeSubtasks[index] = updated
+        // 在pending中查找
+        if let index = pendingSubtasks.firstIndex(where: { $0.id == id }) {
+            let oldStatus = pendingSubtasks[index].status
+            let updated = pendingSubtasks[index].update(status: status, result: result)
             
             // 如果状态发生变化，发送通知
             if let newStatus = status, oldStatus != newStatus {
                 notifySubtaskStatusChange(subtask: updated, oldStatus: oldStatus)
-                
-                // 同步更新TaskManager中的任务状态
                 syncTaskStatus(subtask: updated)
+                
+                // 状态变更时移动任务
+                moveTask(updated, from: &pendingSubtasks, toStatus: newStatus)
+            } else {
+                pendingSubtasks[index] = updated
             }
+            return
+        }
+        
+        // 在running中查找
+        if let index = runningSubtasks.firstIndex(where: { $0.id == id }) {
+            let oldStatus = runningSubtasks[index].status
+            let updated = runningSubtasks[index].update(status: status, result: result)
             
-            // 如果完成，移动到已完成列表
-            if status == .completed || status == .failed {
-                completedSubtasks.append(updated)
-                activeSubtasks.remove(at: index)
+            if let newStatus = status, oldStatus != newStatus {
+                notifySubtaskStatusChange(subtask: updated, oldStatus: oldStatus)
+                syncTaskStatus(subtask: updated)
+                
+                moveTask(updated, from: &runningSubtasks, toStatus: newStatus)
+            } else {
+                runningSubtasks[index] = updated
             }
+            return
+        }
+    }
+    
+    /// 移动任务到对应状态列表
+    private func moveTask(_ task: Subtask, from sourceList: inout [Subtask], toStatus: SubtaskStatus) {
+        // 从源列表移除
+        sourceList.removeAll { $0.id == task.id }
+        
+        // 添加到目标列表
+        switch toStatus {
+        case .pending:
+            pendingSubtasks.append(task)
+        case .running:
+            runningSubtasks.append(task)
+        case .completed, .failed:
+            completedSubtasks.append(task)
+        case .cancelled:
+            break
         }
     }
     
