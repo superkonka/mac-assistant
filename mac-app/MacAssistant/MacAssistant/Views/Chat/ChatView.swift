@@ -25,6 +25,7 @@ struct ChatView: View {
     @State private var showClawDoctor: Bool = false
     @State private var showDiskMonitor: Bool = false
     @State private var showToDoList: Bool = false
+    @State private var showBundleStore: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
@@ -111,6 +112,10 @@ struct ChatView: View {
             DiskMonitorView()
                 .frame(minWidth: 600, minHeight: 500)
         }
+        .sheet(isPresented: $showBundleStore) {
+            BundleStoreView()
+                .frame(minWidth: 800, minHeight: 700)
+        }
         .popover(isPresented: $showToDoList, attachmentAnchor: .point(.topTrailing), arrowEdge: .top) {
             ToDoListView()
         }
@@ -178,6 +183,14 @@ struct ChatView: View {
             }
             .buttonStyle(PlainButtonStyle())
             .help("磁盘管理")
+            
+            // Bundle Store 按钮
+            Button(action: { showBundleStore = true }) {
+                Image(systemName: "cube.box")
+                    .font(.system(size: 14))
+            }
+            .buttonStyle(PlainButtonStyle())
+            .help("Bundle Store")
             
             // 设置按钮
             Button(action: { showSkills = true }) {

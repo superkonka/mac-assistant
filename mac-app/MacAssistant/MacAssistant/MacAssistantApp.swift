@@ -25,6 +25,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let commandRunner = CommandRunner.shared
     var window: NSWindow?
     var logWindow: NSWindow?
+    var bundleStoreWindow: NSWindow?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         LogInfo("🚀 应用启动")
@@ -78,6 +79,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "截图询问", action: #selector(screenshotAndAsk), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "剪贴板询问", action: #selector(clipboardAndAsk), keyEquivalent: ""))
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(NSMenuItem(title: "🛒 Bundle Store", action: #selector(showBundleStore), keyEquivalent: "b"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "📋 查看日志", action: #selector(showLogViewer), keyEquivalent: "l"))
         menu.addItem(NSMenuItem(title: "📂 打开日志目录", action: #selector(openLogDirectory), keyEquivalent: ""))
@@ -141,6 +144,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let logPath = FileLogger.shared.getLogFilePath()
         let logURL = URL(fileURLWithPath: logPath).deletingLastPathComponent()
         NSWorkspace.shared.open(logURL)
+    }
+    
+    @objc func showBundleStore() {
+        LogInfo("🛒 用户打开 Bundle Store")
+        
+        if bundleStoreWindow == nil {
+            let bundleStoreView = BundleStoreView()
+            
+            bundleStoreWindow = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            bundleStoreWindow?.title = "Bundle Store"
+            bundleStoreWindow?.contentView = NSHostingView(rootView: bundleStoreView)
+            bundleStoreWindow?.setFrameAutosaveName("BundleStoreWindow")
+        }
+        
+        bundleStoreWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
     
     func showWindow() {
