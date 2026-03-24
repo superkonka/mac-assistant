@@ -23,7 +23,6 @@ struct ChatView: View {
     @State private var showSkills: Bool = false
     @State private var showClawDoctor: Bool = false
     @State private var showDiskMonitor: Bool = false
-    @State private var showBundleStore: Bool = false
     @State private var showBrowserAgent: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
@@ -33,8 +32,8 @@ struct ChatView: View {
     @State private var isNearBottom = true
     @State private var hasPerformedInitialBottomAlignment = false
     
-    // 磁盘监控
-    @ObservedObject private var diskManager = DiskManager.shared
+    // 磁盘监控 - 暂时禁用，可能导致布局循环
+    // @ObservedObject private var diskManager = DiskManager.shared
 
     private let bottomAnchorID = "chat-bottom-anchor"
     private let taskPanelTopInset: CGFloat = 68
@@ -51,19 +50,20 @@ struct ChatView: View {
         .onAppear {
             setupNotifications()
             presentInitialSetupIfNeeded()
-            runtimeDoctor.startMonitoring()
-            Task {
-                await diskManager.startMonitoring()
-            }
+            // runtimeDoctor.startMonitoring()
+            // Task {
+            //     await diskManager.startMonitoring()
+            // }
             // 应用回到前台时刷新任务状态
             refreshTaskSessionsOnForeground()
         }
         .onChange(of: agentStore.usableAgents.count) { _ in
             presentInitialSetupIfNeeded()
         }
-        .onChange(of: taskSessionIDs) { _ in
-            synchronizeSelectedTaskSession()
-        }
+        // 注意：taskSessionIDs 是计算属性，会产生新数组，不适合用于 onChange
+        // .onChange(of: taskSessionIDs) { _ in
+        //     synchronizeSelectedTaskSession()
+        // }
         // 监听应用从后台进入前台
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshTaskSessionsOnForeground()
@@ -108,10 +108,6 @@ struct ChatView: View {
         .sheet(isPresented: $showDiskMonitor) {
             DiskMonitorView()
                 .frame(minWidth: 600, minHeight: 500)
-        }
-        .sheet(isPresented: $showBundleStore) {
-            BundleStoreView()
-                .frame(minWidth: 800, minHeight: 700)
         }
         .sheet(isPresented: $showBrowserAgent) {
             SimpleBrowserAgentView()
@@ -160,10 +156,8 @@ struct ChatView: View {
                 // 服务管理按钮
                 ServiceEntryButton()
                 
-                // AI 浏览器入口按钮
-                BrowserAgentEntryButton {
-                    showBrowserAgent = true
-                }
+                // AI 浏览器入口按钮（暂时隐藏）
+                // BrowserAgentEntryButton { showBrowserAgent = true }
 
                 toolbarIconButton(
                     systemImage: "internaldrive",
@@ -187,13 +181,6 @@ struct ChatView: View {
             // ===== 右侧：扩展功能区 =====
             HStack(spacing: 4) {
                 toolbarIconButton(
-                    systemImage: "cube.box",
-                    helpText: "Bundle Store"
-                ) {
-                    showBundleStore = true
-                }
-
-                toolbarIconButton(
                     systemImage: "gear",
                     helpText: "设置"
                 ) {
@@ -208,21 +195,10 @@ struct ChatView: View {
 
     private var chatContentColumn: some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .topTrailing) {
-                messageList
-
-                // [兼容] 任务会话详情面板
-                taskSessionPanel
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            if shouldShowProcessingStatusDock {
-                processingStatusDock
-            }
+            messageList
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
-
-            currentAgentBar
 
             IntelligentInputView(
                 text: $inputText,
@@ -235,103 +211,23 @@ struct ChatView: View {
     }
     
     private var messageList: some View {
-        GeometryReader { geometry in
-            let availableBubbleWidth = max(geometry.size.width - 24, 320)
-
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(spacing: 16) {
-                        if visibleMessages.isEmpty && agentStore.needsInitialSetup {
-                            InitialSetupCard {
-                                currentGap = nil
-                                showWizard = true
-                            }
-                        }
-
-                        ForEach(visibleMessages) { message in
-                            let trace = conversationController.executionTrace(forMessageID: message.id)
-                            let hidesPlaceholderBubble = shouldHideAssistantPlaceholder(message, trace: trace)
-                            let detectedSkillSuggestion = message.detectedSkillSuggestion
-
-                            if !hidesPlaceholderBubble {
-                                MessageBubble(
-                                    message: message,
-                                    availableWidth: availableBubbleWidth,
-                                    taskSession: nil,
-                                    detectedSkillSuggestion: detectedSkillSuggestion,
-                                    onDetectedSkillSuggestionAction: { action in
-                                        Task {
-                                            await conversationController.handleDetectedSkillSuggestionAction(
-                                                messageID: message.id,
-                                                action: action
-                                            )
-                                        }
-                                    }
-                                )
-                                .id(messageRenderIdentity(for: message))
-                            }
-
-                            if let trace {
-                                TraceStripView(
-                                    trace: trace,
-                                    availableWidth: availableBubbleWidth
-                                )
-                            }
-                        }
-
-                        if conversationController.stores.isProcessing && conversationController.stores.currentTrace == nil {
-                            TypingIndicator()
-                        }
-
-                        Color.clear
-                            .frame(height: 1)
-                            .id(bottomAnchorID)
-                            .background(
-                                GeometryReader { anchorGeometry in
-                                    Color.clear.preference(
-                                        key: ChatBottomAnchorPreferenceKey.self,
-                                        value: anchorGeometry.frame(in: .named("chat-scroll")).maxY
-                                    )
-                                }
-                            )
-                    }
-                    .id(messageListRevision)
-                    .padding(.vertical, 16)
-                    .padding(.horizontal, 12)
-                }
-                .coordinateSpace(name: "chat-scroll")
-                .onAppear {
-                    scrollProxy = proxy
-                    performInitialBottomAlignment(using: proxy)
-                }
-                .onPreferenceChange(ChatBottomAnchorPreferenceKey.self) { bottomMaxY in
-                    let nearBottom = bottomMaxY <= geometry.size.height + 32
-                    isNearBottom = nearBottom
-                    if nearBottom {
-                        shouldFollowLatest = true
-                    }
-                }
-                .onChange(of: conversationController.stores.messages.count) { _ in
-                    handleMessageCountChange(using: proxy)
-                }
-                .onChange(of: latestMessageRenderIdentity) { _ in
-                    handleLatestMessageMutation(using: proxy)
-                }
-                .onChange(of: conversationController.stores.currentTrace?.id) { _ in
-                    if shouldFollowLatest {
-                        scrollToBottom(proxy: proxy, animated: false)
-                    }
-                }
-                .simultaneousGesture(
-                    DragGesture(minimumDistance: 4)
-                        .onEnded { _ in
-                            if !isNearBottom {
-                                shouldFollowLatest = false
-                            }
-                        }
+        // 使用 List 替代 ScrollView + VStack，List 有更好的性能优化
+        List {
+            ForEach(conversationController.stores.messages) { message in
+                MessageBubble(
+                    message: message,
+                    availableWidth: nil,
+                    taskSession: nil,
+                    detectedSkillSuggestion: nil,
+                    onDetectedSkillSuggestionAction: { _ in }
                 )
+                .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
             }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
     }
     
     private var currentAgentBar: some View {
@@ -397,14 +293,9 @@ struct ChatView: View {
     
     // MARK: - 动作
 
+    // 只使用 message.id 作为视图标识，避免流式输出时 content 变化导致重建
     private func messageRenderIdentity(for message: ChatMessage) -> String {
-        var hasher = Hasher()
-        hasher.combine(message.id)
-        hasher.combine(message.content)
-        hasher.combine(message.agentId)
-        hasher.combine(message.agentName)
-        hasher.combine(message.linkedTaskSessionID)
-        return "\(message.id.uuidString)-\(hasher.finalize())"
+        return message.id.uuidString
     }
 
     private var visibleMessages: [ChatMessage] {
@@ -423,15 +314,15 @@ struct ChatView: View {
         conversationController.taskSession(for: selectedTaskSessionID)
     }
 
-    private var messageListRevision: String {
-        visibleMessages
-            .map { messageRenderIdentity(for: $0) }
-            .joined(separator: "|")
+    // 只用消息数量作为列表版本，避免 content 变化导致整个 VStack 重建
+    private var messageListRevision: Int {
+        return visibleMessages.count
     }
 
+    // 使用最后一条消息的 ID 和内容长度来检测变化，避免频繁触发滚动
     private var latestMessageRenderIdentity: String {
         guard let message = visibleMessages.last else { return "empty" }
-        return messageRenderIdentity(for: message)
+        return "\(message.id.uuidString)-\(message.content.count)"
     }
 
     private var shouldShowProcessingStatusDock: Bool {
@@ -840,13 +731,11 @@ private struct InlineProcessingBar: View {
                     .foregroundColor(.primary)
                     .lineLimit(1)
 
-                TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text(subtitle)
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Spacer(minLength: 8)
@@ -883,15 +772,14 @@ private struct InlineProcessingBar: View {
                 .padding(.vertical, 5)
             }
 
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(elapsedText(referenceDate: context.date))
-                    .font(.system(size: 10.5, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.white.opacity(0.75))
-                    .clipShape(Capsule())
-            }
+            // 使用静态文本，避免 TimelineView 每秒刷新导致的性能问题
+            Text(elapsedText(referenceDate: Date()))
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.white.opacity(0.75))
+                .clipShape(Capsule())
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

@@ -31,7 +31,13 @@ final class RequestPlanner {
     }
 
     func plan(_ envelope: RequestEnvelope) async -> RequestPlan {
-        // Phase 2: MCP 服务前置检测（最高优先级）
+        // Phase 1: 服务管理意图检测（最高优先级）
+        if let servicePlan = await detectServiceManagementIntent(envelope) {
+            LogInfo("[RequestPlanner] 服务管理意图检测命中: \(servicePlan.reason)")
+            return servicePlan.withPlannerID("service-management")
+        }
+        
+        // Phase 2: MCP 服务前置检测
         if let mcpPlan = await detectMCPDirectExecution(envelope) {
             LogInfo("[RequestPlanner] MCP 直接执行检测命中: \(mcpPlan.reason)")
             return mcpPlan.withPlannerID("mcp-direct")
@@ -286,6 +292,78 @@ final class RequestPlanner {
         )
     }
     
+    // MARK: - Phase 2: 服务管理意图检测
+    
+    /// 检测是否是服务管理相关请求（启动/停止/重启服务）
+    /// 如果检测到，使用 ServicePlanner 执行，不经过 LLM
+    private func detectServiceManagementIntent(_ envelope: RequestEnvelope) async -> RequestPlan? {
+        let text = envelope.originalText.lowercased()
+        
+        // 服务管理关键词
+        let operationKeywords: [(ServiceOperation, [String])] = [
+            (.start, ["启动", "开启", "运行", "打开", "start", "run"]),
+            (.stop, ["停止", "关闭", "关停", "stop", "shutdown"]),
+            (.restart, ["重启", "重新启动", "restart", "reload"]),
+            (.check, ["状态", "检查", "查看", "status", "check", "info"])
+        ]
+        
+        // 常见服务名称
+        let commonServices = [
+            ("postgresql", ["postgres", "postgresql", "pg", "数据库", "pgsql"]),
+            ("redis", ["redis", "缓存", "cache"]),
+            ("mysql", ["mysql", "mariadb", "sql"]),
+            ("mongodb", ["mongodb", "mongo", "nosql"]),
+            ("nginx", ["nginx", "web服务器"]),
+            ("rabbitmq", ["rabbitmq", "mq", "消息队列"]),
+            ("elasticsearch", ["es", "elasticsearch", "搜索引擎"]),
+        ]
+        
+        // 检测操作类型
+        var detectedOperation: ServiceOperation?
+        for (op, keywords) in operationKeywords {
+            if keywords.contains(where: { text.contains($0) }) {
+                detectedOperation = op
+                break
+            }
+        }
+        
+        guard let operation = detectedOperation else {
+            return nil
+        }
+        
+        // 检测服务名称
+        var detectedService: String?
+        for (serviceId, keywords) in commonServices {
+            if keywords.contains(where: { text.contains($0) }) {
+                detectedService = serviceId
+                break
+            }
+        }
+        
+        guard let serviceId = detectedService else {
+            return nil
+        }
+        
+        // 构建服务管理执行计划
+        return RequestPlan(
+            envelope: envelope,
+            parsedInput: ParsedInput(
+                original: envelope.originalText,
+                cleanText: envelope.originalText
+            ),
+            preparedInput: envelope.originalText,
+            notices: ["🚀 服务管理: \(serviceId) \(operation.rawValue)"],
+            requestedAgentSwitch: nil,
+            primaryAction: .manageService(
+                serviceID: serviceId,
+                operation: operation.rawValue,
+                userIntent: envelope.originalText
+            ),
+            confidence: .high,
+            reason: "用户请求管理服务: \(serviceId), 操作: \(operation.rawValue)"
+        )
+    }
+    
     // MARK: - Phase 2: MCP 原生调度
     
     /// 检测是否是直接的 MCP 服务调用请求
@@ -295,9 +373,9 @@ final class RequestPlanner {
         
         // 获取所有可用的 MCP 服务
         let mcpServices = await MainActor.run {
+            // 简化实现：返回所有运行中的服务
             ServiceManager.shared.services.filter {
-                $0.category == .mcp &&
-                ServiceManager.shared.runtimeInfos[$0.id]?.status == .running
+                $0.state == .running
             }
         }
         
@@ -318,11 +396,11 @@ final class RequestPlanner {
             ]
             
             if servicePatterns.contains(where: { text.contains($0) }) {
-                let (operation, params) = extractMCPOperation(from: text, service: service)
+                let (operation, params) = extractMCPOperation(from: text, service: service.toServiceDefinition())
                 
                 return buildMCPPlan(
                     envelope: envelope,
-                    service: service,
+                    service: service.toServiceDefinition(),
                     operation: operation,
                     parameters: params
                 )
@@ -335,7 +413,7 @@ final class RequestPlanner {
             if let xhsService = mcpServices.first(where: { $0.id.contains("xiaohongshu") || $0.name.contains("小红书") }) {
                 return buildMCPPlan(
                     envelope: envelope,
-                    service: xhsService,
+                    service: xhsService.toServiceDefinition(),
                     operation: "trending",
                     parameters: [:]
                 )
@@ -347,7 +425,7 @@ final class RequestPlanner {
             if let ghService = mcpServices.first(where: { $0.id.contains("github") || $0.name.contains("GitHub") }) {
                 return buildMCPPlan(
                     envelope: envelope,
-                    service: ghService,
+                    service: ghService.toServiceDefinition(),
                     operation: "query",
                     parameters: extractGitHubParameters(from: text)
                 )
@@ -580,15 +658,16 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
 
     private func nativeServiceExecutionCandidate(
         for text: String,
-        services: [ServiceDefinition]
+        services: [ServiceStateSnapshot]
     ) -> NativeServiceExecutionCandidate? {
         let normalizedText = RequestPlanningHeuristics.normalized(text)
         guard !normalizedText.isEmpty else { return nil }
 
         guard let service = services.first(where: { service in
-            service.category == .mcp &&
-            service.type == .http &&
-            serviceAliases(for: service).contains(where: { alias in
+            let def = service.toServiceDefinition()
+            return def.category == .mcp &&
+            def.type == .http &&
+            serviceAliases(for: def).contains(where: { alias in
                 let foldedAlias = foldedServiceIdentifier(alias)
                 return !foldedAlias.isEmpty && foldedServiceIdentifier(normalizedText).contains(foldedAlias)
             })
@@ -620,7 +699,7 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
             : "识别到明确的 MCP 健康/状态检查请求，直接走原生执行链。"
 
         return NativeServiceExecutionCandidate(
-            service: service,
+            service: service.toServiceDefinition(),
             skillID: "mcp.\(service.id)",
             operation: operation,
             endpoint: endpoint,
@@ -1288,10 +1367,10 @@ final class RuleBasedRequestPlannerProvider: RequestPlannerProvider {
         if RequestPlanningHeuristics.shouldTreatAsResumeCommand(normalized) {
             // 使用 ContinueIntentAnalyzer 分析所有可继续处理的事项
             let taskSessions = await MainActor.run { CommandRunner.shared.taskSessions }
-            let services = await MainActor.run { ServiceManager.shared.services }
+            let services = await MainActor.run { ServiceManager.shared.services.map { $0.toServiceDefinition() } }
             let runtimes = await MainActor.run { ServiceManager.shared.runtimeInfos }
             let messages = await MainActor.run { CommandRunner.shared.messages }
-            let activeTasks = await MainActor.run { Set(ServiceTaskManager.shared.activeServiceTasks.keys) }
+            let activeTasks = await MainActor.run { Set(ServiceTaskManager.shared.activeServiceTasks) }
             
             let analysis = ContinueIntentAnalyzer.shared.analyze(
                 taskSessions: taskSessions,

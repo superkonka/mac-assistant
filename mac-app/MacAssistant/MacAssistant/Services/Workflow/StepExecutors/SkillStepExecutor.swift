@@ -123,11 +123,8 @@ final class SkillStepExecutor: StepExecutor {
             ]
             
         case .analyzeDisk:
-            return [
-                "skill": "analyzeDisk",
-                "status": "completed",
-                "result": "磁盘分析完成"
-            ]
+            // 真正执行磁盘分析
+            return await performRealDiskAnalysis()
             
         case .explainSelection:
             return [
@@ -164,5 +161,93 @@ final class SkillStepExecutor: StepExecutor {
                 "output": "Skill 执行完成"
             ]
         }
+    }
+    
+    // MARK: - 真实磁盘分析
+    
+    private func performRealDiskAnalysis() async -> [String: String] {
+        LogInfo("[SkillStepExecutor] 开始执行真实磁盘分析...")
+        
+        // 触发分析
+        await MainActor.run {
+            ResourceAnalyzer.shared.startAnalysis()
+        }
+        
+        // 等待分析完成（最多30秒）
+        var attempts = 0
+        while attempts < 30 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1秒
+            
+            let isAnalyzing = await MainActor.run {
+                ResourceAnalyzer.shared.isAnalyzing
+            }
+            
+            if !isAnalyzing {
+                break
+            }
+            attempts += 1
+        }
+        
+        // 获取结果
+        let result = await MainActor.run {
+            ResourceAnalyzer.shared.analysisResult
+        }
+        
+        guard let analysis = result else {
+            return [
+                "skill": "analyzeDisk",
+                "status": "failed",
+                "error": "分析未完成或失败"
+            ]
+        }
+        
+        // 构建详细的分析结果
+        var resultLines: [String] = []
+        
+        // 总览
+        let totalSizeGB = Double(analysis.totalScannedSize) / 1_000_000_000
+        resultLines.append("📊 磁盘分析结果")
+        resultLines.append("总扫描大小: \(String(format: "%.2f", totalSizeGB)) GB")
+        resultLines.append("")
+        
+        // 分类统计
+        if !analysis.categories.isEmpty {
+            resultLines.append("📁 按类型分布:")
+            for category in analysis.categories.prefix(5) {
+                let sizeGB = Double(category.size) / 1_000_000_000
+                resultLines.append("  - \(category.category.rawValue): \(String(format: "%.2f", sizeGB)) GB (\(category.count) 个文件)")
+            }
+            resultLines.append("")
+        }
+        
+        // 大文件
+        if !analysis.largeFiles.isEmpty {
+            resultLines.append("📦 最大的文件:")
+            for file in analysis.largeFiles.prefix(10) {
+                let sizeMB = Double(file.size) / 1_000_000
+                resultLines.append("  - \(file.name): \(String(format: "%.1f", sizeMB)) MB")
+            }
+            resultLines.append("")
+        }
+        
+        // 建议
+        if !analysis.suggestions.isEmpty {
+            resultLines.append("💡 优化建议:")
+            for suggestion in analysis.suggestions.prefix(5) {
+                resultLines.append("  - \(suggestion.title)")
+                resultLines.append("    \(suggestion.description)")
+            }
+        }
+        
+        let fullResult = resultLines.joined(separator: "\n")
+        
+        return [
+            "skill": "analyzeDisk",
+            "status": "completed",
+            "result": fullResult,
+            "totalSizeGB": String(format: "%.2f", totalSizeGB),
+            "categoriesCount": "\(analysis.categories.count)",
+            "largeFilesCount": "\(analysis.largeFiles.count)"
+        ]
     }
 }

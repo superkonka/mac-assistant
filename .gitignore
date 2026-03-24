@@ -16,3 +16,4 @@ mac-app/MacAssistant/MacAssistant/Resources/openclaw-runtime/*
 
 # Local runtime artifacts
 *.log
+*.dmg

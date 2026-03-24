@@ -646,9 +646,18 @@ enum RequestPlanningHeuristics {
     /// 判断是否应提升为 workflow
     static func shouldPromoteToWorkflow(_ text: String) -> Bool {
         let normalized = RequestPlanningHeuristics.normalized(text)
+        
+        // 排除纯查询类意图（不是执行/自动化意图）
+        let queryOnlyPatterns = ["有哪些", "有什么", "是什么", "在哪里", "怎么样", "如何", "介绍", "说明"]
+        let isQueryOnly = queryOnlyPatterns.contains(where: { normalized.contains($0) })
+        
+        // 明确排除"有哪些服务"这种查询
+        if isQueryOnly && normalized.contains("服务") {
+            return false
+        }
 
         let scheduleMarkers = ["每天", "每周", "定时", "定期", "循环"]
-        let mcpAutomationMarkers = ["mcp", "服务", "整理", "汇总", "日报", "热搜", "榜单", "简报"]
+        let mcpAutomationMarkers = ["mcp", "整理", "汇总", "日报", "热搜", "榜单", "简报"]
         if scheduleMarkers.contains(where: { normalized.contains($0) }) &&
             mcpAutomationMarkers.contains(where: { normalized.contains($0) }) {
             return true

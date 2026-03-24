@@ -18,6 +18,11 @@ final class ConversationRuntime: ObservableObject {
     private let unifiedSessionPrefix = "unified-task-"
     private var dismissedUnifiedSessionDates: [String: Date] = [:]
     private var cancellables: Set<AnyCancellable> = []
+    
+    // 节流控制
+    private var lastRefreshTime: Date = .distantPast
+    private var pendingRefresh = false
+    private let refreshInterval: TimeInterval = 0.1  // 最小刷新间隔
 
     init(runner: CommandRunner = .shared) {
         self.runner = runner
@@ -139,6 +144,26 @@ final class ConversationRuntime: ObservableObject {
     }
 
     private func refreshStores() {
+        // 节流检查
+        let now = Date()
+        let timeSinceLastRefresh = now.timeIntervalSince(lastRefreshTime)
+        
+        if timeSinceLastRefresh < refreshInterval {
+            // 如果距离上次刷新时间太短，标记有挂起的刷新
+            if !pendingRefresh {
+                pendingRefresh = true
+                // 延迟执行刷新
+                DispatchQueue.main.asyncAfter(deadline: .now() + refreshInterval - timeSinceLastRefresh) { [weak self] in
+                    self?.pendingRefresh = false
+                    self?.refreshStores()
+                }
+            }
+            return
+        }
+        
+        lastRefreshTime = now
+        pendingRefresh = false
+        
         let unifiedSessions = convertUnifiedTasksToSessions()
         let unifiedGatewaySessionKeys = Set(unifiedSessions.compactMap(\.gatewaySessionKey))
         let runnerSessions = filteredRunnerSessions(
@@ -146,7 +171,7 @@ final class ConversationRuntime: ObservableObject {
         )
         let mergedSessions = runnerSessions + unifiedSessions
         
-        stores = ConversationStores(
+        let newStores = ConversationStores(
             messages: runner.messages,
             taskSessions: mergedSessions,
             tracesByID: runner.messageExecutionTraces,
@@ -156,6 +181,11 @@ final class ConversationRuntime: ObservableObject {
             activeBrowserSessionID: browserSessionStore.activeSessionID,
             browserSessions: browserSessionStore.sessions
         )
+        
+        // 只在数据真正变化时更新，避免触发不必要的 SwiftUI 重绘
+        if stores != newStores {
+            stores = newStores
+        }
     }
     private func filteredRunnerSessions(excludingGatewaySessionKeys gatewaySessionKeys: Set<String>) -> [AgentTaskSession] {
         runner.taskSessions.filter { session in

@@ -2,12 +2,71 @@
 //  ConversationMemoryManager.swift
 //  MacAssistant
 //
-//  对话记忆管理器 - 简化的上下文回填系统
-//  作为秘书最基本的职责：记住用户说过的话
+//  对话记忆管理器 - 蒸馏模式上下文回填系统
 //
 
 import Foundation
 import NaturalLanguage
+
+// MARK: - 蒸馏后的对话信息
+
+/// 对话条目类型
+enum ConversationEntryType: String, Codable {
+    case code       // 代码相关
+    case file       // 文件操作
+    case task       // 任务执行
+    case skill      // Skill调用
+    case service    // 服务管理
+    case query      // 一般查询
+    case chitchat   // 闲聊
+}
+
+/// 蒸馏后的对话条目 - 提取关键信息
+struct DistilledEntry: Codable {
+    let id: UUID
+    let timestamp: Date
+    let role: MessageRole
+    let type: ConversationEntryType
+    
+    // 蒸馏信息
+    let keyEntities: [String]      // 关键实体（文件名、服务名、代码片段等）
+    let intent: String             // 意图摘要
+    let outcome: String?           // 结果/回复摘要
+    let rawContent: String         // 原始内容（保留用于详情）
+    
+    // 关联信息
+    let agentID: String?
+    let agentName: String?
+    let metadata: [String: String]?
+}
+
+/// 蒸馏后的记忆上下文
+struct DistilledMemoryContext: Codable {
+    // 按类型分组的条目
+    let codeEntries: [DistilledEntry]
+    let fileEntries: [DistilledEntry]
+    let taskEntries: [DistilledEntry]
+    let skillEntries: [DistilledEntry]
+    let serviceEntries: [DistilledEntry]
+    let queryEntries: [DistilledEntry]
+    
+    // 提取的关键信息
+    let keyEntities: [String: [String]]  // 类型 -> 实体列表
+    let topicEvolution: [String]         // 话题演变
+    let activeTasks: [String]            // 进行中的任务
+    let lastUserIntent: String?          // 最后用户意图
+    
+    var isEmpty: Bool {
+        codeEntries.isEmpty && 
+        fileEntries.isEmpty && 
+        taskEntries.isEmpty && 
+        skillEntries.isEmpty && 
+        serviceEntries.isEmpty && 
+        queryEntries.isEmpty
+    }
+}
+
+// MARK: - 原始对话条目
 
 /// 对话历史条目
 struct ConversationEntry: Codable, Identifiable, Equatable {
@@ -24,7 +83,7 @@ struct ConversationEntry: Codable, Identifiable, Equatable {
     var isAssistantMessage: Bool { role == .assistant }
 }
 
-/// 记忆上下文
+/// 记忆上下文（原始模式 - 用于兼容）
 struct MemoryContext: Codable {
     let relevantEntries: [ConversationEntry]
     let summary: String?
@@ -32,75 +91,109 @@ struct MemoryContext: Codable {
     let continuityHints: [String]
     
     var isEmpty: Bool { relevantEntries.isEmpty }
-    
-    /// 格式化为提示词（按时间线组织）
-    func formattedForPrompt(maxEntries: Int = 10) -> String {
-        var parts: [String] = []
+}
+
+// MARK: - 上下文格式化扩展
+
+extension DistilledMemoryContext {
+    /// 格式化为系统提示词（蒸馏模式）
+    func formatForSystemPrompt() -> String {
+        var sections: [String] = []
         
-        // 1. 时间线摘要
-        if let summary = summary, !summary.isEmpty {
-            parts.append("📋 对话时间线：\n\(summary)\n")
+        // 1. 话题演变
+        if !topicEvolution.isEmpty {
+            sections.append("【话题演变】\n" + topicEvolution.joined(separator: " => "))
         }
         
-        // 2. 按时间顺序排列的对话历史
-        if !relevantEntries.isEmpty {
-            parts.append("💬 对话历史（按时间顺序）：")
-            let entriesToShow = Array(relevantEntries.suffix(maxEntries))  // 取最近的
-            
-            var lastTimestamp: Date?
-            for entry in entriesToShow {
-                let role = entry.isUserMessage ? "用户" : (entry.agentName ?? "助手")
-                let timeMark = formatTimeMark(entry: entry, lastTimestamp: lastTimestamp)
-                parts.append("\(timeMark)\(role)：\(entry.content.prefix(200))\(entry.content.count > 200 ? "..." : "")")
-                lastTimestamp = entry.timestamp
+        // 2. 关键实体
+        if !keyEntities.isEmpty {
+            var entityLines: [String] = []
+            for (type, entities) in keyEntities where !entities.isEmpty {
+                entityLines.append("- \(type): \(entities.joined(separator: ", "))")
+            }
+            if !entityLines.isEmpty {
+                sections.append("【关键实体】\n" + entityLines.joined(separator: "\n"))
             }
         }
         
-        // 3. 当前话题提示
-        if let topic = lastTopic, !topic.isEmpty {
-            parts.append("\n📍 当前话题：\(topic)")
+        // 3. 代码相关（优先级高）
+        if !codeEntries.isEmpty {
+            sections.append(formatEntries(codeEntries, title: "代码相关", icon: "CODE"))
         }
         
-        // 4. 连续性提示
-        if !continuityHints.isEmpty {
-            parts.append("\n🔔 连续性提示：\n" + continuityHints.joined(separator: "\n"))
+        // 4. 文件操作
+        if !fileEntries.isEmpty {
+            sections.append(formatEntries(fileEntries, title: "文件操作", icon: "FILE"))
         }
         
-        return parts.joined(separator: "\n")
+        // 5. 任务执行
+        if !taskEntries.isEmpty {
+            sections.append(formatEntries(taskEntries, title: "任务执行", icon: "TASK"))
+        }
+        
+        // 6. Skill调用
+        if !skillEntries.isEmpty {
+            sections.append(formatEntries(skillEntries, title: "Skill调用", icon: "SKILL"))
+        }
+        
+        // 7. 服务管理
+        if !serviceEntries.isEmpty {
+            sections.append(formatEntries(serviceEntries, title: "服务管理", icon: "SVC"))
+        }
+        
+        // 8. 一般查询（优先级低，只显示最近的）
+        if !queryEntries.isEmpty {
+            let recentQueries = Array(queryEntries.suffix(2))
+            sections.append(formatEntries(recentQueries, title: "近期对话", icon: "CHAT"))
+        }
+        
+        // 9. 进行中的任务
+        if !activeTasks.isEmpty {
+            sections.append("【进行中】\n- \(activeTasks.joined(separator: "\n- "))")
+        }
+        
+        // 10. 当前意图提示
+        if let intent = lastUserIntent {
+            sections.append("【当前意图】\n\(intent)")
+        }
+        
+        return sections.joined(separator: "\n\n")
     }
     
-    /// 格式化时间标记
-    private func formatTimeMark(entry: ConversationEntry, lastTimestamp: Date?) -> String {
-        guard let last = lastTimestamp else { return "" }
+    private func formatEntries(_ entries: [DistilledEntry], title: String, icon: String) -> String {
+        var lines: [String] = ["[\(icon)] 【\(title)】"]
         
-        let gap = entry.timestamp.timeIntervalSince(last)
-        if gap > 300 {  // 超过5分钟显示时间
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
-            return "[\(formatter.string(from: entry.timestamp))] "
+        for entry in entries.suffix(3) {  // 每类最多3条
+            let role = entry.role == .user ? "用户" : "助手"
+            var line = "- [\(role)] \(entry.intent)"
+            
+            if !entry.keyEntities.isEmpty {
+                line += " (\(entry.keyEntities.joined(separator: ", ")))"
+            }
+            
+            if let outcome = entry.outcome, !outcome.isEmpty {
+                line += " [=] \(outcome)"
+            }
+            
+            lines.append(line)
         }
-        return ""
+        
+        return lines.joined(separator: "\n")
     }
 }
 
-/// 对话记忆管理器
+// MARK: - 对话记忆管理器
+
 @MainActor
 final class ConversationMemoryManager: ObservableObject {
     static let shared = ConversationMemoryManager()
     
-    /// 最大保留的对话历史数量
     private let maxHistorySize = 100
-    
-    /// 向量维度
     private let vectorDimension = 32
     
-    /// 对话历史存储
     @Published private(set) var entries: [ConversationEntry] = []
-    
-    /// 向量缓存 (entryID -> vector)
+    private var distilledCache: [UUID: DistilledEntry] = [:]
     private var vectorCache: [String: [Double]] = [:]
-    
-    /// 会话索引 (sessionID -> entryIDs)
     private var sessionIndex: [String: [UUID]] = [:]
     
     private init() {
@@ -109,7 +202,6 @@ final class ConversationMemoryManager: ObservableObject {
     
     // MARK: - 核心 API
     
-    /// 记录对话条目
     func recordEntry(
         sessionID: String,
         role: MessageRole,
@@ -130,289 +222,332 @@ final class ConversationMemoryManager: ObservableObject {
         )
         
         entries.append(entry)
-        
-        // 更新索引
         sessionIndex[sessionID, default: []].append(entry.id)
         
-        // 生成并缓存向量
         let vector = generateVector(for: content)
         vectorCache[entry.id.uuidString] = vector
         
-        // 清理旧数据
         if entries.count > maxHistorySize {
             cleanupOldEntries()
         }
         
-        // 持久化
         persistEntries()
         
-        LogInfo("MemoryManager: 记录对话 entry=\(entry.id), session=\(sessionID), role=\(role)")
+        Task {
+            let distilled = await distillEntry(entry)
+            await MainActor.run {
+                self.distilledCache[entry.id] = distilled
+            }
+        }
+        
+        LogInfo("MemoryManager: recorded entry=\(entry.id), session=\(sessionID), role=\(role)")
     }
     
-    /// 检索相关历史（基于时间线提炼）
-    func retrieveRelevantContext(
+    // MARK: - 蒸馏模式检索
+    
+    func retrieveDistilledContext(
         for query: String,
         currentSessionID: String,
-        maxEntries: Int = 8,
-        timeWindow: TimeInterval = 3600  // 1小时
-    ) -> MemoryContext {
+        maxEntries: Int = 10
+    ) -> DistilledMemoryContext {
         
-        let cutoffTime = Date().addingTimeInterval(-timeWindow)
-        let queryVector = generateVector(for: query)
+        let cutoffTime = Date().addingTimeInterval(-3600)
         
-        // 1. 获取当前会话的近期历史（按时间排序）
-        let currentSessionEntries = entries
+        let sessionEntries = entries
             .filter { $0.sessionID == currentSessionID && $0.timestamp > cutoffTime }
             .sorted { $0.timestamp < $1.timestamp }
         
-        // 2. 时间线基础：获取最近 N 条消息作为上下文基础
-        let recentBaseCount = 3
-        var selectedEntries: [ConversationEntry] = Array(currentSessionEntries.suffix(recentBaseCount))
-        var selectedIDs = Set(selectedEntries.map { $0.id })
+        var distilledEntries: [DistilledEntry] = []
+        for entry in sessionEntries {
+            if let distilled = distilledCache[entry.id] {
+                distilledEntries.append(distilled)
+            } else {
+                let distilled = distillEntrySync(entry)
+                distilledCache[entry.id] = distilled
+                distilledEntries.append(distilled)
+            }
+        }
         
-        // 3. 语义补充：基于相似度查找更多相关内容
-        if selectedEntries.count < maxEntries {
-            var scoredEntries: [(entry: ConversationEntry, score: Double)] = []
+        let codeEntries = distilledEntries.filter { $0.type == .code }
+        let fileEntries = distilledEntries.filter { $0.type == .file }
+        let taskEntries = distilledEntries.filter { $0.type == .task }
+        let skillEntries = distilledEntries.filter { $0.type == .skill }
+        let serviceEntries = distilledEntries.filter { $0.type == .service }
+        let queryEntries = distilledEntries.filter { $0.type == .query }
+        
+        var keyEntities: [String: [String]] = [:]
+        for entry in distilledEntries {
+            let typeKey = entry.type.rawValue
+            var entities = keyEntities[typeKey] ?? []
+            entities.append(contentsOf: entry.keyEntities)
+            keyEntities[typeKey] = Array(Set(entities)).sorted()
+        }
+        
+        let topicEvolution = extractTopicEvolution(from: distilledEntries)
+        let activeTasks = identifyActiveTasks(from: distilledEntries)
+        let lastUserIntent = distilledEntries.last { $0.role == .user }?.intent
+        
+        return DistilledMemoryContext(
+            codeEntries: codeEntries,
+            fileEntries: fileEntries,
+            taskEntries: taskEntries,
+            skillEntries: skillEntries,
+            serviceEntries: serviceEntries,
+            queryEntries: queryEntries,
+            keyEntities: keyEntities,
+            topicEvolution: topicEvolution,
+            activeTasks: activeTasks,
+            lastUserIntent: lastUserIntent
+        )
+    }
+
+    // MARK: - 上下文注入（蒸馏模式）
+    
+    func prepareDistilledContextPrompt(
+        userMessage: String,
+        sessionID: String,
+        baseSystemPrompt: String? = nil
+    ) -> (text: String, systemPrompt: String?) {
+        
+        let context = retrieveDistilledContext(for: userMessage, currentSessionID: sessionID)
+        
+        var enhancedSystemPrompt = baseSystemPrompt
+        
+        if !context.isEmpty {
+            let distilledContext = context.formatForSystemPrompt()
             
-            for entry in entries where entry.timestamp > cutoffTime && !selectedIDs.contains(entry.id) {
-                guard let entryVector = vectorCache[entry.id.uuidString] else { continue }
+            if let base = baseSystemPrompt, !base.isEmpty {
+                enhancedSystemPrompt = base + "\n\n【对话上下文 - 蒸馏模式】\n" + distilledContext
+            } else {
+                enhancedSystemPrompt = """
+                你是 MacAssistant，一个智能助手。
                 
-                let similarity = cosineSimilarity(queryVector, entryVector)
+                【对话上下文 - 蒸馏模式】
+                \(distilledContext)
                 
-                // 同一会话加权，时间越近加权越高
-                let sessionBoost = entry.sessionID == currentSessionID ? 0.3 : 0
-                let timeBoost = calculateTimeBoost(entry: entry, cutoff: cutoffTime)
-                let finalScore = similarity + sessionBoost + timeBoost
-                
-                if finalScore > 0.25 {
-                    scoredEntries.append((entry, finalScore))
+                请基于以上上下文回答用户的问题。不要说你没有记忆或这是第一次对话。
+                """
+            }
+        } else {
+            if enhancedSystemPrompt == nil {
+                enhancedSystemPrompt = "你是 MacAssistant，一个运行在 macOS 上的智能助手。"
+            }
+        }
+        
+        return (userMessage, enhancedSystemPrompt)
+    }
+    
+    // MARK: - 蒸馏逻辑
+    
+    private func distillEntry(_ entry: ConversationEntry) async -> DistilledEntry {
+        return distillEntrySync(entry)
+    }
+    
+    private func distillEntrySync(_ entry: ConversationEntry) -> DistilledEntry {
+        let content = entry.content
+        
+        let type = classifyEntryType(content: content)
+        let entities = extractKeyEntities(from: content, type: type)
+        let intent = generateIntentSummary(content: content, type: type, role: entry.role)
+        let outcome: String? = entry.role == .assistant ? generateOutcomeSummary(content: content) : nil
+        
+        return DistilledEntry(
+            id: entry.id,
+            timestamp: entry.timestamp,
+            role: entry.role,
+            type: type,
+            keyEntities: entities,
+            intent: intent,
+            outcome: outcome,
+            rawContent: content,
+            agentID: entry.agentID,
+            agentName: entry.agentName,
+            metadata: entry.metadata
+        )
+    }
+    
+    private func classifyEntryType(content: String) -> ConversationEntryType {
+        let lower = content.lowercased()
+        
+        let codePatterns = ["代码", "code", "函数", "类", "bug", "error", "编译", "syntax", "def ", "func ", "class "]
+        if codePatterns.contains(where: lower.contains) {
+            return .code
+        }
+        
+        let filePatterns = ["文件", "file", "路径", "path", "目录", "folder", "打开", "读取", "保存"]
+        if filePatterns.contains(where: lower.contains) {
+            return .file
+        }
+        
+        let taskPatterns = ["任务", "task", "执行", "运行", "处理", "分析", "检查"]
+        if taskPatterns.contains(where: lower.contains) {
+            return .task
+        }
+        
+        let skillPatterns = ["skill", "技能", "工具", "截图", "翻译", "总结"]
+        if skillPatterns.contains(where: lower.contains) {
+            return .skill
+        }
+        
+        let servicePatterns = ["服务", "service", "启动", "停止", "重启", "运行中"]
+        if servicePatterns.contains(where: lower.contains) {
+            return .service
+        }
+        
+        return .query
+    }
+    
+    private func extractKeyEntities(from content: String, type: ConversationEntryType) -> [String] {
+        var entities: [String] = []
+        
+        switch type {
+        case .code:
+            // 提取代码相关实体
+            if content.contains("函数") || content.contains("func ") {
+                entities.append("函数定义")
+            }
+            if content.contains("类") || content.contains("class ") {
+                entities.append("类定义")
+            }
+            if content.contains("bug") || content.contains("error") {
+                entities.append("问题修复")
+            }
+            
+        case .file:
+            // 提取文件路径
+            let filePattern = try? NSRegularExpression(pattern: "[/\\][\\w\\-./]+\\.[\\w]+", options: [])
+            if let matches = filePattern?.matches(in: content, options: [], range: NSRange(location: 0, length: content.utf16.count)) {
+                for match in matches.prefix(3) {
+                    if let range = Range(match.range, in: content) {
+                        entities.append(String(content[range]))
+                    }
                 }
             }
             
-            // 按相似度排序，选择补充条目
-            scoredEntries.sort { $0.score > $1.score }
-            let remainingSlots = maxEntries - selectedEntries.count
-            let supplementary = scoredEntries.prefix(remainingSlots).map { $0.entry }
+        case .service:
+            // 提取服务名
+            let serviceNames = ["postgresql", "redis", "mysql", "nginx", "mongodb", "rabbitmq"]
+            for name in serviceNames {
+                if content.lowercased().contains(name) {
+                    entities.append(name)
+                }
+            }
             
-            selectedEntries.append(contentsOf: supplementary)
-            selectedIDs.formUnion(supplementary.map { $0.id })
+        case .skill:
+            // 提取技能名
+            let skillNames = ["截图", "翻译", "总结", "分析", "explain", "translate", "summarize"]
+            for name in skillNames {
+                if content.lowercased().contains(name) {
+                    entities.append(name)
+                }
+            }
+            
+        default:
+            break
         }
         
-        // 4. 按时间线排序（不是按相似度！）
-        let timeLineEntries = selectedEntries.sorted { $0.timestamp < $1.timestamp }
-        
-        // 5. 生成时间线摘要
-        let timeLineSummary = generateTimeLineSummary(from: timeLineEntries)
-        
-        // 6. 提取当前话题
-        let currentTopic = extractCurrentTopic(from: currentSessionEntries)
-        
-        // 7. 生成基于时间线的连续性提示
-        let continuityHints = generateTimeLineContinuityHints(
-            currentQuery: query,
-            timeLineEntries: timeLineEntries,
-            allSessionEntries: currentSessionEntries
-        )
-        
-        return MemoryContext(
-            relevantEntries: timeLineEntries,
-            summary: timeLineSummary,
-            lastTopic: currentTopic,
-            continuityHints: continuityHints
-        )
+        return entities
     }
     
-    /// 计算时间加权（越近越高）
-    private func calculateTimeBoost(entry: ConversationEntry, cutoff: Date) -> Double {
-        let totalWindow = Date().timeIntervalSince(cutoff)
-        let entryAge = Date().timeIntervalSince(entry.timestamp)
-        let recency = 1.0 - (entryAge / totalWindow)
-        return max(0, recency * 0.2)  // 最大0.2的加权
-    }
-    
-    /// 获取会话的完整历史
-    func getSessionHistory(sessionID: String, limit: Int = 50) -> [ConversationEntry] {
-        return entries
-            .filter { $0.sessionID == sessionID }
-            .sorted { $0.timestamp < $1.timestamp }
-            .suffix(limit)
-    }
-    
-    /// 获取最近的对话
-    func getRecentEntries(count: Int = 10) -> [ConversationEntry] {
-        return entries.suffix(count)
-    }
-    
-    /// 清空历史
-    func clearHistory() {
-        entries.removeAll()
-        vectorCache.removeAll()
-        sessionIndex.removeAll()
-        persistEntries()
-    }
-    
-    /// 清空特定会话的历史
-    func clearSessionHistory(sessionID: String) {
-        entries.removeAll { $0.sessionID == sessionID }
-        let validIDs = Set(entries.map { $0.id.uuidString })
-        vectorCache = vectorCache.filter { validIDs.contains($0.key) }
-        sessionIndex.removeValue(forKey: sessionID)
-        persistEntries()
-    }
-    
-    // MARK: - 上下文注入
-    
-    /// 为请求准备带上下文的提示词
-    func prepareContextualPrompt(
-        userMessage: String,
-        sessionID: String,
-        systemPrompt: String? = nil
-    ) -> (text: String, systemPrompt: String?) {
+    private func generateIntentSummary(content: String, type: ConversationEntryType, role: MessageRole) -> String {
+        let lower = content.lowercased()
         
-        let context = retrieveRelevantContext(for: userMessage, currentSessionID: sessionID)
-        
-        guard !context.isEmpty else {
-            return (userMessage, systemPrompt)
+        if role == .user {
+            // 用户意图
+            if lower.contains("查看") || lower.contains("看") {
+                return "查看\(type == .service ? "服务状态" : "信息")"
+            } else if lower.contains("启动") || lower.contains("开始") {
+                return "启动\(type == .service ? "服务" : "任务")"
+            } else if lower.contains("停止") || lower.contains("关闭") {
+                return "停止\(type == .service ? "服务" : "任务")"
+            } else if lower.contains("重启") {
+                return "重启服务"
+            } else if lower.contains("分析") || lower.contains("检查") {
+                return "分析\(type == .code ? "代码" : "问题")"
+            } else if lower.contains("帮助") || lower.contains("怎么做") {
+                return "寻求帮助"
+            } else if lower.contains("记得") || lower.contains("聊过") {
+                return "询问对话历史"
+            }
+        } else {
+            // 助手回复摘要
+            if lower.contains("完成") || lower.contains("成功") {
+                return "任务完成"
+            } else if lower.contains("错误") || lower.contains("失败") {
+                return "遇到问题"
+            } else if lower.contains("建议") {
+                return "提供建议"
+            }
         }
         
-        // 构建增强的用户消息
-        var enhancedMessage = userMessage
-        
-        // 如果用户消息包含"继续"、"刚才"等词，添加更多上下文
-        if shouldEnrichContext(for: userMessage) {
-            let contextPrompt = context.formattedForPrompt()
-            enhancedMessage = """
-            \(contextPrompt)
-            
-            ---
-            
-            当前用户输入：\(userMessage)
-            """
-        }
-        
-        // 增强系统提示词
-        var enhancedSystemPrompt = systemPrompt
-        if let sp = systemPrompt, !sp.isEmpty {
-            enhancedSystemPrompt = """
-            \(sp)
-            
-            【记忆提示】
-            你在与用户的对话中。以下是相关信息：
-            \(context.summary ?? "")
-            \(context.continuityHints.joined(separator: "\n"))
-            """
-        } else if !context.continuityHints.isEmpty {
-            enhancedSystemPrompt = """
-            你是一个AI助手，正在与用户进行对话。
-            
-            【前文上下文】
-            \(context.continuityHints.joined(separator: "\n"))
-            """
-        }
-        
-        return (enhancedMessage, enhancedSystemPrompt)
+        // 默认摘要
+        let prefix = String(content.prefix(20))
+        return prefix + (content.count > 20 ? "..." : "")
     }
     
-    // MARK: - 辅助方法
-    
-    private func shouldEnrichContext(for message: String) -> Bool {
-        let contextKeywords = [
-            "继续", "刚才", "之前", "上面", "前面",
-            "接着说", "继续讲", "回到", "刚才说",
-            "continue", "previous", "earlier", "before",
-            "刚才那个", "之前那个", "上面提到的"
-        ]
+    private func generateOutcomeSummary(content: String) -> String? {
+        let lower = content.lowercased()
         
-        let lowercased = message.lowercased()
-        return contextKeywords.contains { lowercased.contains($0) }
+        if lower.contains("完成") || lower.contains("成功") || lower.contains("已") {
+            return "已完成"
+        } else if lower.contains("失败") || lower.contains("错误") {
+            return "执行失败"
+        } else if lower.contains("运行中") || lower.contains("进行中") {
+            return "运行中"
+        }
+        
+        return nil
     }
+
+    // MARK: - 话题演变与任务识别
     
-    /// 生成基于时间线的摘要
-    private func generateTimeLineSummary(from entries: [ConversationEntry]) -> String? {
-        guard !entries.isEmpty else { return nil }
-        
-        // 按时间排序
-        let sorted = entries.sorted { $0.timestamp < $1.timestamp }
-        
-        // 提取话题演变
+    private func extractTopicEvolution(from entries: [DistilledEntry]) -> [String] {
         var topics: [String] = []
-        var lastRole: MessageRole?
+        var lastType: ConversationEntryType?
         
-        for entry in sorted {
-            if entry.isUserMessage && lastRole != .user {
-                let topic = entry.content.prefix(40).description
-                topics.append(String(topic))
-            }
-            lastRole = entry.role
-        }
-        
-        if topics.isEmpty { return nil }
-        
-        if topics.count == 1 {
-            return "正在讨论：\(topics[0])"
-        } else {
-            return "对话演变：" + topics.joined(separator: " → ")
-        }
-    }
-    
-    /// 提取当前话题
-    private func extractCurrentTopic(from entries: [ConversationEntry]) -> String? {
-        guard let lastUser = entries.last(where: { $0.isUserMessage }) else { return nil }
-        return String(lastUser.content.prefix(50))
-    }
-    
-    /// 生成基于时间线的连续性提示
-    private func generateTimeLineContinuityHints(
-        currentQuery: String,
-        timeLineEntries: [ConversationEntry],
-        allSessionEntries: [ConversationEntry]
-    ) -> [String] {
-        var hints: [String] = []
-        
-        // 1. 最近的对话脉络（按时间）
-        let recentFlow = timeLineEntries.suffix(4)
-        if recentFlow.count >= 2 {
-            let flow = recentFlow.map { entry -> String in
-                let role = entry.isUserMessage ? "用户" : "助手"
-                return "\(role)：\(entry.content.prefix(30))..."
-            }.joined(separator: " → ")
-            hints.append("最近对话脉络：\(flow)")
-        }
-        
-        // 2. 用户上一条消息（如果不是当前消息）
-        let userMessages = allSessionEntries.filter { $0.isUserMessage }
-        if userMessages.count >= 2 {
-            let lastUserMsg = userMessages.suffix(2).first
-            if let msg = lastUserMsg, msg.content != currentQuery {
-                hints.append("用户之前问：\(msg.content.prefix(50))...")
+        for entry in entries where entry.role == .user {
+            if entry.type != lastType {
+                let topic = topicName(for: entry.type)
+                if !topics.contains(topic) {
+                    topics.append(topic)
+                }
+                lastType = entry.type
             }
         }
         
-        // 3. 等待回应的助手消息
-        if let lastAssistant = allSessionEntries.last(where: { $0.isAssistantMessage }) {
-            let timeAgo = formatTimeAgo(lastAssistant.timestamp)
-            hints.append("\(timeAgo)前助手回复了关于「\(lastAssistant.content.prefix(30))...」的内容")
-        }
-        
-        return hints
+        return topics
     }
     
-    /// 格式化时间差
-    private func formatTimeAgo(_ date: Date) -> String {
-        let seconds = Date().timeIntervalSince(date)
-        if seconds < 60 {
-            return "\(Int(seconds))秒"
-        } else if seconds < 3600 {
-            return "\(Int(seconds/60))分钟"
-        } else {
-            return "\(Int(seconds/3600))小时"
+    private func topicName(for type: ConversationEntryType) -> String {
+        switch type {
+        case .code: return "代码开发"
+        case .file: return "文件操作"
+        case .task: return "任务执行"
+        case .skill: return "技能调用"
+        case .service: return "服务管理"
+        case .query: return "一般查询"
+        case .chitchat: return "闲聊"
         }
+    }
+    
+    private func identifyActiveTasks(from entries: [DistilledEntry]) -> [String] {
+        var tasks: [String] = []
+        
+        // 查找未完成的任务
+        let taskEntries = entries.filter { $0.type == .task || $0.type == .skill }
+        
+        for entry in taskEntries.suffix(3) {
+            if entry.outcome == nil || entry.outcome == "运行中" {
+                tasks.append(entry.intent)
+            }
+        }
+        
+        return tasks
     }
     
     // MARK: - 向量计算
     
     private func generateVector(for text: String) -> [Double] {
-        // 简化的词袋模型
         var vector = Array(repeating: 0.0, count: vectorDimension)
         
         let keywords = [
@@ -438,7 +573,6 @@ final class ConversationMemoryManager: ObservableObject {
             }
         }
         
-        // 归一化
         let magnitude = sqrt(vector.map { $0 * $0 }.reduce(0, +))
         if magnitude > 0 {
             vector = vector.map { $0 / magnitude }
@@ -464,7 +598,7 @@ final class ConversationMemoryManager: ObservableObject {
             let data = try JSONEncoder().encode(entries)
             UserDefaults.standard.set(data, forKey: "conversation_memory_entries")
         } catch {
-            LogError("MemoryManager: 持久化失败 \(error)")
+            LogError("MemoryManager: persist failed \(error)")
         }
     }
     
@@ -476,33 +610,62 @@ final class ConversationMemoryManager: ObservableObject {
         do {
             entries = try JSONDecoder().decode([ConversationEntry].self, from: data)
             
-            // 重建索引和向量缓存
             for entry in entries {
                 sessionIndex[entry.sessionID, default: []].append(entry.id)
                 vectorCache[entry.id.uuidString] = generateVector(for: entry.content)
             }
             
-            LogInfo("MemoryManager: 加载了 \(entries.count) 条历史记录")
+            LogInfo("MemoryManager: loaded \(entries.count) entries")
         } catch {
-            LogError("MemoryManager: 加载失败 \(error)")
+            LogError("MemoryManager: load failed \(error)")
         }
     }
     
     private func cleanupOldEntries() {
-        let cutoff = Date().addingTimeInterval(-86400 * 7)  // 保留7天
+        let cutoff = Date().addingTimeInterval(-86400 * 7)
         entries.removeAll { $0.timestamp < cutoff }
         
-        // 清理向量缓存
         let validIDs = Set(entries.map { $0.id.uuidString })
         vectorCache = vectorCache.filter { validIDs.contains($0.key) }
+        distilledCache = distilledCache.filter { validIDs.contains($0.key.uuidString) }
         
-        // 重建索引
         sessionIndex.removeAll()
         for entry in entries {
             sessionIndex[entry.sessionID, default: []].append(entry.id)
         }
     }
+    
+    // MARK: - 兼容旧API（保留）
+    
+    func getSessionHistory(sessionID: String, limit: Int = 50) -> [ConversationEntry] {
+        return entries
+            .filter { $0.sessionID == sessionID }
+            .sorted { $0.timestamp < $1.timestamp }
+            .suffix(limit)
+    }
+    
+    func getRecentEntries(count: Int = 10) -> [ConversationEntry] {
+        return entries.suffix(count)
+    }
+    
+    func clearHistory() {
+        entries.removeAll()
+        vectorCache.removeAll()
+        distilledCache.removeAll()
+        sessionIndex.removeAll()
+        persistEntries()
+    }
+    
+    func clearSessionHistory(sessionID: String) {
+        entries.removeAll { $0.sessionID == sessionID }
+        let validIDs = Set(entries.map { $0.id.uuidString })
+        vectorCache = vectorCache.filter { validIDs.contains($0.key) }
+        distilledCache = distilledCache.filter { validIDs.contains($0.key.uuidString) }
+        sessionIndex.removeValue(forKey: sessionID)
+        persistEntries()
+    }
 }
+
 
 // MARK: - CommandRunner 集成扩展
 
@@ -525,21 +688,36 @@ extension CommandRunner {
         )
     }
     
-    /// 为请求准备带记忆的上下文
+    /// 为请求准备带蒸馏记忆的上下文（新模式）
+    @MainActor
+    func prepareRequestWithDistilledMemory(
+        text: String,
+        sessionID: String? = nil,
+        baseSystemPrompt: String? = nil
+    ) -> (text: String, systemPrompt: String?) {
+        let memory = ConversationMemoryManager.shared
+        
+        let session = sessionID ?? "main_session"
+        
+        return memory.prepareDistilledContextPrompt(
+            userMessage: text,
+            sessionID: session,
+            baseSystemPrompt: baseSystemPrompt
+        )
+    }
+    
+    /// 为请求准备带记忆的上下文（兼容旧模式）
     @MainActor
     func prepareRequestWithMemory(
         text: String,
         sessionID: String? = nil,
         systemPrompt: String? = nil
     ) -> (text: String, systemPrompt: String?) {
-        let memory = ConversationMemoryManager.shared
-        
-        let session = sessionID ?? "main_session"
-        
-        return memory.prepareContextualPrompt(
-            userMessage: text,
-            sessionID: session,
-            systemPrompt: systemPrompt
+        // 使用新的蒸馏模式
+        return prepareRequestWithDistilledMemory(
+            text: text,
+            sessionID: sessionID,
+            baseSystemPrompt: systemPrompt
         )
     }
 }

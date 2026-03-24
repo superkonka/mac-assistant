@@ -30,7 +30,7 @@ struct IntelligentInputView: View {
 
             if showSuggestions && !intelligence.suggestions.isEmpty {
                 suggestionsPopup
-                    .offset(y: -suggestionFrame.height - 8)
+                    .offset(y: -100)  // 固定偏移，避免 GeometryReader 循环
             }
         }
     }
@@ -84,13 +84,6 @@ struct IntelligentInputView: View {
         }
         .padding(12)
         .background(Color(NSColor.controlBackgroundColor))
-        .background(
-            GeometryReader { geo in
-                Color.clear.onAppear {
-                    suggestionFrame = geo.frame(in: .global)
-                }
-            }
-        )
     }
 
     private var suggestionsPopup: some View {

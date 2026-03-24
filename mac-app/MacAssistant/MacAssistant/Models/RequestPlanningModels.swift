@@ -378,6 +378,13 @@ enum RequestPlannerPrimaryAction {
         operation: String,
         parameters: [String: String]
     )
+    
+    /// 管理服务生命周期（Phase 1: 服务管理调度）
+    case manageService(
+        serviceID: String,
+        operation: String,
+        userIntent: String?
+    )
 }
 
 struct RequestPlan {
@@ -869,6 +876,19 @@ struct RequestPlan {
                     returnsToMainConversation: true
                 )
             ]
+            
+        // Phase 1: 服务管理调度
+        case .manageService(let serviceID, let operation, _):
+            return [
+                PlannedTaskSpec(
+                    id: "manage-service-\(serviceID)-\(operation)",
+                    kind: .localSystemAction,
+                    title: "管理服务: \(serviceID)",
+                    executorLabel: "ServicePlanner",
+                    summary: "通过 CLI 执行 \(serviceID) 的 \(operation) 操作。",
+                    returnsToMainConversation: true
+                )
+            ]
         }
     }
 
@@ -1025,6 +1045,10 @@ struct RequestPlan {
         // Phase 2: MCP 原生调度
         case .executeMCPService(let serviceID, let operation, _):
             return "execute_mcp_service:\(serviceID):\(operation)"
+            
+        // Phase 1: 服务管理调度
+        case .manageService(let serviceID, let operation, _):
+            return "manage_service:\(serviceID):\(operation)"
         }
     }
 

@@ -84,7 +84,8 @@ struct SkillExecutionContext {
 /// Skill 执行结果
 struct SkillExecutionResult {
     let success: Bool
-    let output: String
+    let output: [String: String]?
+    let error: String?
     let artifacts: [Artifact]?  // 生成的文件/图片等
     let followUpActions: [FollowUpAction]?
     
@@ -105,6 +106,23 @@ struct SkillExecutionResult {
         let skillID: String?
         let parameters: [String: String]?
     }
+}
+
+// MARK: - Skill Adapter Registry (临时占位)
+@MainActor
+final class SkillAdapterRegistry: ObservableObject {
+    static let shared = SkillAdapterRegistry()
+    
+    func syncToCatalog() async {
+        // 临时实现
+    }
+}
+
+// MARK: - Health Severity
+enum HealthSeverity: String, Codable {
+    case critical
+    case warning
+    case info
 }
 
 // MARK: - Skill 扩展管理器

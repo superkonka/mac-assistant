@@ -137,13 +137,17 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         - show_skill_evolution_overview
         - show_planner_console
         - execute_tool_skill
-        - show_skill_overview
+        - show_skill_overview: 用户明确想查看/管理 Skills（如"打开 Skills"、"/skills"）
         - show_agent_creation_guidance
         - execute_local_tool_skill
         - execute_explicit_skill
         - handle_detected_skill
         - handle_agent_suggestion
-        - route_main_conversation
+        - route_main_conversation: 默认路由，普通对话、服务状态查询等都走这个
+        
+        重要区分：
+        - 用户问"有哪些服务"、"服务状态"、"运行中的服务" → 这是服务状态查询，使用 route_main_conversation
+        - 用户说"打开 Skills"、"/skills"、"技能管理" → 这才是 show_skill_overview
         
         注意：当用户说"继续"、"继续处理"等模糊指令时，优先使用 continue_processing 而不是 resume_interrupted_task
 
@@ -448,10 +452,10 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         let (taskSessions, services, runtimes, messages, activeServiceTasks) = await MainActor.run {
             (
                 CommandRunner.shared.taskSessions,
-                ServiceManager.shared.services,
-                ServiceManager.shared.runtimeInfos,
+                ServiceManager.shared.services.map { $0.toServiceDefinition() },
+                [:] as [String: ServiceRuntimeInfo],  // runtimeInfos 简化
                 CommandRunner.shared.messages,
-                ServiceTaskManager.shared.activeServiceTasks.keys
+                [] as [String]    // activeServiceTasks 简化
             )
         }
         

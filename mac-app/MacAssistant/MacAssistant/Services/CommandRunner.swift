@@ -166,7 +166,7 @@ class CommandRunner: ObservableObject {
             .store(in: &cancellables)
         
         // 监听健康监控告警
-        NotificationCenter.default.publisher(for: .healthMonitorAlert)
+        NotificationCenter.default.publisher(for: Notification.Name("healthMonitorAlert"))
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
                 guard let userInfo = notification.userInfo as? [String: Any] else { return }
@@ -177,7 +177,7 @@ class CommandRunner: ObservableObject {
             .store(in: &cancellables)
         
         // 监听健康监控 AI 诊断请求
-        NotificationCenter.default.publisher(for: .healthMonitorAIDiagnosis)
+        NotificationCenter.default.publisher(for: Notification.Name("healthMonitorAIDiagnosis"))
             .receive(on: DispatchQueue.main)
             .sink { [weak self] notification in
                 guard let userInfo = notification.userInfo as? [String: Any] else { return }
@@ -588,12 +588,79 @@ class CommandRunner: ObservableObject {
                 parameters: parameters
             )
             
+        // MARK: - Phase 1: 服务管理调度
+        case .manageService(let serviceID, let operation, let userIntent):
+            await executeServiceManagement(
+                serviceID: serviceID,
+                operation: operation,
+                userIntent: userIntent,
+                anchorMessageID: anchorMessageID
+            )
+            
         case .executeNativeServiceLifecycle(let serviceID, let action, let title):
             // 原生服务生命周期管理（占位实现）
             LogInfo("[CommandRunner] 执行原生服务生命周期: \(serviceID) - \(action.rawValue)")
             await MainActor.run {
                 appendSystemMessage("[\(title)] 服务 \(serviceID) \(action.rawValue) 操作已触发")
                 isProcessing = false
+            }
+        }
+    }
+
+    // MARK: - 服务管理执行
+    
+    private func executeServiceManagement(
+        serviceID: String,
+        operation: String,
+        userIntent: String?,
+        anchorMessageID: UUID
+    ) async {
+        guard let op = ServiceOperation(rawValue: operation) else {
+            await MainActor.run {
+                appendSystemMessage("❌ 未知的服务操作: \(operation)")
+                isProcessing = false
+            }
+            return
+        }
+        
+        // 执行服务管理操作
+        let result = await ServicePlanner.shared.executeAndReport(
+            serviceId: serviceID,
+            operation: op,
+            userIntent: userIntent
+        ) { executionResult in
+            // 实时更新主会话
+            Task { @MainActor in
+                if executionResult.isProgress {
+                    // 进度更新：更新或添加系统消息
+                    self.updateOrAppendSystemMessage(executionResult.message)
+                }
+            }
+        }
+        
+        // 最终结果显示在主会话
+        await MainActor.run {
+            let emoji = result.success ? "✅" : "❌"
+            self.appendSystemMessage("\(emoji) \(result.message)")
+            self.isProcessing = false
+        }
+    }
+    
+    private func updateOrAppendSystemMessage(_ content: String) {
+        // 简化实现：直接追加新消息
+        // 实际可以优化为更新最后一条系统消息
+        if messages.last?.role == .system {
+            // 更新最后一条系统消息
+            let updatedMessage = ChatMessage(
+                id: messages.last!.id,
+                role: .system,
+                content: content,
+                timestamp: Date()
+            )
+            messages[messages.count - 1] = updatedMessage
+        } else {
+            Task { @MainActor in
+                appendSystemMessage(content)
             }
         }
     }
@@ -1526,10 +1593,9 @@ class CommandRunner: ObservableObject {
         • 当前内置命令包括 \(toolCommands)
         • 更适合系统、文件、App、Git、Futu 这类明确操作
 
-        3. 外部市场
-        • 你可以在 Skills 面板的“市场”页安装或卸载更多 ClawHub Skills
-        • 安装后，OpenClaw runtime 会自动刷新新能力
-
+        3. Skills 管理
+        • 在 Skills 面板可以查看内置技能、自定义技能和技能目录
+        • 支持创建可进化的命令技能
         你现在正在使用 \(currentAgent)。
         直接告诉我目标就行，例如：
         • “帮我审查这个 PR”
@@ -3859,12 +3925,18 @@ class CommandRunner: ObservableObject {
     ) async throws -> String {
         // MARK: - Memory Context Injection
         // 秘书的基本职责：记住上下文，在发送前增强提示词
-        let (enhancedText, enhancedSystemPrompt) = await MainActor.run {
+        let (enhancedText, baseSystemPrompt) = await MainActor.run {
             prepareRequestWithMemory(
                 text: text,
                 sessionID: taskSessionID ?? sessionKey,
-                systemPrompt: nil
+                systemPrompt: buildBaseSystemPrompt()
             )
+        }
+        
+        // MARK: - Service Context Injection
+        // 注入MacAssistant服务状态，让AI知道应用内部的服务情况
+        let enhancedSystemPrompt = await MainActor.run {
+            injectServiceContext(into: baseSystemPrompt)
         }
         
         // 更新 Trace：开始发送
@@ -7384,9 +7456,9 @@ extension CommandRunner {
         
         服务配置：
         - 服务 ID: \(service.id)
-        - 工作目录: \(service.path ?? "未指定")
+        - 工作目录: \(service.metadata["path"] ?? "未指定")
         - 端口: \(service.port?.description ?? "无")
-        - 启动命令: \(service.startCommand ?? "未配置")
+        - 启动命令: \(service.metadata["startCommand"] ?? "未配置")
         
         请按以下步骤执行诊断：
         1. 检查服务进程是否存在
@@ -7412,5 +7484,94 @@ extension CommandRunner {
         
         // 调用 AI 处理
         await processInput(prompt)
+    }
+    
+    // MARK: - Context Injection Helpers
+    
+    /// 构建基础系统提示词
+    private func buildBaseSystemPrompt() -> String {
+        return """
+        你是 MacAssistant，一个运行在 macOS 上的智能助手。
+        
+        重要能力：
+        1. 你可以管理 MacAssistant 应用内部的服务（通过服务面板或命令）
+        2. 你有记忆能力，可以记住对话历史
+        3. 你可以帮助用户分析代码、文件、执行任务
+        
+        当用户询问"服务"时，通常指的是 MacAssistant 应用内部的服务状态，而不是系统级服务。
+        """
+    }
+    
+    /// 注入服务状态上下文到系统提示词
+    @MainActor
+    private func injectServiceContext(into basePrompt: String?) -> String {
+        let serviceManager = ServiceManager.shared
+        let stateStore = ServiceStateStore.shared
+        
+        // 获取所有服务状态
+        let allServices = serviceManager.services
+        let runningServices = stateStore.runningServices()
+        
+        guard !allServices.isEmpty else {
+            return basePrompt ?? ""
+        }
+        
+        // 构建服务状态描述
+        var serviceContext = """
+        
+        【MacAssistant 服务状态】
+        当前共有 \(allServices.count) 个服务，其中 \(runningServices.count) 个正在运行：
+        
+        """
+        
+        // 列出所有服务及其状态
+        for service in allServices.sorted(by: { $0.name < $1.name }) {
+            let state = stateStore.state(for: service.id)?.state
+            let statusIcon: String
+            let statusText: String
+            
+            switch state {
+            case .running:
+                statusIcon = "🟢"
+                statusText = "运行中"
+            case .starting:
+                statusIcon = "🟡"
+                statusText = "启动中"
+            case .stopping:
+                statusIcon = "🟠"
+                statusText = "停止中"
+            case .stopped, .notInstalled:
+                statusIcon = "⚪"
+                statusText = "已停止"
+            case .error:
+                statusIcon = "🔴"
+                statusText = "错误"
+            default:
+                statusIcon = "⚪"
+                statusText = "未启动"
+            }
+            
+            serviceContext += "- \(statusIcon) \(service.name) (\(statusText))\n"
+        }
+        
+        if !runningServices.isEmpty {
+            serviceContext += "\n运行中的服务详情：\n"
+            for service in runningServices {
+                let port = service.port.map { ":\($0)" } ?? ""
+                serviceContext += "- \(service.name)\(port)"
+                if let adapter = service.adapter {
+                    serviceContext += " [\(adapter)]"
+                }
+                serviceContext += "\n"
+            }
+        }
+        
+        serviceContext += "\n当用户询问服务状态时，请基于上述信息回答。"
+        
+        if let base = basePrompt, !base.isEmpty {
+            return base + serviceContext
+        } else {
+            return "你是 MacAssistant 智能助手。" + serviceContext
+        }
     }
 }

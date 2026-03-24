@@ -14,7 +14,7 @@ enum SkillPriority: Int, Codable {
     case critical = 3
 }
 
-struct Skill: Codable {
+struct Skill: Codable, Identifiable {
     let id: String
     var name: String
     var triggers: [String]          // 触发关键词

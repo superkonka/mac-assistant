@@ -7,7 +7,7 @@
 
 import SwiftUI
 
-struct MessageBubble: View, Equatable {
+struct MessageBubble: View {
     let message: ChatMessage
     var availableWidth: CGFloat? = nil
     var taskSession: AgentTaskSession? = nil
@@ -23,81 +23,55 @@ struct MessageBubble: View, Equatable {
         return formatter
     }()
 
-    static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
-        lhs.message == rhs.message &&
-        lhs.taskSession == rhs.taskSession &&
-        lhs.detectedSkillSuggestion == rhs.detectedSkillSuggestion &&
-        lhs.availableWidth == rhs.availableWidth
-    }
-    
+
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
+        // 使用标准 HStack + Spacer，但避免在 ScrollView 中直接使用
+        // 通过给 VStack 添加固定宽度约束来防止无限扩张
+        HStack(alignment: .top, spacing: 8) {
             if message.role == .user {
                 Spacer(minLength: 60)
             }
             
-            // 消息容器
-            HStack(alignment: .top, spacing: 8) {
-                // AI 头像（左侧）
-                if message.role != .user {
-                    avatarView
-                }
-                
-                // 消息内容区
-                VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                    // 头部：名称和时间
-                    HStack(spacing: 6) {
-                        if message.role == .user {
-                            Spacer()
-                        }
-                        
-                        Text(message.role == .user ? "你" : "AI 助手")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(nameColor)
-                        
-                        Text(formattedTime)
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary.opacity(0.7))
-
-                        if taskSession == nil && detectedSkillSuggestion == nil && message.role != .user {
-                            copyButton
-                        }
-
-                        if message.role != .user {
-                            Spacer()
-                        }
-                    }
+            VStack(alignment: .leading, spacing: 4) {
+                // 头部：名称和时间
+                HStack(spacing: 6) {
+                    Text(message.role == .user ? "你" : "AI 助手")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(nameColor)
                     
-                    // 气泡主体
-                    messageContent
-                        .background(
-                            BubbleShape(isUser: message.role == .user)
-                                .fill(bubbleBackground)
-                                .shadow(
-                                    color: shadowColor,
-                                    radius: message.role == .user ? 2 : 4,
-                                    x: 0,
-                                    y: message.role == .user ? 1 : 2
-                                )
-                        )
-                        .overlay(
-                            BubbleShape(isUser: message.role == .user)
-                                .stroke(borderColor, lineWidth: 0.5)
-                        )
+                    Text(formattedTime)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary.opacity(0.7))
+
+                    if taskSession == nil && detectedSkillSuggestion == nil && message.role != .user {
+                        copyButton
+                    }
                 }
                 
-                // 用户头像（右侧）
-                if message.role == .user {
-                    avatarView
-                }
+                // 气泡主体
+                messageContent
+                    .background(
+                        BubbleShape(isUser: message.role == .user)
+                            .fill(bubbleBackground)
+                            .shadow(
+                                color: shadowColor,
+                                radius: message.role == .user ? 2 : 4,
+                                x: 0,
+                                y: message.role == .user ? 1 : 2
+                            )
+                    )
+                    .overlay(
+                        BubbleShape(isUser: message.role == .user)
+                            .stroke(borderColor, lineWidth: 0.5)
+                    )
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
             
             if message.role != .user {
                 Spacer(minLength: 60)
             }
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
         .contextMenu {
             if taskSession == nil && detectedSkillSuggestion == nil {
                 Button("复制") {
@@ -143,9 +117,9 @@ struct MessageBubble: View, Equatable {
                     text: message.content,
                     availableWidth: richContentWidth
                 )
-                    .equatable()
-                    .padding(.horizontal, message.role == .user ? 14 : 16)
-                    .padding(.vertical, message.role == .user ? 10 : 12)
+                .equatable()
+                .padding(.horizontal, message.role == .user ? 14 : 16)
+                .padding(.vertical, message.role == .user ? 10 : 12)
             }
         }
         .frame(
@@ -153,7 +127,6 @@ struct MessageBubble: View, Equatable {
             alignment: .leading
         )
         .overlay(
-            // 复制按钮（悬停时显示）
             copyOverlay,
             alignment: .topTrailing
         )

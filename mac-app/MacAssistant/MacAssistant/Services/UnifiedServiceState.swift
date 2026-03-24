@@ -167,7 +167,7 @@ final class UnifiedServiceState: ObservableObject {
     }
     
     /// 更新服务名称映射
-    private func updateServiceNameMap(_ services: [ServiceDefinition]) {
+    private func updateServiceNameMap(_ services: [ServiceStateSnapshot]) {
         var map: [String: String] = [:]
         for service in services {
             map[service.name] = service.id
@@ -374,7 +374,7 @@ final class UnifiedServiceState: ObservableObject {
         )
         
         // 更新 ServiceManager
-        serviceManager.updateRuntimeInfo(runtimeInfo)
+        serviceManager.updateRuntimeInfo(id: runtimeInfo.id, info: runtimeInfo)
     }
     
     /// 从主会话接收服务操作结果
