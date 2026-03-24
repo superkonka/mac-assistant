@@ -109,6 +109,7 @@ struct ExecutionSession: Identifiable, Codable {
         case completed = "completed"
         case failed = "failed"
         case cancelled = "cancelled"
+        case interrupted = "interrupted"  // 可恢复的中断
     }
     
     var duration: TimeInterval {

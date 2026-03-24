@@ -42,7 +42,7 @@ final class LocalKimiCLIService {
             process.standardOutput = outputPipe
             process.standardError = outputPipe
 
-            var environment = ProcessInfo.processInfo.environment
+            var environment = ProcessInfo().environment
             environment["PATH"] = self.commandSearchPath()
             environment["KIMI_NO_COLOR"] = "1"
             environment["LANG"] = "zh_CN.UTF-8"
@@ -239,7 +239,7 @@ final class LocalKimiCLIService {
         task.standardOutput = pipe
         task.standardError = pipe
 
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo().environment
         environment["PATH"] = commandSearchPath()
         task.environment = environment
 

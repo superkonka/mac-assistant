@@ -26,6 +26,17 @@ enum ConfigurationStep: Int, CaseIterable {
         case .complete: return "完成"
         }
     }
+    
+    var shortTitle: String {
+        switch self {
+        case .selectProvider: return "提供商"
+        case .inputAPIKey: return "配置"
+        case .testConnection: return "测试"
+        case .customizeSettings: return "自定义"
+        case .assignRoles: return "角色"
+        case .complete: return "完成"
+        }
+    }
 }
 
 class WizardViewModel: ObservableObject {
@@ -80,7 +91,13 @@ class WizardViewModel: ObservableObject {
     
     func selectProvider(_ provider: ProviderType, model: String? = nil) {
         selectedProvider = provider
-        selectedModel = model ?? provider.availableModels[0]
+        let selected = model ?? provider.availableModels[0]
+        selectedModel = selected
+        
+        // 根据模型自动设置合理的 maxTokens 默认值
+        let config = provider.modelConfig(for: selected)
+        // 默认使用最大输出的一半或 4K，取较小值
+        maxTokens = min(config.maxOutputTokens / 2, 4096)
         
         // 自动生成名称
         if agentName.isEmpty {
@@ -97,7 +114,7 @@ class WizardViewModel: ObservableObject {
 
         roleProfile = AgentRoleProfile.suggested(
             provider: provider,
-            capabilities: inferCapabilities(for: provider, model: selectedModel ?? provider.availableModels[0]),
+            capabilities: inferCapabilities(for: provider, model: selected),
             isFirstAgent: AgentStore.shared.agents.isEmpty
         )
     }
@@ -201,7 +218,7 @@ class WizardViewModel: ObservableObject {
         switch provider {
         case .ollama:
             return await AgentStore.shared.validateLocalCodingRuntime()
-        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot, .minimax:
             return try await testOpenAICompatibleProvider(provider: provider, apiKey: apiKey)
         case .anthropic:
             return try await testAnthropicProvider(apiKey: apiKey)
@@ -217,14 +234,18 @@ class WizardViewModel: ObservableObject {
 
         let baseURL = provider.defaultBaseURL
         let endpoint = URL(string: "\(baseURL)/chat/completions")!
+        let model = selectedModel ?? provider.recommendedModel
+        // kimi-k2.5 只支持 temperature=1
+        let temperature: Double = model.contains("kimi-k2.5") || model.contains("kimi-k2") ? 1.0 : 0.0
+        
         let body: [String: Any] = [
-            "model": selectedModel ?? provider.recommendedModel,
+            "model": model,
             "messages": [
                 ["role": "user", "content": "Reply with OK."]
             ],
             "stream": false,
             "max_tokens": 8,
-            "temperature": 0
+            "temperature": temperature
         ]
 
         return try await sendTestRequest(
@@ -342,8 +363,16 @@ class WizardViewModel: ObservableObject {
         
         Task {
             do {
+                // 根据模型调整 temperature
+                let adjustedTemp: Double
+                if model.contains("kimi-k2.5") || model.contains("kimi-k2") {
+                    adjustedTemp = 1.0
+                } else {
+                    adjustedTemp = temperature
+                }
+                
                 let config = AgentConfig(
-                    temperature: temperature,
+                    temperature: adjustedTemp,
                     maxTokens: maxTokens,
                     topP: 1.0
                 )
@@ -380,7 +409,7 @@ class WizardViewModel: ObservableObject {
         switch provider {
         case .ollama:
             capabilities.append(.codeAnalysis)
-        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot, .minimax:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])
         }
 

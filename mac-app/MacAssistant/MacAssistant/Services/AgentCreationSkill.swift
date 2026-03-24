@@ -28,6 +28,7 @@ class AgentCreationSkill {
     }
     
     @Published var state: CreationState = .idle
+    private var activeRunID: UUID?
     
     /// 发起创建流程
     func initiateCreation(for gap: CapabilityGap, in runner: CommandRunner) {
@@ -47,6 +48,18 @@ class AgentCreationSkill {
     
     /// 处理用户输入
     func handleInput(_ input: String, runner: CommandRunner) async {
+        if RequestPlanningHeuristics.shouldCancelPendingFlow(input) {
+            cancel()
+            let message = MacAssistant.ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: "已退出当前 Agent 创建流程，主会话恢复普通对话。",
+                timestamp: Date()
+            )
+            runner.messages.append(message)
+            return
+        }
+
         switch state {
         case .idle:
             break
@@ -183,6 +196,8 @@ class AgentCreationSkill {
         }
         
         // 进入测试阶段
+        let runID = UUID()
+        activeRunID = runID
         state = .testing(provider: provider, apiKey: apiKey, model: selectedModel, gap: gap)
         
         let testingMessage = MacAssistant.ChatMessage(
@@ -202,6 +217,7 @@ class AgentCreationSkill {
         
         // 执行测试和创建
         await testAndCreateAgent(
+            runID: runID,
             provider: provider,
             apiKey: apiKey,
             model: selectedModel,
@@ -212,6 +228,7 @@ class AgentCreationSkill {
     
     /// 测试并创建 Agent
     private func testAndCreateAgent(
+        runID: UUID,
         provider: ProviderType,
         apiKey: String,
         model: String,
@@ -221,6 +238,10 @@ class AgentCreationSkill {
         do {
             // 1. 测试连接
             let success = try await performConnectionTest(provider: provider, apiKey: apiKey)
+
+            guard activeRunID == runID else {
+                return
+            }
             
             guard success else {
                 let errorMessage = MacAssistant.ChatMessage(
@@ -241,11 +262,16 @@ class AgentCreationSkill {
                     timestamp: Date()
                 )
                 runner.messages.append(errorMessage)
+                activeRunID = nil
                 state = .idle
                 return
             }
             
             // 2. 创建 Agent
+            guard activeRunID == runID else {
+                return
+            }
+
             let agentName = generateAgentName(for: gap, provider: provider)
             let emoji = getEmoji(for: gap)
             
@@ -291,9 +317,14 @@ class AgentCreationSkill {
             )
             runner.messages.append(successMessage)
             
+            activeRunID = nil
             state = .idle
             
         } catch {
+            guard activeRunID == runID else {
+                return
+            }
+
             let errorMessage = MacAssistant.ChatMessage(
                 id: UUID(),
                 role: .assistant,
@@ -303,6 +334,7 @@ class AgentCreationSkill {
                 timestamp: Date()
             )
             runner.messages.append(errorMessage)
+            activeRunID = nil
             state = .idle
         }
     }
@@ -403,6 +435,8 @@ class AgentCreationSkill {
             return key.count > 20
         case .ollama:
             return true
+        case .minimax:
+            return key.count > 20
         }
     }
     
@@ -479,6 +513,7 @@ class AgentCreationSkill {
     
     /// 取消创建
     func cancel() {
+        activeRunID = nil
         state = .idle
     }
 

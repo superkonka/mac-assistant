@@ -309,7 +309,7 @@ actor EmbeddingServiceFactory {
     /// 创建默认的嵌入服务
     static func createDefault() -> EmbeddingService {
         // 优先使用 OpenAI，如果配置了 API Key
-        if let apiKey = ProcessInfo.processInfo.environment["OPENAI_API_KEY"],
+        if let apiKey = ProcessInfo().environment["OPENAI_API_KEY"],
            !apiKey.isEmpty {
             return OpenAIEmbeddingService(apiKey: apiKey)
         }

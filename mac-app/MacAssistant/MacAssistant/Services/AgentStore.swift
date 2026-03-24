@@ -489,7 +489,7 @@ class AgentStore: ObservableObject {
         
         do {
             switch provider {
-            case .deepseek, .doubao, .zhipu, .moonshot, .openai:
+            case .deepseek, .doubao, .zhipu, .moonshot, .openai, .minimax:
                 return try await validateOpenAICompatible(urlString: urlString, apiKey: cleanKey, provider: provider)
             case .anthropic:
                 return try await validateAnthropic(urlString: urlString, apiKey: cleanKey)
@@ -514,14 +514,19 @@ class AgentStore: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 15
+        
+        // 根据模型调整 temperature（kimi-k2.5 只支持 temperature=1）
+        let model = provider.recommendedModel
+        let temperature: Double = model.contains("kimi-k2.5") || model.contains("kimi-k2") ? 1.0 : 0.0
+        
         let body: [String: Any] = [
-            "model": provider.recommendedModel,
+            "model": model,
             "messages": [
                 ["role": "user", "content": "Reply with OK."]
             ],
             "stream": false,
             "max_tokens": 8,
-            "temperature": 0
+            "temperature": temperature
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         
@@ -938,7 +943,7 @@ class AgentStore: ObservableObject {
         switch provider {
         case .ollama:
             capabilities.append(.codeAnalysis)
-        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .anthropic, .google, .moonshot, .minimax:
             capabilities.append(contentsOf: [.codeAnalysis, .longContext])
         }
         
@@ -969,6 +974,7 @@ class AgentStore: ObservableObject {
         case .anthropic: return "🅰️"
         case .google: return "🇬"
         case .moonshot: return "🌙"
+        case .minimax: return "Ⓜ️"
         }
     }
     

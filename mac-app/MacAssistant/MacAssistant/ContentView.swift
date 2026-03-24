@@ -19,6 +19,15 @@ struct ContentView: View {
     @State private var currentGap: CapabilityGap?
     @State private var showingGapAlert = false
     
+    // Browser Agent 状态
+    @State private var showingBrowserAgent = false
+    // Desktop App Manager 状态
+    @State private var showingDesktopAppManager = false
+    // Health Monitor 状态
+    @State private var showingHealthMonitor = false
+    // Bulk Operations 状态
+    @State private var showingBulkOperations = false
+    
     var body: some View {
         VStack(spacing: 0) {
             // Agent 切换栏
@@ -109,6 +118,39 @@ struct ContentView: View {
             AgentConfigurationWizard(gap: currentGap) { newAgent in
                 orchestrator.switchToAgent(newAgent)
             }
+        }
+        // Browser Agent 面板
+        .sheet(isPresented: $showingBrowserAgent) {
+            SimpleBrowserAgentView()
+                .frame(minWidth: 760, minHeight: 560)
+        }
+        // Desktop App Manager 面板
+        .sheet(isPresented: $showingDesktopAppManager) {
+            DesktopAppManagerView()
+                .frame(minWidth: 600, minHeight: 400)
+        }
+        // Health Monitor 面板
+        .sheet(isPresented: $showingHealthMonitor) {
+            HealthMonitorView()
+                .frame(minWidth: 600, minHeight: 400)
+        }
+        // Bulk Operations 面板
+        .sheet(isPresented: $showingBulkOperations) {
+            BulkOperationsView()
+                .frame(minWidth: 500, minHeight: 400)
+        }
+        // 监听通知
+        .onReceive(NotificationCenter.default.publisher(for: .showBrowserAgent)) { _ in
+            showingBrowserAgent = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showDesktopAppManager)) { _ in
+            showingDesktopAppManager = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showHealthMonitor)) { _ in
+            showingHealthMonitor = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showBulkOperations)) { _ in
+            showingBulkOperations = true
         }
     }
     

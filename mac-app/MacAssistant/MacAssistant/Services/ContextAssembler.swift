@@ -16,6 +16,8 @@ struct ConversationAssemblyInput {
     let creationFlowActive: Bool
     let messages: [ChatMessage]
     let taskSessions: [AgentTaskSession]
+    let activeBrowserSessionID: String?
+    let browserSessions: [BrowserSession]
 }
 
 final class ContextAssembler {
@@ -31,7 +33,14 @@ final class ContextAssembler {
             text: input.text,
             explicitImages: input.explicitImages,
             messages: input.messages,
-            lastScreenshotPath: input.lastScreenshotPath
+            lastScreenshotPath: input.lastScreenshotPath,
+            activeBrowserSessionID: input.activeBrowserSessionID,
+            browserSessions: input.browserSessions
+        )
+
+        let browserSession = activeBrowserSession(
+            sessionID: input.activeBrowserSessionID,
+            sessions: input.browserSessions
         )
 
         let envelope = RequestEnvelope(
@@ -46,7 +55,13 @@ final class ContextAssembler {
             activeWorkflowDesignContext: activeWorkflowDesignContext(
                 messages: input.messages,
                 taskSessions: input.taskSessions
-            )
+            ),
+            activeBrowserSession: browserSession,
+            activeBrowserSnapshot: browserSession?.latestSnapshot,
+            activeBrowserObservation: browserSession?.latestObservation ??
+                browserSession?.latestSnapshot.map(BrowserObservation.init(snapshot:)),
+            activeBrowserDelta: browserSession?.latestDelta,
+            activeBrowserPlannerState: browserSession?.plannerState
         )
 
         return AssembledConversationContext(
@@ -70,7 +85,9 @@ final class ContextAssembler {
         text: String,
         explicitImages: [String],
         messages: [ChatMessage],
-        lastScreenshotPath: String?
+        lastScreenshotPath: String?,
+        activeBrowserSessionID: String?,
+        browserSessions: [BrowserSession]
     ) -> [String] {
         if !explicitImages.isEmpty {
             return explicitImages
@@ -82,7 +99,9 @@ final class ContextAssembler {
 
         if let recentImagePath = latestReusableImagePath(
             messages: messages,
-            lastScreenshotPath: lastScreenshotPath
+            lastScreenshotPath: lastScreenshotPath,
+            activeBrowserSessionID: activeBrowserSessionID,
+            browserSessions: browserSessions
         ) {
             return [recentImagePath]
         }
@@ -92,13 +111,24 @@ final class ContextAssembler {
 
     private func latestReusableImagePath(
         messages: [ChatMessage],
-        lastScreenshotPath: String?
+        lastScreenshotPath: String?,
+        activeBrowserSessionID: String?,
+        browserSessions: [BrowserSession]
     ) -> String? {
         let fileManager = FileManager.default
 
         if let lastScreenshotPath,
            fileManager.fileExists(atPath: lastScreenshotPath) {
             return lastScreenshotPath
+        }
+
+        if let activeBrowserSessionID,
+           let activeBrowserScreenshotPath = browserSessions
+            .first(where: { $0.id == activeBrowserSessionID })?
+            .latestSnapshot?
+            .screenshotPath,
+           fileManager.fileExists(atPath: activeBrowserScreenshotPath) {
+            return activeBrowserScreenshotPath
         }
 
         for message in messages.reversed() {
@@ -116,6 +146,14 @@ final class ContextAssembler {
             .reversed()
             .first(where: { $0.canResume || $0.status == .partial || $0.status == .waitingUser })?
             .id
+    }
+
+    private func activeBrowserSession(
+        sessionID: String?,
+        sessions: [BrowserSession]
+    ) -> BrowserSession? {
+        guard let sessionID else { return nil }
+        return sessions.first { $0.id == sessionID }
     }
 
     private func activeWorkflowDesignContext(

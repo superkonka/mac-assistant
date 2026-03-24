@@ -35,7 +35,8 @@ protocol BundleServiceProtocol: Actor {
 }
 
 /// 用户意图
-enum UserIntent: String, CaseIterable {
+enum UserIntent: String, CaseIterable, Identifiable {
+    var id: String { rawValue }
     case coding = "coding"
     case writing = "writing"
     case analysis = "analysis"

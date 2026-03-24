@@ -6,40 +6,14 @@ let package = Package(
     platforms: [
         .macOS("15.0")
     ],
-    dependencies: [
-        .package(path: "../../openclaw-core/apps/shared/OpenClawKit"),
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "MacAssistant",
-            dependencies: [
-                .product(name: "OpenClawKit", package: "OpenClawKit"),
-                .product(name: "OpenClawProtocol", package: "OpenClawKit"),
-                .product(name: "OpenClawChatUI", package: "OpenClawKit"),
-            ],
+            dependencies: [],
             path: "MacAssistant",
             exclude: [
                 "Info.plist",
-                "ContentView.swift",
-                "AgentSystem",
-                "Analytics/ConversationAnalyzer.swift",
-                "Analytics/ConversationAnalyzerView.swift",
-                "MemorySystem/docs",
-                "MemorySystem/README.md",
-                "MemorySystem/Tests",
-            ],
-            sources: [
-                "MacAssistantApp.swift",
-                "Models",
-                "Services",
-                "Views",
-                "Storage",
-                "Utils",
-                "Analytics",
-                "AutoAgent",
-                "Distillation",
-                "Skills",
-                "MemorySystem",
             ],
             swiftSettings: [
                 .unsafeFlags(["-suppress-warnings"]),

@@ -172,7 +172,7 @@ struct BundleInstance: Identifiable, Codable {
     func agentConfiguration() -> AgentConfigurationSuggestion {
         AgentConfigurationSuggestion(
             name: "\(metadata.name) Agent",
-            provider: metadata.requiredProviders.first ?? .openAI,
+            provider: metadata.requiredProviders.first ?? .openai,
             model: recommendedModel(),
             capabilities: metadata.capabilities,
             sandboxEnabled: metadata.sandboxConfig?.required ?? false,
@@ -290,7 +290,7 @@ extension BundleMetadata {
             author: "OpenAI",
             capabilities: [.codeAnalysis, .codeGeneration, .refactoring],
             dependencies: [],
-            requiredProviders: [.openAI],
+            requiredProviders: [.openai],
             sandboxConfig: .init(type: .docker, required: false, defaultConfig: ["image": "python:3.11"]),
             skills: ["/generate", "/test", "/debug"],
             isOfficial: true,
@@ -307,8 +307,8 @@ extension BundleMetadata {
             description: "包含前端、后端、数据库的全栈开发工具集。集成 Firecrawl 搜索和代码执行沙箱。",
             author: "社区",
             capabilities: [.codeAnalysis, .codeGeneration, .webSearch, .sandbox],
-            dependencies: ["firecrawl"],
-            requiredProviders: [.openAI, .deepSeek],
+            dependencies: [.init(name: "firecrawl", versionRange: "*", optional: false)],
+            requiredProviders: [.openai, .deepseek],
             sandboxConfig: .init(type: .openShell, required: true, defaultConfig: ["mode": "mirror"]),
             skills: ["/web", "/api", "/db", "/search"],
             isOfficial: false,

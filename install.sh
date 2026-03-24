@@ -120,13 +120,6 @@ fi
 log_info ""
 log_info "🔍 检查可选依赖..."
 
-if command -v openclaw &> /dev/null; then
-    log_success "✓ OpenClaw 已安装"
-else
-    log_warn "⚠️  OpenClaw 未安装 (可选)"
-    log_info "  安装: https://github.com/openclaw/openclaw"
-fi
-
 if command -v kimi &> /dev/null; then
     log_success "✓ Kimi CLI 已安装"
 else

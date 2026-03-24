@@ -12,8 +12,7 @@ import NaturalLanguage
 final class TaskCreationPlanner {
     static let shared = TaskCreationPlanner()
     
-    private let taskManager = TaskManager.shared
-    private let intentMatcher = IntentMatcher.shared
+    private let unifiedTaskManager = UnifiedTaskManager.shared
     private let embeddingService = VectorEmbeddingService.shared
     
     private init() {}
@@ -34,7 +33,7 @@ final class TaskCreationPlanner {
         let allTasks = getAllRelevantTasks()
         
         // 4. 计算与现有任务的相似度
-        var taskSimilarities: [(task: TaskItem, similarity: Double, matchType: TaskMatchType)] = []
+        var taskSimilarities: [(task: TaskCreationTarget, similarity: Double, matchType: TaskMatchType)] = []
         
         for task in allTasks {
             let similarity = await calculateSimilarity(
@@ -108,7 +107,7 @@ final class TaskCreationPlanner {
     private func calculateSimilarity(
         input: String,
         inputEmbedding: [Float],
-        task: TaskItem
+        task: TaskCreationTarget
     ) async -> Double {
         var similarities: [Double] = []
         
@@ -146,7 +145,7 @@ final class TaskCreationPlanner {
         return dotProduct / (normA * normB)
     }
     
-    private func calculateKeywordSimilarity(_ input: String, task: TaskItem) -> Double {
+    private func calculateKeywordSimilarity(_ input: String, task: TaskCreationTarget) -> Double {
         let inputKeywords = extractKeywords(input)
         let taskKeywords = extractKeywords("\(task.title) \(task.description)")
         
@@ -170,29 +169,16 @@ final class TaskCreationPlanner {
         return words
     }
     
-    private func calculateTypeSimilarity(_ input: String, task: TaskItem) -> Double {
-        // 根据任务类型和输入内容判断匹配度
-        let typeKeywords: [SubtaskType: [String]] = [
-            .diskAnalysis: ["磁盘", "空间", "存储", "分析", "占用"],
-            .diskCleanup: ["清理", "删除", "垃圾", "释放", "缓存"],
-            .fileOperation: ["文件", "移动", "复制", "重命名", "整理"],
-            .codeAnalysis: ["代码", "分析", "审查", "质量", "bug", "问题"],
-            .codeGeneration: ["生成", "写代码", "创建", "实现", "编写"],
-            .codeReview: ["review", "评审", "review", "检查代码"],
-            .securityScan: ["安全", "扫描", "漏洞", "风险"],
-            .deployment: ["部署", "发布", "上线", "deploy"],
-            .custom: []
-        ]
-        
-        guard let keywords = typeKeywords[task.type] else { return 0 }
-        
-        let matches = keywords.filter { input.lowercased().contains($0) }
-        return Double(matches.count) / Double(max(keywords.count, 1))
+    private func calculateTypeSimilarity(_ input: String, task: TaskCreationTarget) -> Double {
+        guard !task.typeKeywords.isEmpty else { return 0 }
+
+        let matches = task.typeKeywords.filter { input.lowercased().contains($0) }
+        return Double(matches.count) / Double(max(task.typeKeywords.count, 1))
     }
     
     private func determineMatchType(
         input: String,
-        task: TaskItem,
+        task: TaskCreationTarget,
         similarity: Double
     ) -> TaskMatchType {
         // 判断是精确匹配、相似主题还是弱相关
@@ -210,7 +196,7 @@ final class TaskCreationPlanner {
     private func makeDecision(
         userInput: String,
         intent: TaskIntent,
-        taskSimilarities: [(task: TaskItem, similarity: Double, matchType: TaskMatchType)]
+        taskSimilarities: [(task: TaskCreationTarget, similarity: Double, matchType: TaskMatchType)]
     ) -> TaskCreationDecision {
         
         // 策略1：如果明确表达"新建"意图，创建新任务
@@ -222,7 +208,7 @@ final class TaskCreationPlanner {
         if intent.isContinuation {
             if let bestMatch = taskSimilarities.first,
                bestMatch.similarity > 0.7 {
-                return createAppendDecision(
+                return createUseExistingDecision(
                     userInput: userInput,
                     task: bestMatch.task,
                     similarity: bestMatch.similarity
@@ -232,25 +218,16 @@ final class TaskCreationPlanner {
         
         // 策略3：如果有精确匹配的任务（相似度>0.85），建议沿用
         if let exactMatch = taskSimilarities.first(where: { $0.matchType == .exact }) {
-            // 检查任务状态
-            if exactMatch.task.status == .completed {
-                return createAppendDecision(
-                    userInput: userInput,
-                    task: exactMatch.task,
-                    similarity: exactMatch.similarity
-                )
-            } else {
-                return createUseExistingDecision(
-                    userInput: userInput,
-                    task: exactMatch.task,
-                    similarity: exactMatch.similarity
-                )
-            }
+            return createUseExistingDecision(
+                userInput: userInput,
+                task: exactMatch.task,
+                similarity: exactMatch.similarity
+            )
         }
         
         // 策略4：如果有相似主题（相似度>0.6），建议追加
         if let similarMatch = taskSimilarities.first(where: { $0.similarity > 0.6 }) {
-            return createAppendDecision(
+            return createUseExistingDecision(
                 userInput: userInput,
                 task: similarMatch.task,
                 similarity: similarMatch.similarity
@@ -280,7 +257,7 @@ final class TaskCreationPlanner {
     
     private func createUseExistingDecision(
         userInput: String,
-        task: TaskItem,
+        task: TaskCreationTarget,
         similarity: Double
     ) -> TaskCreationDecision {
         return TaskCreationDecision(
@@ -288,14 +265,14 @@ final class TaskCreationPlanner {
             targetTask: task,
             suggestedTitle: task.title,
             suggestedDescription: task.description,
-            reasoning: "找到高度匹配的任务「\(task.title)」（相似度\(Int(similarity * 100))%），该任务当前状态为\(task.status.displayName)。",
+            reasoning: "找到高度匹配的任务「\(task.title)」（相似度\(Int(similarity * 100))%），该任务当前状态为\(task.statusText)。",
             confidence: similarity
         )
     }
     
     private func createAppendDecision(
         userInput: String,
-        task: TaskItem,
+        task: TaskCreationTarget,
         similarity: Double
     ) -> TaskCreationDecision {
         return TaskCreationDecision(
@@ -310,17 +287,15 @@ final class TaskCreationPlanner {
     
     // MARK: - 辅助方法
     
-    private func getAllRelevantTasks() -> [TaskItem] {
-        // 获取所有非已销毁的任务
-        let pending = taskManager.pendingTasks
-        let running = taskManager.runningTasks
-        let completed = taskManager.completedTasks.filter { task in
-            // 只保留最近7天内完成的任务
-            let sevenDaysAgo = Date().addingTimeInterval(-7 * 24 * 60 * 60)
-            return task.updatedAt > sevenDaysAgo
-        }
-        
-        return pending + running + completed
+    private func getAllRelevantTasks() -> [TaskCreationTarget] {
+        let sevenDaysAgo = Date().addingTimeInterval(-7 * 24 * 60 * 60)
+
+        return unifiedTaskManager.tasks
+            .filter { task in
+                task.type != .exceptionRecovery &&
+                task.updatedAt > sevenDaysAgo
+            }
+            .map(TaskCreationTarget.init(unifiedTask:))
     }
     
     private func generateTaskTitle(from input: String) -> String {
@@ -362,6 +337,41 @@ final class TaskCreationPlanner {
             return input
         }
         return String(input.prefix(maxLength)) + "..."
+    }
+}
+
+struct TaskCreationTarget {
+    let id: String
+    let title: String
+    let description: String
+    let inputContext: String
+    let statusText: String
+    let isCompleted: Bool
+    let typeKeywords: [String]
+
+    init(unifiedTask: UnifiedTask) {
+        self.id = unifiedTask.id
+        self.title = unifiedTask.title
+        self.description = unifiedTask.description
+        self.inputContext = unifiedTask.inputContext
+        self.statusText = unifiedTask.status.displayName
+        self.isCompleted = unifiedTask.status == .completed
+        self.typeKeywords = TaskCreationTarget.keywords(for: unifiedTask.type)
+    }
+
+    private static func keywords(for type: UnifiedTaskType) -> [String] {
+        switch type {
+        case .exceptionRecovery:
+            return ["恢复", "继续处理", "重试"]
+        case .smartSubtask:
+            return ["分析", "执行", "处理", "代码"]
+        case .todo:
+            return ["待办", "提醒", "计划"]
+        case .background:
+            return ["后台", "定时", "自动"]
+        case .workflow:
+            return ["工作流", "流程", "自动化", "编排", "步骤"]
+        }
     }
 }
 

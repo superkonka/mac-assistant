@@ -305,11 +305,18 @@ enum UserFacingErrorFormatter {
 
         if code == 401 || code == 403 || containsAny(lowercased, [
             "invalid authentication",
+            "authentication required",
             "authentication failed",
             "unauthorized",
             "invalid api key",
             "invalid_api_key",
             "api key is invalid",
+            "invalid_authentication_error",
+            "pairing required",
+            "login required",
+            "not logged in",
+            "please run kimi login",
+            "kimi login",
             "鉴权失败",
             "未授权"
         ]) {

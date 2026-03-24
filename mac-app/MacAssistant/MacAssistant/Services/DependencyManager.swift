@@ -501,7 +501,7 @@ class DependencyManager: ObservableObject {
         let managedNodeBin = managedNodeBinDir.path
         let legacyBin = legacyInstallDir.path
         let defaultPath = "\(managedBin):\(managedNodeBin):\(legacyBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        return ProcessInfo.processInfo.environment["PATH"].map { "\($0):\(defaultPath)" } ?? defaultPath
+        return ProcessInfo().environment["PATH"].map { "\($0):\(defaultPath)" } ?? defaultPath
     }
 }
 
@@ -511,6 +511,9 @@ enum DependencyError: LocalizedError {
     case bundledNotFound
     case installFailed(String)
     case verificationFailed
+    case alreadyExists
+    case circularDependency(cycles: [[String]])
+    case serviceNotFound
 
     var errorDescription: String? {
         switch self {
@@ -520,6 +523,13 @@ enum DependencyError: LocalizedError {
             return "安装 OpenClaw runtime 失败: \(reason)"
         case .verificationFailed:
             return "无法验证 OpenClaw runtime，文件可能损坏。"
+        case .alreadyExists:
+            return "依赖关系已存在"
+        case .circularDependency(let cycles):
+            let cycleStrings = cycles.map { $0.joined(separator: " -> ") }
+            return "检测到循环依赖: \(cycleStrings.joined(separator: "; "))"
+        case .serviceNotFound:
+            return "服务不存在"
         }
     }
 
@@ -531,6 +541,8 @@ enum DependencyError: LocalizedError {
             return "请检查磁盘空间权限，或尝试重启应用。"
         case .verificationFailed:
             return "请尝试在应用内执行 OpenClaw 重装。"
+        case .alreadyExists, .circularDependency, .serviceNotFound:
+            return nil
         }
     }
 }

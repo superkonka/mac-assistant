@@ -56,6 +56,12 @@ class AgentOrchestrator: ObservableObject {
             return .agentManagement
         }
         
+        // 浏览器自动化意图
+        if containsAny(lowercased, ["打开网页", "登录", "浏览器", "网页", "访问网站", "打开网站", 
+                                   "web.whatsapp", "whatsapp", "扫码", "自动登录"]) {
+            return .browserAutomation
+        }
+        
         // 默认一般对话
         return .generalChat
     }

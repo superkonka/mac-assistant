@@ -54,13 +54,14 @@ actor MemoryRecallCoordinator {
         let output: String
     }
 
-    private let runtimeManager = OpenClawGatewayRuntimeManager.shared
     private let agentID = "desktop"
     private let minUsefulScore = 0.08
     private let maxPreludeHits = 4
     private let reindexCooldown: TimeInterval = 15
 
     private var lastIndexAttemptAt = Date.distantPast
+
+    // 原生运行时不再需要 gateway runtime manager
 
     func recallPreludeIfNeeded(
         text: String,
@@ -311,46 +312,12 @@ actor MemoryRecallCoordinator {
     }
 
     private func runOpenClaw(arguments: [String]) async throws -> CommandResult {
-        _ = try await self.runtimeManager.ensureGatewayReadyWithDependencies()
-        let executablePath = await self.runtimeManager.currentExecutablePath()
-        let environment = await self.runtimeManager.currentProcessEnvironment()
-
-        return try await Task.detached(priority: .utility) {
-            let process = Process()
-            let pipe = Pipe()
-
-            if let executablePath,
-               executablePath.hasSuffix("/openclaw"),
-               FileManager.default.isExecutableFile(atPath: executablePath) {
-                process.executableURL = URL(fileURLWithPath: executablePath)
-                process.arguments = arguments
-            } else {
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                process.arguments = ["openclaw"] + arguments
-            }
-
-            process.environment = environment
-            process.standardOutput = pipe
-            process.standardError = pipe
-
-            try process.run()
-            process.waitUntilExit()
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let output = String(data: data, encoding: .utf8) ?? ""
-            return CommandResult(status: process.terminationStatus, output: output)
-        }.value
+        // 原生运行时不再使用 OpenClaw
+        throw NSError(domain: "MemoryRecallCoordinator", code: 2, userInfo: [NSLocalizedDescriptionKey: "原生运行时不支持此操作"])
     }
 
     private func profileName() async throws -> String {
-        let profile = await self.runtimeManager.currentProfileName()
-        guard !profile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(
-                domain: "MemoryRecallCoordinator",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "OpenClaw profile is unavailable."]
-            )
-        }
-        return profile
+        // 原生运行时返回默认 profile
+        return "native"
     }
 }

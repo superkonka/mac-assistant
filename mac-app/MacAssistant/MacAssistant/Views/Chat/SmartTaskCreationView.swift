@@ -19,7 +19,7 @@ enum TaskCreationState {
 /// 任务创建决策结果
 struct TaskCreationDecision {
     let action: TaskCreationAction
-    let targetTask: TaskItem?       // 如果是沿用或追加，指向哪个任务
+    let targetTask: TaskCreationTarget?       // 如果是沿用或追加，指向哪个任务
     let suggestedTitle: String      // 建议的任务标题
     let suggestedDescription: String // 建议的任务描述
     let reasoning: String           // 决策理由
@@ -42,7 +42,7 @@ final class SmartTaskCreationViewModel: ObservableObject {
     @Published var isProcessing: Bool = false
     @Published var currentDecision: TaskCreationDecision?
     
-    private let taskManager = TaskManager.shared
+    private let unifiedTaskManager = UnifiedTaskManager.shared
     private let planner = TaskCreationPlanner.shared
     
     private init() {
@@ -131,7 +131,7 @@ final class SmartTaskCreationViewModel: ObservableObject {
             if let existing = decision.targetTask {
                 message += "💡 **决策**：沿用已有任务\n\n"
                 message += "📝 **匹配任务**：\(existing.title)\n"
-                message += "📄 **状态**：\(existing.status.displayName)\n\n"
+                message += "📄 **状态**：\(existing.statusText)\n\n"
                 message += "🤔 **理由**：\(decision.reasoning)\n\n"
                 message += "❓ 是否跳转到该任务？"
             }
@@ -140,7 +140,7 @@ final class SmartTaskCreationViewModel: ObservableObject {
             if let existing = decision.targetTask {
                 message += "💡 **决策**：追加到现有任务\n\n"
                 message += "📝 **目标任务**：\(existing.title)\n"
-                message += "📄 **当前状态**：\(existing.status.displayName)\n\n"
+                message += "📄 **当前状态**：\(existing.statusText)\n\n"
                 message += "🤔 **理由**：\(decision.reasoning)\n\n"
                 message += "❓ 是否追加到该任务并继续对话？"
             }
@@ -150,26 +150,14 @@ final class SmartTaskCreationViewModel: ObservableObject {
     }
     
     private func createNewTask(from decision: TaskCreationDecision) {
-        let newTask = TaskItem(
+        let inputContext = messages.first { $0.role == .user }?.content ?? ""
+        let createdTask = unifiedTaskManager.createSmartSubtask(
             title: decision.suggestedTitle,
             description: decision.suggestedDescription,
-            status: .pending,
-            strategy: .custom,
-            inputContext: messages.first { $0.role == .user }?.content ?? "",
-            messages: [
-                TaskMessage(
-                    id: UUID(),
-                    role: .system,
-                    content: "任务通过智能创建流程创建。决策理由：\(decision.reasoning)",
-                    timestamp: Date(),
-                    agentID: nil,
-                    agentName: "任务秘书"
-                )
-            ]
+            inputContext: inputContext,
+            strategy: .auto
         )
-        
-        taskManager.addTask(newTask)
-        
+
         // 添加系统确认消息
         addSystemMessage("✅ 已创建新任务：\(decision.suggestedTitle)")
         state = .completed
@@ -177,36 +165,36 @@ final class SmartTaskCreationViewModel: ObservableObject {
         // 通知外部任务已创建
         NotificationCenter.default.post(
             name: NSNotification.Name("SmartTaskCreated"),
-            object: newTask.id
+            object: createdTask.id,
+            userInfo: ["source": "unified"]
         )
     }
-    
+
     func confirmUseExisting() {
         guard let decision = currentDecision, let targetTask = decision.targetTask else { return }
         
         addSystemMessage("✅ 已跳转到现有任务：\(targetTask.title)")
         state = .completed
-        
+
+        unifiedTaskManager.selectedTaskID = targetTask.id
         NotificationCenter.default.post(
             name: NSNotification.Name("SmartTaskUseExisting"),
-            object: targetTask.id
+            object: targetTask.id,
+            userInfo: ["source": "unified"]
         )
     }
     
     func confirmAppendToExisting() {
         guard let decision = currentDecision, let targetTask = decision.targetTask else { return }
-        
-        // 将当前对话追加为任务消息
-        if let userInput = messages.first(where: { $0.role == .user })?.content {
-            taskManager.addUserMessage(to: targetTask.id, content: userInput)
-        }
-        
-        addSystemMessage("✅ 已追加到任务：\(targetTask.title)")
+
+        unifiedTaskManager.selectedTaskID = targetTask.id
+        addSystemMessage("✅ 已定位到任务中心中的任务：\(targetTask.title)")
         state = .completed
         
         NotificationCenter.default.post(
             name: NSNotification.Name("SmartTaskAppendToExisting"),
-            object: targetTask.id
+            object: targetTask.id,
+            userInfo: ["source": "unified"]
         )
     }
     
@@ -290,7 +278,7 @@ enum TaskCreationRole {
 struct SmartTaskCreationView: View {
     @StateObject private var viewModel = SmartTaskCreationViewModel.shared
     @Environment(\.dismiss) private var dismiss
-    @State private var showCreatedTask: TaskItem?
+    @State private var showUnifiedTaskManager = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -314,28 +302,30 @@ struct SmartTaskCreationView: View {
         .frame(width: 500, height: 600)
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SmartTaskCreated"))) { notification in
             if let taskID = notification.object as? String,
-               let task = TaskManager.shared.getTask(taskID) {
-                showCreatedTask = task
+               notification.userInfo?["source"] as? String == "unified" {
+                UnifiedTaskManager.shared.selectedTaskID = taskID
+                showUnifiedTaskManager = true
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SmartTaskUseExisting"))) { notification in
-            if let taskID = notification.object as? String,
-               let task = TaskManager.shared.getTask(taskID) {
-                dismiss()
-                // 打开现有任务
-                TaskManager.shared.selectedTask = task
+            guard let taskID = notification.object as? String else { return }
+
+            if notification.userInfo?["source"] as? String == "unified" {
+                UnifiedTaskManager.shared.selectedTaskID = taskID
+                showUnifiedTaskManager = true
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("SmartTaskAppendToExisting"))) { notification in
-            if let taskID = notification.object as? String,
-               let task = TaskManager.shared.getTask(taskID) {
-                dismiss()
-                // 打开追加后的任务
-                TaskManager.shared.selectedTask = task
+            guard let taskID = notification.object as? String else { return }
+
+            if notification.userInfo?["source"] as? String == "unified" {
+                UnifiedTaskManager.shared.selectedTaskID = taskID
+                showUnifiedTaskManager = true
             }
         }
-        .sheet(item: $showCreatedTask) { task in
-            TaskAgentChatView(task: task)
+        .sheet(isPresented: $showUnifiedTaskManager) {
+            UnifiedTaskManagerView()
+                .frame(minWidth: 720, minHeight: 580)
         }
     }
     

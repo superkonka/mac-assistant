@@ -52,11 +52,11 @@ final class BackgroundTaskRecoveryService: ObservableObject {
     /// 任务会话管理器
     private var taskSessionManager: CommandRunner?
     
-    /// OpenClaw客户端
-    private let openClawClient = OpenClawGatewayClient.shared
-    
     /// 智能恢复执行器
     private let smartRecovery = SmartRecoveryExecutor.shared
+
+    /// 新任务中心入口
+    private let taskCenter = TaskCenterFacade.shared
     
     /// 后台任务定时器
     private var checkTimer: Timer?
@@ -98,6 +98,15 @@ final class BackgroundTaskRecoveryService: ObservableObject {
         
         pendingTasks.append(task)
         persistTasks()
+
+        let summary = originalRequest.prefix(30).description + (originalRequest.count > 30 ? "..." : "")
+        _ = taskCenter.createRecoveryDefinition(
+            title: summary,
+            originalRequest: originalRequest,
+            errorMessage: "已安排后台自动恢复，或点击「继续处理」立即重试",
+            gatewaySessionKey: sessionID,
+            trigger: .delay(seconds: delay)
+        )
         
         LogInfo("[BackgroundRecovery] 安排恢复任务: session=\(sessionID), 将在\(delay)秒后检查")
         
@@ -115,23 +124,34 @@ final class BackgroundTaskRecoveryService: ObservableObject {
             persistTasks()
             LogInfo("[BackgroundRecovery] 取消恢复任务: session=\(sessionID)")
         }
+
+        if let recoveryTask = taskCenter.legacyTasks.first(where: { $0.gatewaySessionKey == sessionID }) {
+            taskCenter.removeTask(definitionID: recoveryTask.id)
+        }
     }
     
     /// 获取任务状态
     func getTaskStatus(sessionID: String) -> BackgroundRecoveryTask? {
-        pendingTasks.first { $0.sessionID == sessionID }
+        let localTask = pendingTasks.first { $0.sessionID == sessionID }
             ?? completedTasks.first { $0.sessionID == sessionID }
+        let unifiedTask = taskCenter.legacyTasks.first { $0.gatewaySessionKey == sessionID }
+
+        guard let localTask else {
+            if let unifiedTask {
+                return bridgedTask(from: unifiedTask, sessionID: sessionID)
+            }
+            return nil
+        }
+
+        return mergedTaskStatus(localTask, unifiedTask: unifiedTask)
     }
     
     // MARK: - 后台检查逻辑
     
     private func startBackgroundChecker() {
-        // 每5秒检查一次待处理任务
-        checkTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                await self?.processScheduledTasks()
-            }
-        }
+        // 调度职责已经迁移到 TaskScheduler，这里保留状态记录和诊断能力。
+        checkTimer?.invalidate()
+        checkTimer = nil
     }
     
     private func processScheduledTasks() async {
@@ -256,6 +276,52 @@ final class BackgroundTaskRecoveryService: ObservableObject {
                 "message": "后台自动恢复成功！"
             ]
         )
+    }
+
+    private func bridgedTask(from task: UnifiedTask, sessionID: String) -> BackgroundRecoveryTask {
+        let now = Date()
+        return BackgroundRecoveryTask(
+            id: task.id,
+            sessionID: sessionID,
+            originalRequest: task.originalRequest ?? task.inputContext,
+            scheduledAt: task.createdAt,
+            checkAt: task.scheduledTime ?? task.updatedAt,
+            state: bridgedState(for: task.status).rawValue,
+            attempts: task.retryCount,
+            maxAttempts: task.maxRetries,
+            lastError: task.errorMessage,
+            recoveredResult: task.result
+        )
+    }
+
+    private func mergedTaskStatus(
+        _ localTask: BackgroundRecoveryTask,
+        unifiedTask: UnifiedTask?
+    ) -> BackgroundRecoveryTask {
+        guard let unifiedTask else { return localTask }
+
+        var merged = localTask
+        merged.checkAt = unifiedTask.scheduledTime ?? merged.checkAt
+        merged.attempts = max(merged.attempts, unifiedTask.retryCount)
+        merged.lastError = unifiedTask.errorMessage ?? merged.lastError
+        merged.recoveredResult = unifiedTask.result ?? merged.recoveredResult
+        merged.state = bridgedState(for: unifiedTask.status).rawValue
+        return merged
+    }
+
+    private func bridgedState(for status: UnifiedTaskStatus) -> BackgroundRecoveryState {
+        switch status {
+        case .pending:
+            return .scheduled
+        case .running:
+            return .checking
+        case .paused:
+            return .scheduled
+        case .completed:
+            return .recovered
+        case .failed:
+            return .failed
+        }
     }
     
     private func notifyUserRecoveryFailed(task: BackgroundRecoveryTask) {

@@ -150,9 +150,25 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
     var canResume: Bool
     var lastReconciledAt: Date?
     var dismissedAt: Date?
+    
+    // MARK: - 服务管理专用字段
+    var serviceID: String?              // 关联的服务ID
+    var serviceAction: ServiceAction?   // 服务操作类型
+    
+    enum ServiceAction: String, Codable {
+        case start
+        case stop
+        case restart
+        case checkStatus
+    }
 
     var isHiddenFromTabs: Bool {
         dismissedAt != nil
+    }
+    
+    /// 是否是服务管理任务
+    var isServiceManagementTask: Bool {
+        serviceID != nil
     }
 
     init(
@@ -180,7 +196,9 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         latestAssistantText: String? = nil,
         canResume: Bool = false,
         lastReconciledAt: Date? = nil,
-        dismissedAt: Date? = nil
+        dismissedAt: Date? = nil,
+        serviceID: String? = nil,
+        serviceAction: ServiceAction? = nil
     ) {
         self.id = id
         self.title = title
@@ -207,6 +225,8 @@ struct AgentTaskSession: Identifiable, Codable, Equatable {
         self.canResume = canResume
         self.lastReconciledAt = lastReconciledAt
         self.dismissedAt = dismissedAt
+        self.serviceID = serviceID
+        self.serviceAction = serviceAction
     }
 }
 

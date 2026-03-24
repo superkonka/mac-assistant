@@ -1,0 +1,89 @@
+{
+  "name": "service-operations",
+  "version": "1.0.0",
+  "description": "服务生命周期管理操作",
+  "operations": [
+    {
+      "name": "start_service",
+      "description": "启动指定服务",
+      "parameters": {
+        "service_id": {
+          "type": "string",
+          "description": "服务ID"
+        },
+        "service_config": {
+          "type": "object",
+          "description": "服务完整配置"
+        }
+      },
+      "returns": {
+        "success": "boolean",
+        "pid": "number (optional)",
+        "message": "string",
+        "error": "string (optional)"
+      }
+    },
+    {
+      "name": "stop_service",
+      "description": "停止指定服务",
+      "parameters": {
+        "service_id": {
+          "type": "string",
+          "description": "服务ID"
+        },
+        "service_config": {
+          "type": "object",
+          "description": "服务完整配置"
+        },
+        "current_pid": {
+          "type": "number",
+          "description": "当前进程PID（可选）"
+        }
+      },
+      "returns": {
+        "success": "boolean",
+        "message": "string",
+        "error": "string (optional)"
+      }
+    },
+    {
+      "name": "restart_service",
+      "description": "重启指定服务",
+      "parameters": {
+        "service_id": {
+          "type": "string",
+          "description": "服务ID"
+        },
+        "service_config": {
+          "type": "object",
+          "description": "服务完整配置"
+        }
+      },
+      "returns": {
+        "success": "boolean",
+        "pid": "number (optional)",
+        "message": "string",
+        "error": "string (optional)"
+      }
+    },
+    {
+      "name": "check_service_status",
+      "description": "检查服务状态",
+      "parameters": {
+        "service_id": {
+          "type": "string",
+          "description": "服务ID"
+        },
+        "service_config": {
+          "type": "object",
+          "description": "服务完整配置"
+        }
+      },
+      "returns": {
+        "status": "string (running|stopped|error|unknown)",
+        "pid": "number (optional)",
+        "message": "string"
+      }
+    }
+  ]
+}

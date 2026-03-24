@@ -24,7 +24,7 @@ enum RequestPlanningHeuristics {
     }
 
     static func acceptanceDecision(from normalized: String) -> Bool? {
-        let accepted = ["是", "y", "yes"]
+        let accepted = ["是", "y", "yes", "确认"]
         if accepted.contains(normalized) {
             return true
         }
@@ -35,6 +35,303 @@ enum RequestPlanningHeuristics {
         }
 
         return nil
+    }
+
+    static func workflowApprovalDecision(from text: String) -> Bool? {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !normalized.isEmpty else { return nil }
+
+        if acceptanceDecision(from: normalized) == true {
+            return true
+        }
+
+        let approvedMarkers = ["通过", "批准", "同意", "继续执行", "执行吧", "可以执行"]
+        if approvedMarkers.contains(normalized) || approvedMarkers.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        let rejectedMarkers = ["拒绝", "不通过", "别执行", "不要执行", "先别", "取消这步", "否决"]
+        if rejectedMarkers.contains(normalized) || rejectedMarkers.contains(where: { normalized.contains($0) }) {
+            return false
+        }
+
+        return nil
+    }
+
+    static func shouldCancelPendingFlow(_ text: String) -> Bool {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !normalized.isEmpty else {
+            return false
+        }
+
+        let exactMatches: Set<String> = [
+            "取消", "取消吧", "取消了", "取消一下",
+            "退出", "退出吧", "退出流程",
+            "算了", "算了吧", "不用了", "先不用", "不继续了",
+            "停止", "停止吧", "停一下", "停", "结束", "结束吧",
+            "cancel", "stop", "quit", "exit", "never mind"
+        ]
+        if exactMatches.contains(normalized) {
+            return true
+        }
+
+        let leadingMarkers = ["取消", "退出", "停止", "结束", "算了", "不用了"]
+        if leadingMarkers.contains(where: { normalized.hasPrefix($0) }) {
+            return true
+        }
+
+        let scopedMarkers = [
+            "取消创建", "取消流程", "退出创建", "退出流程",
+            "取消这个", "取消当前", "结束当前", "停止当前"
+        ]
+        return scopedMarkers.contains(where: { normalized.contains($0) })
+    }
+
+    static func browserStartURL(from text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+
+        if trimmed.lowercased().hasPrefix("http://") || trimmed.lowercased().hasPrefix("https://") {
+            return trimmed
+        }
+
+        let directSitePatterns = [
+            #"(?:(?:打开|访问|进入|去|导航到)\s*)(.+)"#,
+            #"(?:(?:网页|网站)\s*)(.+)"#
+        ]
+
+        for pattern in directSitePatterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+                  let match = regex.firstMatch(
+                    in: trimmed,
+                    options: [],
+                    range: NSRange(location: 0, length: trimmed.utf16.count)
+                  ),
+                  let siteRange = Range(match.range(at: 1), in: trimmed) else {
+                continue
+            }
+
+            let rawSite = String(trimmed[siteRange])
+            if let url = buildBrowserURL(from: rawSite) {
+                return url
+            }
+        }
+
+        return nil
+    }
+
+    static func shouldContinueBrowserSession(
+        with text: String,
+        session: BrowserSession,
+        lastMessage: ChatMessage?
+    ) -> Bool {
+        let normalizedText = RequestPlanningHeuristics.normalized(text)
+        let observation = session.latestObservation ?? session.latestSnapshot.map(BrowserObservation.init(snapshot:))
+        guard !normalizedText.isEmpty else {
+            return false
+        }
+
+        if lastMessage?.metadata?[BrowserConversationMetadataKeys.pendingSessionID] == session.id {
+            let promptKind = lastMessage?.metadata?[BrowserConversationMetadataKeys.promptKind]
+            if promptKind == "confirmation",
+               acceptanceDecision(from: normalizedText) != nil || normalizedText == "继续" {
+                return true
+            }
+            if promptKind == "next_step",
+               shouldTreatAsResumeCommand(normalizedText) {
+                return true
+            }
+        }
+
+        if (session.pendingAction != nil || session.status == .blockedByAuth) &&
+            shouldTreatAsResumeCommand(normalizedText) {
+            return true
+        }
+
+        if session.latestDelta?.becameReady == true &&
+            (shouldTreatAsResumeCommand(normalizedText) || normalizedText == "继续") {
+            return true
+        }
+
+        let markers = [
+            "当前页面", "这个页面", "网页上", "浏览器里", "帮我看看", "识别页面",
+            "继续登录", "继续网页", "点击登录", "输入账号", "填写账号",
+            "用户名", "邮箱", "提交"
+        ]
+        if markers.contains(where: { normalizedText.contains($0) }) {
+            return true
+        }
+
+        if let observation {
+            let pageURL = RequestPlanningHeuristics.normalized(observation.url)
+            let pageTitle = RequestPlanningHeuristics.normalized(observation.title)
+            let isChatSession = observation.looksLikeChatSurface
+
+            if isChatSession {
+                let chatMarkers = [
+                    "whatsapp", "消息", "聊天", "回复", "联系人",
+                    "未读", "发送", "群聊", "对话", "接管", "托管", "扮演"
+                ]
+                if chatMarkers.contains(where: { normalizedText.contains($0) }) {
+                    return true
+                }
+            }
+
+            if !pageTitle.isEmpty && normalizedText.contains(pageTitle) {
+                return true
+            }
+            if !pageURL.isEmpty && normalizedText.contains(pageURL) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    static func hasHighLevelBrowserAutomationIntent(_ text: String) -> Bool {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        let markers = [
+            "接管", "托管", "代聊", "自动回复", "自动处理", "值守",
+            "监控", "监听", "跟进", "持续处理", "帮我盯着", "代表我回复"
+        ]
+        return markers.contains(where: { normalized.contains($0) })
+    }
+
+    static func shouldPromoteActiveBrowserSessionToWorkflow(
+        text: String,
+        observation: BrowserObservation?
+    ) -> Bool {
+        guard let observation else {
+            return false
+        }
+
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard hasHighLevelBrowserAutomationIntent(text) else {
+            return false
+        }
+
+        if observation.looksLikeChatSurface {
+            return true
+        }
+
+        if normalized.contains("持续") || normalized.contains("长期") || normalized.contains("自动") {
+            return true
+        }
+
+        return observation.pageKind == .dashboard || observation.pageKind == .list
+    }
+
+    static func browserWorkflowCandidate(
+        from text: String,
+        observation: BrowserObservation?
+    ) -> WorkflowCandidate? {
+        guard let observation,
+              shouldPromoteActiveBrowserSessionToWorkflow(text: text, observation: observation) else {
+            return nil
+        }
+
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        var steps: [String]
+        var missingSlots: [PlanningSlot] = []
+
+        if observation.looksLikeChatSurface {
+            steps = [
+                "读取当前页面的未读消息与对话上下文",
+                "根据既定角色生成候选回复或行动建议",
+                "等待你确认后继续回复或执行下一步"
+            ]
+
+            let modeMarkers = ["自动发送", "直接发送", "无需确认", "先给草稿", "确认后发送", "草稿"]
+            if !modeMarkers.contains(where: { normalized.contains($0) }) {
+                missingSlots.append(
+                    PlanningSlot(
+                        name: "reply_mode",
+                        description: "回复模式（例如：先给草稿确认 / 自动发送）",
+                        isRequired: true,
+                        value: nil
+                    )
+                )
+            }
+
+            let scopeMarkers = ["当前对话", "当前聊天", "指定联系人", "全部联系人", "所有联系人", "群聊"]
+            if !scopeMarkers.contains(where: { normalized.contains($0) }) {
+                missingSlots.append(
+                    PlanningSlot(
+                        name: "conversation_scope",
+                        description: "处理范围（例如：当前对话 / 指定联系人 / 全部联系人）",
+                        isRequired: true,
+                        value: nil
+                    )
+                )
+            }
+        } else {
+            steps = [
+                "持续观察当前网页状态变化",
+                "根据页面变化规划下一步浏览器动作",
+                "必要时向你确认后继续执行"
+            ]
+
+            if !normalized.contains("当前页面") && !normalized.contains("这个页面") {
+                missingSlots.append(
+                    PlanningSlot(
+                        name: "monitor_target",
+                        description: "监控目标或页面范围",
+                        isRequired: true,
+                        value: nil
+                    )
+                )
+            }
+        }
+
+        return WorkflowCandidate(
+            name: observation.looksLikeChatSurface ? "网页聊天接待助手" : "网页观察与执行助手",
+            description: observation.looksLikeChatSurface
+                ? "基于当前聊天页面持续读取消息、生成回复并等待确认。"
+                : "基于当前网页状态持续观察变化并协助执行下一步动作。",
+            stepsPreview: steps,
+            estimatedSteps: steps.count,
+            needsConfirmation: true,
+            requiredCapabilities: ["browser-observation", "browser-action"],
+            missingSlots: missingSlots
+        )
+    }
+
+    static func browserObservationSummary(
+        session: BrowserSession,
+        observation: BrowserObservation?,
+        delta: BrowserObservationDelta?
+    ) -> String {
+        guard let observation else {
+            return session.lastUserGoal.map { "当前浏览器仍在执行目标：\($0)" } ?? "当前有一个活动浏览器会话。"
+        }
+
+        if delta?.becameReady == true {
+            return "页面刚切换为可操作状态。"
+        }
+
+        if delta?.becameBlockedByAuth == true {
+            return "页面重新进入登录或扫码状态。"
+        }
+
+        if observation.looksLikeChatSurface {
+            return observation.authState == .ready
+                ? "当前是已登录的聊天页面。"
+                : "当前是聊天页面，但还未完成登录或扫码。"
+        }
+
+        switch observation.pageKind {
+        case .login:
+            return "当前停留在登录页面。"
+        case .form:
+            return "当前停留在表单页面。"
+        case .dashboard:
+            return "当前停留在仪表盘页面。"
+        default:
+            return "当前页面类型为 \(observation.pageKind.rawValue)。"
+        }
     }
 
     static func workflowGuidanceDecision(from text: String) -> Bool? {
@@ -214,6 +511,41 @@ enum RequestPlanningHeuristics {
         return .runtimeSetup
     }
 
+    private static func buildBrowserURL(from rawSite: String) -> String? {
+        let noiseTokens = ["网页", "网站", "首页", "登录页", "页面", "官网"]
+        var site = rawSite.trimmingCharacters(in: .whitespacesAndNewlines)
+        noiseTokens.forEach { token in
+            site = site.replacingOccurrences(of: token, with: "")
+        }
+        site = site.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = site.lowercased()
+
+        let knownSites: [String: String] = [
+            "google": "https://www.google.com",
+            "github": "https://github.com",
+            "youtube": "https://www.youtube.com",
+            "bilibili": "https://www.bilibili.com",
+            "百度": "https://www.baidu.com",
+            "微博": "https://weibo.com",
+            "知乎": "https://www.zhihu.com",
+            "whatsapp": "https://web.whatsapp.com"
+        ]
+
+        if let url = knownSites[lowercased] {
+            return url
+        }
+
+        if lowercased.hasPrefix("http://") || lowercased.hasPrefix("https://") {
+            return site
+        }
+
+        if site.contains(".") {
+            return "https://\(site)"
+        }
+
+        return nil
+    }
+
     static func plannedAgentSwitch(for parsed: ParsedInput, images: [String]) -> PlannedAgentSwitch? {
         guard let mention = parsed.agentMention else {
             return nil
@@ -278,5 +610,302 @@ enum RequestPlanningHeuristics {
             .replacingOccurrences(of: " ", with: "")
             .replacingOccurrences(of: "-", with: "")
             .replacingOccurrences(of: "_", with: "")
+    }
+    
+    // MARK: - Workflow Intent Detection (新增)
+    
+    /// 识别用户意图类型
+    static func intentKind(from text: String) -> IntentKind {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        
+        // 优先判断是否适合 workflow
+        if shouldPromoteToWorkflow(normalized) {
+            return .workflow
+        }
+
+        let serviceMarkers = ["mcp", "服务", "service"]
+        if serviceMarkers.contains(where: { normalized.contains($0) }) {
+            return .service
+        }
+        
+        // 判断是否纯聊天
+        let chatOnlyMarkers = ["你好", "在吗", "帮忙", "谢谢", "再见", "介绍一下"]
+        if chatOnlyMarkers.contains(where: { normalized.contains($0) }) && normalized.count < 20 {
+            return .chat
+        }
+        
+        // 判断是否为单次任务
+        let singleTaskMarkers = ["查一下", "搜一下", "打开", "看看", "截图", "天气"]
+        if singleTaskMarkers.contains(where: { normalized.contains($0) }) {
+            return .singleTask
+        }
+        
+        return .chat
+    }
+    
+    /// 判断是否应提升为 workflow
+    static func shouldPromoteToWorkflow(_ text: String) -> Bool {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+
+        let scheduleMarkers = ["每天", "每周", "定时", "定期", "循环"]
+        let mcpAutomationMarkers = ["mcp", "服务", "整理", "汇总", "日报", "热搜", "榜单", "简报"]
+        if scheduleMarkers.contains(where: { normalized.contains($0) }) &&
+            mcpAutomationMarkers.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+        
+        // 多步骤关键词
+        let multiStepMarkers = [
+            "每天", "每周", "定时", "定期", "循环", "自动化",
+            "先然后", "第一步", "流程", "步骤", "编排",
+            "完成后", "结束时", "触发", "条件", "如果"
+        ]
+        let multiStepCount = multiStepMarkers.filter { normalized.contains($0) }.count
+        
+        // 长期运行关键词
+        let longRunningMarkers = [
+            "监控", "跟踪", "监听", "观察", "记录",
+            "提醒我", "通知我", "推送", "汇总", "报告",
+            "整理", "简报", "日报", "热搜", "榜单"
+        ]
+        let longRunningCount = longRunningMarkers.filter { normalized.contains($0) }.count
+        
+        // 复杂协调关键词
+        let coordinationMarkers = [
+            "多个", "同时", "协调", "同步", "串联", "并联",
+            "根据", "取决于", "不同情况", "分支", "判断"
+        ]
+        let coordinationCount = coordinationMarkers.filter { normalized.contains($0) }.count
+        
+        // 得分判定
+        let score = multiStepCount * 2 + longRunningCount * 2 + coordinationCount * 3
+        return score >= 4 || (multiStepCount >= 2 && longRunningCount >= 1)
+    }
+    
+    /// 生成 workflow 候选
+    static func workflowCandidate(from text: String) -> WorkflowCandidate? {
+        guard shouldPromoteToWorkflow(text) else { return nil }
+        
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        
+        // 提取 workflow 名称（简化版）
+        let name = extractWorkflowName(from: normalized) ?? "未命名工作流"
+        
+        // 生成步骤预览
+        let steps = extractWorkflowSteps(from: normalized)
+        
+        // 提取缺失的槽位
+        let slots = extractPlanningSlots(from: normalized)
+        
+        return WorkflowCandidate(
+            name: name,
+            description: "基于用户输入: \(text.prefix(50))...",
+            stepsPreview: steps,
+            estimatedSteps: steps.count,
+            needsConfirmation: !slots.isEmpty,
+            requiredCapabilities: [],
+            missingSlots: slots
+        )
+    }
+    
+    /// 提取信息槽位
+    static func extractPlanningSlots(from text: String) -> [PlanningSlot] {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        var slots: [PlanningSlot] = []
+        
+        // 时间槽
+        if normalized.contains("定时") || normalized.contains("每天") || normalized.contains("每周") {
+            if !normalized.contains("点") && !normalized.contains(":") {
+                slots.append(PlanningSlot(
+                    name: "execution_time",
+                    description: "执行时间（如：早上9点）",
+                    isRequired: true,
+                    value: nil
+                ))
+            }
+        }
+        
+        // 目标/接收者槽
+        let targetPatterns = [
+            (pattern: #"发给(.+?)"#, slot: "recipient"),
+            (pattern: #"给(.+?)发送"#, slot: "recipient"),
+            (pattern: #"通知(.+?)"#, slot: "recipient")
+        ]
+        for (pattern, slotName) in targetPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
+               let range = Range(match.range(at: 1), in: text) {
+                let value = String(text[range]).trimmingCharacters(in: .whitespaces)
+                if slots.firstIndex(where: { $0.name == slotName }) == nil {
+                    slots.append(PlanningSlot(
+                        name: slotName,
+                        description: "目标接收者",
+                        isRequired: true,
+                        value: value
+                    ))
+                }
+            }
+        }
+        
+        // 内容槽
+        if normalized.contains("内容") || normalized.contains("写") {
+            if !normalized.contains("主题是") && !normalized.contains("关于") {
+                slots.append(PlanningSlot(
+                    name: "content_theme",
+                    description: "内容主题",
+                    isRequired: false,
+                    value: nil
+                ))
+            }
+        }
+        
+        return slots
+    }
+
+    static func fillPlanningSlots(from text: String, expectedSlots: [PlanningSlot]) -> [PlanningSlot] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        guard !trimmed.isEmpty else {
+            return expectedSlots
+        }
+
+        return expectedSlots.map { slot in
+            guard !slot.isFilled else { return slot }
+
+            switch slot.name {
+            case "execution_time":
+                let timeMarkers = ["点", ":", "早上", "上午", "中午", "下午", "晚上", "每天", "每周", "定时"]
+                if timeMarkers.contains(where: { normalized.contains($0) }) {
+                    return PlanningSlot(
+                        name: slot.name,
+                        description: slot.description,
+                        isRequired: slot.isRequired,
+                        value: trimmed
+                    )
+                }
+
+            case "recipient":
+                let patterns = [
+                    #"发给(.+?)"#,
+                    #"给(.+?)发送"#,
+                    #"通知(.+?)"#,
+                    #"发送给(.+?)"#
+                ]
+                for pattern in patterns {
+                    if let regex = try? NSRegularExpression(pattern: pattern),
+                       let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
+                       let range = Range(match.range(at: 1), in: text) {
+                        return PlanningSlot(
+                            name: slot.name,
+                            description: slot.description,
+                            isRequired: slot.isRequired,
+                            value: String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        )
+                    }
+                }
+
+                if expectedSlots.count == 1 {
+                    return PlanningSlot(
+                        name: slot.name,
+                        description: slot.description,
+                        isRequired: slot.isRequired,
+                        value: trimmed
+                    )
+                }
+
+            case "content_theme":
+                if !trimmed.isEmpty {
+                    return PlanningSlot(
+                        name: slot.name,
+                        description: slot.description,
+                        isRequired: slot.isRequired,
+                        value: trimmed
+                    )
+                }
+
+            default:
+                if expectedSlots.count == 1 {
+                    return PlanningSlot(
+                        name: slot.name,
+                        description: slot.description,
+                        isRequired: slot.isRequired,
+                        value: trimmed
+                    )
+                }
+            }
+
+            return slot
+        }
+    }
+
+    static func shouldPublishWorkflowDraft(_ text: String) -> Bool {
+        if workflowGuidanceDecision(from: text) == true {
+            return true
+        }
+
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        let markers = ["确认", "发布", "创建吧", "就这样", "开始配置", "开始执行", "启动吧"]
+        return markers.contains(normalized) || markers.contains(where: { normalized.contains($0) })
+    }
+
+    static func shouldModifyWorkflowDraft(_ text: String) -> Bool {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        let markers = ["修改", "调整", "改一下", "编辑", "补充", "优化", "增加", "删掉", "替换"]
+        return markers.contains(normalized) || markers.contains(where: { normalized.contains($0) })
+    }
+
+    static func workflowStepsPreview(from text: String) -> [String] {
+        extractWorkflowSteps(from: text)
+    }
+    
+    // MARK: - Private Helpers
+    
+    private static func extractWorkflowName(from text: String) -> String? {
+        // 尝试从 "创建一个XX的workflow" 或 "帮我做XX" 中提取
+        let patterns = [
+            #"(?:创建|设计|做一个|帮我做)(?:一个)?(.+?)(?:的)?(?:工作流|workflow|自动化|任务)"#,
+            #"(?:每天|每周|定时)(.+?)(?:的|通知|提醒|汇总)"#
+        ]
+        
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+               let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: text.utf16.count)),
+               let range = Range(match.range(at: 1), in: text) {
+                let name = String(text[range]).trimmingCharacters(in: .whitespaces)
+                if name.count > 1 && name.count < 30 {
+                    return name
+                }
+            }
+        }
+        return nil
+    }
+    
+    private static func extractWorkflowSteps(from text: String) -> [String] {
+        let normalized = RequestPlanningHeuristics.normalized(text)
+        var steps: [String] = []
+        
+        // 基于关键词推测步骤
+        if normalized.contains("查") || normalized.contains("看") || normalized.contains("监控") {
+            steps.append("收集信息/数据")
+        }
+        if normalized.contains("分析") || normalized.contains("整理") || normalized.contains("汇总") {
+            steps.append("分析处理")
+        }
+        if normalized.contains("写") || normalized.contains("生成") || normalized.contains("创建") {
+            steps.append("生成内容")
+        }
+        if normalized.contains("发") || normalized.contains("通知") || normalized.contains("提醒") || normalized.contains("推送") {
+            steps.append("发送/通知")
+        }
+        if normalized.contains("保存") || normalized.contains("记录") || normalized.contains("存档") {
+            steps.append("保存记录")
+        }
+        
+        // 如果没有识别到任何步骤，添加一个通用步骤
+        if steps.isEmpty {
+            steps.append("执行主任务")
+        }
+        
+        return steps
     }
 }

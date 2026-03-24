@@ -415,7 +415,7 @@ class AgentStore: ObservableObject {
             task.standardOutput = pipe
             task.standardError = pipe
 
-            var env = ProcessInfo.processInfo.environment
+            var env = ProcessInfo().environment
             env["PATH"] = [
                 "\(home)/.local/bin",
                 "\(home)/.cargo/bin",

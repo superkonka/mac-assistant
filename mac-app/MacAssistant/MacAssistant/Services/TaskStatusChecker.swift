@@ -41,7 +41,6 @@ enum SuggestedUserAction: String {
 final class TaskStatusChecker {
     static let shared = TaskStatusChecker()
     
-    private let openClawClient = OpenClawGatewayClient.shared
     private let executionAnalyzer = ExecutionAnalyzer.shared
     private let backgroundRecovery = BackgroundTaskRecoveryService.shared
     

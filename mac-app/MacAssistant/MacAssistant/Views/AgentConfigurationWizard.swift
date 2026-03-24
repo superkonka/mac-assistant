@@ -85,7 +85,7 @@ struct AgentConfigurationWizard: View {
                 let isActive = index == viewModel.currentStep.rawValue
                 let isCompleted = index < viewModel.currentStep.rawValue
                 
-                HStack(spacing: 8) {
+                VStack(spacing: 4) {
                     // 步骤圆圈
                     ZStack {
                         Circle()
@@ -103,10 +103,12 @@ struct AgentConfigurationWizard: View {
                         }
                     }
                     
-                    // 步骤标题
-                    Text(step.title)
-                        .font(.system(size: 12))
+                    // 步骤标题 - 使用固定宽度确保不换行
+                    Text(step.shortTitle)
+                        .font(.system(size: 10))
                         .foregroundColor(isActive ? .primary : (isCompleted ? .primary : .secondary))
+                        .lineLimit(1)
+                        .frame(width: 60)
                 }
                 
                 // 连接线
@@ -114,11 +116,11 @@ struct AgentConfigurationWizard: View {
                     Rectangle()
                         .fill(isCompleted ? Color.blue : Color.gray.opacity(0.3))
                         .frame(height: 2)
-                        .padding(.horizontal, 8)
+                        .padding(.horizontal, 4)
                 }
             }
         }
-        .padding(.horizontal, 24)
+        .padding(.horizontal, 16)
     }
     
     @ViewBuilder
@@ -529,32 +531,126 @@ struct CustomizeSettingsStep: View {
             
             Divider()
             
-            VStack(alignment: .leading, spacing: 8) {
-                Text("高级设置")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+            // 模型配置信息
+            if let provider = viewModel.selectedProvider, 
+               let model = viewModel.selectedModel {
+                let config = provider.modelConfig(for: model)
                 
-                HStack {
-                    Text("Temperature")
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("模型规格")
                         .font(.caption)
-                    Slider(value: $viewModel.temperature, in: 0...2, step: 0.1)
-                    Text(String(format: "%.1f", viewModel.temperature))
-                        .font(.caption)
-                        .monospacedDigit()
-                        .frame(width: 30)
-                }
-                
-                HStack {
-                    Text("Max Tokens")
-                        .font(.caption)
-                    Picker("", selection: $viewModel.maxTokens) {
-                        Text("2K").tag(2048)
-                        Text("4K").tag(4096)
-                        Text("8K").tag(8192)
-                        Text("16K").tag(16384)
-                        Text("32K").tag(32768)
+                        .foregroundColor(.secondary)
+                    
+                    // 显示模型配置卡片
+                    HStack(spacing: 16) {
+                        // Context Window
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("上下文窗口")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text(config.formattedContextWindow)
+                                .font(.system(size: 14, weight: .medium))
+                            Text("输入+输出总计")
+                                .font(.caption2)
+                                .foregroundColor(.secondary.opacity(0.7))
+                        }
+                        
+                        Divider()
+                            .frame(height: 30)
+                        
+                        // Max Output
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("最大输出")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text(config.formattedMaxOutput)
+                                .font(.system(size: 14, weight: .medium))
+                            Text("单次回复上限")
+                                .font(.caption2)
+                                .foregroundColor(.secondary.opacity(0.7))
+                        }
+                        
+                        Spacer()
                     }
-                    .pickerStyle(SegmentedPickerStyle())
+                    .padding(8)
+                    .background(Color.secondary.opacity(0.05))
+                    .cornerRadius(6)
+                    
+                    // Temperature - 根据模型自动调整
+                    let isFixedTemp = model.contains("kimi-k2.5") || model.contains("kimi-k2")
+                    
+                    if isFixedTemp {
+                        HStack {
+                            Text("Temperature")
+                                .font(.caption)
+                            Spacer()
+                            Text("1.0 (固定值)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Text("此模型只支持 temperature = 1，已自动设置")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                    } else {
+                        HStack {
+                            Text("Temperature")
+                                .font(.caption)
+                            Slider(value: $viewModel.temperature, in: 0...2, step: 0.1)
+                            Text(String(format: "%.1f", viewModel.temperature))
+                                .font(.caption)
+                                .monospacedDigit()
+                                .frame(width: 30)
+                        }
+                    }
+                    
+                    // 输出长度限制选择
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("输出长度限制")
+                                .font(.caption)
+                            Spacer()
+                            Text("\(viewModel.maxTokens / 1024)K tokens")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        // 根据模型最大输出限制提供合理选项
+                        let maxOutput = config.maxOutputTokens
+                        Picker("", selection: $viewModel.maxTokens) {
+                            if maxOutput >= 2048 {
+                                Text("2K").tag(2048)
+                            }
+                            if maxOutput >= 4096 {
+                                Text("4K").tag(4096)
+                            }
+                            if maxOutput >= 8192 {
+                                Text("8K").tag(8192)
+                            }
+                            if maxOutput >= 16384 {
+                                Text("16K").tag(16384)
+                            }
+                            if maxOutput >= 32768 {
+                                Text("32K").tag(32768)
+                            }
+                            if maxOutput >= 65536 {
+                                Text("64K").tag(65536)
+                            }
+                            if maxOutput >= 100000 {
+                                Text("100K").tag(100000)
+                            }
+                            if maxOutput >= 128000 {
+                                Text("128K").tag(128000)
+                            }
+                        }
+                        .pickerStyle(SegmentedPickerStyle())
+                        
+                        // 提示超出模型限制
+                        if viewModel.maxTokens > config.maxOutputTokens {
+                            Text("⚠️ 选择的输出长度超过模型限制的 \(config.formattedMaxOutput)，将自动调整为模型最大值")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
                 }
             }
         }

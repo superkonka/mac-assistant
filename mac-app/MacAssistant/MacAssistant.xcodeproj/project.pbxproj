@@ -8,13 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		000000000000000000000001 /* MacAssistantApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000101 /* MacAssistantApp.swift */; };
-		000000000000000000000002 /* OpenClawChatUI in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000000000901 /* OpenClawChatUI */; };
-		000000000000000000000003 /* OpenClawKit in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000000000902 /* OpenClawKit */; };
-		000000000000000000000004 /* OpenClawProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000000000903 /* OpenClawProtocol */; };
 		000000000000000000000005 /* ConversationLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000103 /* ConversationLogger.swift */; };
-		000000000000000000000006 /* OpenClawHealthChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000104 /* OpenClawHealthChecker.swift */; };
 		000000000000000000000007 /* UserPreferenceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000105 /* UserPreferenceStore.swift */; };
-		000000000000000000000008 /* openclaw-runtime in Resources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000106 /* openclaw-runtime */; };
+		000000000000000000000009 /* FeatureFlags.swift in Sources */ = {isa = PBXBuildFile; fileRef = 000000000000000000000107 /* FeatureFlags.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -22,9 +18,8 @@
 		000000000000000000000101 /* MacAssistantApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacAssistantApp.swift; sourceTree = "<group>"; };
 		000000000000000000000102 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		000000000000000000000103 /* ConversationLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationLogger.swift; sourceTree = "<group>"; };
-		000000000000000000000104 /* OpenClawHealthChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenClawHealthChecker.swift; sourceTree = "<group>"; };
 		000000000000000000000105 /* UserPreferenceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserPreferenceStore.swift; sourceTree = "<group>"; };
-		000000000000000000000106 /* openclaw-runtime */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "Resources/openclaw-runtime"; sourceTree = "<group>"; };
+		000000000000000000000107 /* FeatureFlags.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemorySystem/FeatureFlags.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -75,9 +70,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				000000000000000000000002 /* OpenClawChatUI in Frameworks */,
-				000000000000000000000003 /* OpenClawKit in Frameworks */,
-				000000000000000000000004 /* OpenClawProtocol in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -105,6 +97,7 @@
 				000000000000000000000206 /* Storage */,
 				000000000000000000000207 /* Utils */,
 				000000000000000000000208 /* Views */,
+				000000000000000000000107 /* FeatureFlags.swift */,
 				000000000000000000000106 /* openclaw-runtime */,
 				000000000000000000000102 /* Info.plist */,
 			);
@@ -123,7 +116,6 @@
 			isa = PBXGroup;
 			children = (
 				000000000000000000000103 /* ConversationLogger.swift */,
-				000000000000000000000104 /* OpenClawHealthChecker.swift */,
 				000000000000000000000105 /* UserPreferenceStore.swift */,
 			);
 			path = Analytics;
@@ -156,9 +148,6 @@
 			);
 			name = MacAssistant;
 			packageProductDependencies = (
-				000000000000000000000901 /* OpenClawChatUI */,
-				000000000000000000000902 /* OpenClawKit */,
-				000000000000000000000903 /* OpenClawProtocol */,
 			);
 			productName = MacAssistant;
 			productReference = 000000000000000000000100 /* MacAssistant.app */;
@@ -190,7 +179,6 @@
 			mainGroup = 000000000000000000000300;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				000000000000000000000900 /* OpenClawKit */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 000000000000000000000302 /* Products */;
@@ -207,7 +195,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				000000000000000000000008 /* openclaw-runtime in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -220,8 +207,8 @@
 			files = (
 				000000000000000000000001 /* MacAssistantApp.swift in Sources */,
 				000000000000000000000005 /* ConversationLogger.swift in Sources */,
-				000000000000000000000006 /* OpenClawHealthChecker.swift in Sources */,
 				000000000000000000000007 /* UserPreferenceStore.swift in Sources */,
+				000000000000000000000009 /* FeatureFlags.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

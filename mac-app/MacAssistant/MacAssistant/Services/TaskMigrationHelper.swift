@@ -7,98 +7,93 @@
 
 import Foundation
 
+enum LegacyTaskStatus: String, Codable {
+    case pending
+    case running
+    case paused
+    case completed
+    case failed
+}
+
+struct LegacyTaskRecord: Codable {
+    let id: String
+    let type: SubtaskType
+    let title: String
+    let description: String
+    let parentTaskID: String?
+    let status: LegacyTaskStatus
+    let strategy: SubtaskStrategy
+    let assignedAgentID: String?
+    let assignedAgentName: String?
+    let inputContext: String
+    let result: String?
+    let executionTime: TimeInterval?
+    let scheduledTime: Date?
+    let isPaused: Bool
+    let createdAt: Date
+    let updatedAt: Date
+    let messages: [TaskMessage]
+    let logs: [TaskLogEntry]
+    let logFilePath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case type
+        case title
+        case description
+        case parentTaskID
+        case status
+        case strategy
+        case assignedAgentID
+        case assignedAgentName
+        case inputContext
+        case result
+        case executionTime
+        case scheduledTime
+        case isPaused
+        case createdAt
+        case updatedAt
+        case messages
+        case logs
+        case logFilePath
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        type = (try? container.decode(SubtaskType.self, forKey: .type)) ?? .custom
+        title = (try? container.decode(String.self, forKey: .title)) ?? ""
+        description = (try? container.decode(String.self, forKey: .description)) ?? ""
+        parentTaskID = try container.decodeIfPresent(String.self, forKey: .parentTaskID)
+        status = (try? container.decode(LegacyTaskStatus.self, forKey: .status)) ?? .pending
+        strategy = (try? container.decode(SubtaskStrategy.self, forKey: .strategy)) ?? .custom
+        assignedAgentID = try container.decodeIfPresent(String.self, forKey: .assignedAgentID)
+        assignedAgentName = try container.decodeIfPresent(String.self, forKey: .assignedAgentName)
+        inputContext = (try? container.decode(String.self, forKey: .inputContext)) ?? ""
+        result = try container.decodeIfPresent(String.self, forKey: .result)
+        executionTime = try container.decodeIfPresent(TimeInterval.self, forKey: .executionTime)
+        scheduledTime = try container.decodeIfPresent(Date.self, forKey: .scheduledTime)
+        isPaused = (try? container.decode(Bool.self, forKey: .isPaused)) ?? false
+        createdAt = (try? container.decode(Date.self, forKey: .createdAt)) ?? Date()
+        updatedAt = (try? container.decode(Date.self, forKey: .updatedAt)) ?? createdAt
+        messages = (try? container.decode([TaskMessage].self, forKey: .messages)) ?? []
+        logs = (try? container.decode([TaskLogEntry].self, forKey: .logs)) ?? []
+        logFilePath = try container.decodeIfPresent(String.self, forKey: .logFilePath)
+    }
+}
+
 /// 任务系统迁移助手
 @MainActor
 final class TaskMigrationHelper {
-    
-    /// 将旧版AgentTaskSession转换为UnifiedTask
-    static func migrateAgentTaskSession(_ session: AgentTaskSession) -> UnifiedTask {
-        // 映射状态
-        let status: UnifiedTaskStatus
-        switch session.status {
-        case .queued, .waitingUser:
-            status = .pending
-        case .running:
-            status = .running
-        case .partial:
-            status = .paused  // partial状态映射为paused
-        case .completed:
-            status = .completed
-        case .failed:
-            status = .failed
-        }
-        
-        // 转换消息类型
-        let taskMessages: [TaskMessage] = session.messages.map { msg in
-            let role: TaskMessage.TaskMessageRole
-            switch msg.role {
-            case .user:
-                role = .user
-            case .assistant:
-                role = .assistant
-            case .system:
-                role = .system
-            }
-            return TaskMessage(
-                id: msg.id,
-                role: role,
-                content: msg.content,
-                timestamp: msg.timestamp,
-                agentID: nil,
-                agentName: msg.agentName
-            )
-        }
-        
-        // 转换为UnifiedTask
-        return UnifiedTask(
-            id: session.id,
-            type: .exceptionRecovery,
-            title: session.title,
-            description: "请求处理中断，点击继续处理重试",
-            status: status,
-            strategy: .exceptionRecovery,
-            inputContext: session.originalRequest,
-            result: session.resultSummary,
-            errorMessage: session.errorMessage,
-            messages: taskMessages,
-            canResume: session.canResume,
-            gatewaySessionKey: session.gatewaySessionKey,
-            originalRequest: session.originalRequest
-        )
+    static func decodeLegacyTaskRecords(from data: Data) throws -> [LegacyTaskRecord] {
+        let allTasks = try JSONDecoder().decode([String: [LegacyTaskRecord]].self, from: data)
+        return (allTasks["pending"] ?? [])
+            + (allTasks["running"] ?? [])
+            + (allTasks["completed"] ?? [])
     }
     
-    /// 将旧版Subtask转换为UnifiedTask
-    static func migrateSubtask(_ subtask: Subtask) -> UnifiedTask {
-        // 映射状态
-        let status: UnifiedTaskStatus
-        switch subtask.status {
-        case .pending:
-            status = .pending
-        case .running:
-            status = .running
-        case .completed:
-            status = .completed
-        case .failed, .cancelled:
-            status = .failed
-        }
-        
-        // 映射策略
-        let strategy: TaskExecutionStrategy = .auto
-        
-        return UnifiedTask(
-            id: subtask.id,
-            type: .smartSubtask,
-            title: subtask.title,
-            description: subtask.description,
-            status: status,
-            strategy: strategy,
-            inputContext: subtask.inputContext,
-            result: subtask.result
-        )
-    }
-    
-    /// 将旧版TaskItem转换为UnifiedTask
-    static func migrateTaskItem(_ taskItem: TaskItem) -> UnifiedTask {
+    /// 将旧版任务持久化记录转换为 UnifiedTask
+    static func migrateLegacyTaskRecord(_ taskItem: LegacyTaskRecord) -> UnifiedTask {
         // 映射状态
         let status: UnifiedTaskStatus
         switch taskItem.status {
@@ -145,64 +140,5 @@ final class TaskMigrationHelper {
         task.updatedAt = taskItem.updatedAt
         
         return task
-    }
-    
-    /// 批量迁移任务（用于应用启动时）
-    static func migrateAllTasks(
-        agentSessions: [AgentTaskSession] = [],
-        subtasks: [Subtask] = [],
-        taskItems: [TaskItem] = []
-    ) -> [UnifiedTask] {
-        var unifiedTasks: [UnifiedTask] = []
-        
-        // 迁移异常恢复任务
-        for session in agentSessions {
-            unifiedTasks.append(migrateAgentTaskSession(session))
-        }
-        
-        // 迁移子任务
-        for subtask in subtasks {
-            unifiedTasks.append(migrateSubtask(subtask))
-        }
-        
-        // 迁移待办任务
-        for taskItem in taskItems {
-            unifiedTasks.append(migrateTaskItem(taskItem))
-        }
-        
-        return unifiedTasks
-    }
-}
-
-// MARK: - 扩展方法
-
-extension UnifiedTaskManager {
-    /// 从旧版AgentTaskSession导入
-    func importAgentTaskSession(_ session: AgentTaskSession) {
-        let task = TaskMigrationHelper.migrateAgentTaskSession(session)
-        
-        // 检查是否已存在
-        if tasks.contains(where: { $0.id == task.id }) {
-            updateTask(id: task.id) { existing in
-                existing.status = task.status
-                existing.result = task.result ?? existing.result
-                existing.errorMessage = task.errorMessage ?? existing.errorMessage
-                existing.messages = task.messages.isEmpty ? existing.messages : task.messages
-            }
-        } else {
-            addTask(task)
-        }
-    }
-    
-    /// 从旧版Subtask导入
-    func importSubtask(_ subtask: Subtask) {
-        let task = TaskMigrationHelper.migrateSubtask(subtask)
-        addTask(task)
-    }
-    
-    /// 从旧版TaskItem导入
-    func importTaskItem(_ taskItem: TaskItem) {
-        let task = TaskMigrationHelper.migrateTaskItem(taskItem)
-        addTask(task)
     }
 }

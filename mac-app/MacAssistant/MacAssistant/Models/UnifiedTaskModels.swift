@@ -13,6 +13,7 @@ enum UnifiedTaskType: String, Codable, Equatable, CaseIterable {
     case smartSubtask = "smart_subtask"           // 智能子任务
     case todo = "todo"                            // 待办任务
     case background = "background"                // 后台任务
+    case workflow = "workflow"                    // Workflow 任务（新增）
     
     var displayName: String {
         switch self {
@@ -20,6 +21,7 @@ enum UnifiedTaskType: String, Codable, Equatable, CaseIterable {
         case .smartSubtask: return "智能子任务"
         case .todo: return "待办"
         case .background: return "后台任务"
+        case .workflow: return "工作流"
         }
     }
     
@@ -29,6 +31,7 @@ enum UnifiedTaskType: String, Codable, Equatable, CaseIterable {
         case .smartSubtask: return "brain"
         case .todo: return "checklist"
         case .background: return "clock.arrow.circlepath"
+        case .workflow: return "arrow.right.square.stack"
         }
     }
 }
@@ -324,6 +327,7 @@ enum TaskFilter: String, CaseIterable {
     case all = "全部"
     case pending = "待执行"
     case running = "执行中"
+    case scheduled = "已排期"
     case completed = "已完成"
     case exception = "异常恢复"
     
@@ -332,6 +336,7 @@ enum TaskFilter: String, CaseIterable {
         case .all: return "tray.full"
         case .pending: return "hourglass"
         case .running: return "arrow.triangle.2.circlepath"
+        case .scheduled: return "calendar.badge.clock"
         case .completed: return "checkmark.circle"
         case .exception: return "arrow.counterclockwise"
         }

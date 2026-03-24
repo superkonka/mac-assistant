@@ -18,6 +18,8 @@ struct ConversationStores: Equatable {
     var currentTrace: ExecutionTrace?
     var isProcessing: Bool
     var lastScreenshotPath: String?
+    var activeBrowserSessionID: String?
+    var browserSessions: [BrowserSession]
 
     static let empty = ConversationStores(
         messages: [],
@@ -25,7 +27,9 @@ struct ConversationStores: Equatable {
         tracesByID: [:],
         currentTrace: nil,
         isProcessing: false,
-        lastScreenshotPath: nil
+        lastScreenshotPath: nil,
+        activeBrowserSessionID: nil,
+        browserSessions: []
     )
 
     var visibleMessages: [ChatMessage] {
@@ -45,6 +49,11 @@ struct ConversationStores: Equatable {
 
     var taskSessionIDs: [String] {
         taskSessionsForDisplay.map(\.id)
+    }
+
+    var activeBrowserSession: BrowserSession? {
+        guard let activeBrowserSessionID else { return nil }
+        return browserSessions.first { $0.id == activeBrowserSessionID }
     }
 
     func executionTrace(forMessageID messageID: UUID) -> ExecutionTrace? {

@@ -297,6 +297,7 @@ struct ExecutionLogView: View {
         case .completed: return .green
         case .failed: return .red
         case .cancelled: return .orange
+        case .interrupted: return .yellow
         }
     }
 }

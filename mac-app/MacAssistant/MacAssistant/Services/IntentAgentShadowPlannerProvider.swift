@@ -22,6 +22,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
     private let allowedActions: Set<String> = [
         "continue_agent_creation_flow",
         "resume_interrupted_task",
+        "continue_processing",          // 新增：智能继续处理
         "respond_to_confirmation",
         "request_initial_setup",
         "show_skill_evolution_overview",
@@ -39,7 +40,7 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
 
     private let preferences = UserPreferenceStore.shared
     private let agentStore = AgentStore.shared
-    private let gatewayClient = OpenClawGatewayClient.shared
+    private let runtimeAdapter: ConversationRuntimeAdapter = NativeConversationRuntimeAdapter.shared
     private let intelligence = ConversationIntelligence.shared
 
     private init() {}
@@ -72,19 +73,16 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         let parsed = intelligence.analyzeInput(envelope.originalText)
         let prompt = buildPrompt(envelope: envelope, parsed: parsed)
         let sessionKey = envelope.sessionTopology.shadowSessionKey
-        let resolvedSessionLabel = OpenClawGatewayClient.uniqueSessionLabel(
-            base: envelope.sessionTopology.shadowSessionLabel,
-            uniqueSource: sessionKey
-        )
-
         do {
-            let raw = try await gatewayClient.sendMessage(
+            let raw = try await runtimeAdapter.sendMessage(
                 agent: agent,
                 sessionKey: sessionKey,
-                sessionLabel: resolvedSessionLabel,
+                sessionLabel: envelope.sessionTopology.shadowSessionLabel,
                 requestID: envelope.id.uuidString.lowercased(),
                 text: prompt,
-                images: []
+                images: [],
+                systemPrompt: nil,
+                onAssistantText: nil
             )
             guard let decision = decodeDecision(from: raw) else {
                 LogInfo("IntentAgentShadow returned unparsable payload agent=\(agent.id)")
@@ -131,8 +129,9 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         你是一个只负责意图判定的规划器。不要回答用户问题，不要解释，不要输出 Markdown，只返回一个 JSON 对象。
 
         可选 action：
+        - continue_processing: 用户说"继续"、"继续处理"、"接着做"等，需要分析所有可继续的事项（任务、服务、对话）
+        - resume_interrupted_task: 明确指定要继续某个特定任务（如"继续微信那个任务"）
         - continue_agent_creation_flow
-        - resume_interrupted_task
         - respond_to_confirmation
         - request_initial_setup
         - show_skill_evolution_overview
@@ -145,6 +144,8 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
         - handle_detected_skill
         - handle_agent_suggestion
         - route_main_conversation
+        
+        注意：当用户说"继续"、"继续处理"等模糊指令时，优先使用 continue_processing 而不是 resume_interrupted_task
 
         输出 JSON schema：
         {
@@ -257,14 +258,12 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
                 reason: decision.reason
             )
 
-        case "resume_interrupted_task":
-            return RequestPlan(
+        case "resume_interrupted_task", "continue_processing":
+            // 统一处理所有"继续"类意图
+            return await handleContinueProcessingIntent(
                 envelope: envelope,
-                parsedInput: parsed,
+                parsed: parsed,
                 preparedInput: preparedInput,
-                notices: [],
-                requestedAgentSwitch: nil,
-                primaryAction: .resumeInterruptedTask(sessionID: envelope.resumableTaskSessionID ?? "unknown"),
                 confidence: confidence,
                 reason: decision.reason
             )
@@ -431,6 +430,114 @@ final class IntentAgentShadowPlannerProvider: RequestPlannerShadowProvider {
             confidence: confidence,
             reason: decision.reason
         )
+    }
+    
+    // MARK: - 智能"继续处理"意图处理
+    
+    /// 处理"继续处理"意图
+    /// 分析所有可选项，根据情况自动恢复或询问用户
+    private func handleContinueProcessingIntent(
+        envelope: RequestEnvelope,
+        parsed: ParsedInput,
+        preparedInput: String,
+        confidence: PlannerConfidence,
+        reason: String
+    ) async -> RequestPlan {
+        
+        // 获取当前任务会话和服务状态
+        let (taskSessions, services, runtimes, messages, activeServiceTasks) = await MainActor.run {
+            (
+                CommandRunner.shared.taskSessions,
+                ServiceManager.shared.services,
+                ServiceManager.shared.runtimeInfos,
+                CommandRunner.shared.messages,
+                ServiceTaskManager.shared.activeServiceTasks.keys
+            )
+        }
+        
+        // 分析可继续处理的事项
+        let analysis = ContinueIntentAnalyzer.shared.analyze(
+            taskSessions: taskSessions,
+            services: services,
+            serviceRuntimes: runtimes,
+            messages: messages,
+            activeServiceTasks: Set(activeServiceTasks)
+        )
+        
+        // 根据分析结果决策
+        if analysis.hasClearSingleOption,
+           let primaryOption = analysis.highestPriorityOption {
+            // 只有一个明确的选项，直接处理
+            // 同时在主会话显示其他可能需要处理的事项
+            
+            let otherOptionsMessage = analysis.formatAsOtherOptionsMessage(
+                excluding: primaryOption.id
+            )
+            
+            var notices: [String] = []
+            if !otherOptionsMessage.isEmpty {
+                notices.append(otherOptionsMessage)
+            }
+            
+            // 根据选项类型执行相应操作
+            let primaryAction: RequestPlannerPrimaryAction
+            switch primaryOption.action {
+            case .resumeTask(let sessionID):
+                primaryAction = .resumeInterruptedTask(sessionID: sessionID)
+            case .startService(let serviceID, _):
+                // 启动服务通过主会话路由，让 AI 处理
+                let service = services.first { $0.id == serviceID }
+                let prompt = "帮我启动服务「\(service?.name ?? serviceID)」"
+                primaryAction = .routeMainConversation(input: prompt)
+            case .restartService(let serviceID, _):
+                let service = services.first { $0.id == serviceID }
+                let prompt = "帮我重启服务「\(service?.name ?? serviceID)」"
+                primaryAction = .routeMainConversation(input: prompt)
+            case .newRequest(let prompt):
+                primaryAction = .routeMainConversation(input: prompt)
+            default:
+                primaryAction = .routeMainConversation(input: preparedInput)
+            }
+            
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: preparedInput,
+                notices: notices,
+                requestedAgentSwitch: nil,
+                primaryAction: primaryAction,
+                confidence: .high,
+                reason: "找到明确的继续处理项: \(primaryOption.title)"
+            )
+            
+        } else if analysis.options.isEmpty {
+            // 没有可继续处理的事项
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: preparedInput,
+                notices: ["没有发现需要继续处理的事项。您可以从头开始一个新的任务。"],
+                requestedAgentSwitch: nil,
+                primaryAction: .routeMainConversation(input: preparedInput),
+                confidence: .medium,
+                reason: "没有可继续处理的事项"
+            )
+            
+        } else {
+            // 有多个选项，询问用户 - 通过主会话路由，让 AI 展示选项
+            let userMessage = analysis.formatAsUserMessage()
+            
+            return RequestPlan(
+                envelope: envelope,
+                parsedInput: parsed,
+                preparedInput: userMessage,  // 使用格式化的消息作为输入
+                notices: [],
+                requestedAgentSwitch: nil,
+                primaryAction: .routeMainConversation(input: userMessage),
+                confidence: .medium,
+                reason: "有 \(analysis.options.count) 个可继续处理的选项，需要用户选择"
+            )
+        }
     }
 
     private func jsonString(_ value: String) -> String {

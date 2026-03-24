@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import SwiftUI
 
 // MARK: - Provider Type
 
@@ -18,6 +19,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     case anthropic
     case google
     case moonshot
+    case minimax
     
     var displayName: String {
         switch self {
@@ -29,6 +31,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "Anthropic"
         case .google: return "Google"
         case .moonshot: return "Moonshot"
+        case .minimax: return "MiniMax"
         }
     }
 
@@ -44,6 +47,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "brain.head.profile"
         case .google: return "globe"
         case .moonshot: return "moon.stars.fill"
+        case .minimax: return "m.circle.fill"
         }
     }
 
@@ -57,18 +61,33 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "🅰️"
         case .google: return "🇬"
         case .moonshot: return "🌙"
+        case .minimax: return "Ⓜ️"
         }
     }
     
     var requiresAPIKey: Bool {
         self != .ollama
     }
+    
+    var color: Color {
+        switch self {
+        case .ollama: return .gray
+        case .deepseek: return .blue
+        case .doubao: return .cyan
+        case .zhipu: return .purple
+        case .openai: return .green
+        case .anthropic: return .orange
+        case .google: return .red
+        case .moonshot: return .indigo
+        case .minimax: return .teal
+        }
+    }
 
     var isOpenAICompatible: Bool {
         switch self {
         case .ollama, .anthropic, .google:
             return false
-        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot, .minimax:
             return true
         }
     }
@@ -91,6 +110,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
             return "https://ark.cn-beijing.volces.com/api/v3"
         case .zhipu:
             return "https://open.bigmodel.cn/api/paas/v4"
+        case .minimax:
+            return "https://api.minimax.chat/v1"
         }
     }
 
@@ -121,6 +142,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
             return "例如 Doubao-1.5-pro-32k 或 ep-xxxx"
         case .zhipu:
             return "glm-4.7"
+        case .minimax:
+            return "MiniMax-M2.7"
         }
     }
 
@@ -132,6 +155,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
             return "DeepSeek 使用 OpenAI 兼容接口，默认走 /chat/completions。"
         case .zhipu:
             return "智谱默认走通用对话接口 /api/paas/v4/chat/completions。"
+        case .minimax:
+            return "MiniMax 使用 OpenAI 兼容接口，支持 M2 系列和 abab 系列模型。"
         default:
             return nil
         }
@@ -202,6 +227,16 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
                 "gemini-1.5-pro",          // 1.5 Pro
                 "gemini-1.5-flash",        // 1.5 Flash
             ]
+            
+        case .minimax:
+            // MiniMax 模型 (2025)
+            return [
+                "MiniMax-M2.7",            // 最新 M2 系列（推荐）
+                "MiniMax-M2.5",            // M2 系列
+                "abab6.5s-chat",           // 轻量快速
+                "abab6.5-chat",            // 标准版
+                "abab6-chat",              // 上一代
+            ]
         }
     }
     
@@ -214,6 +249,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .zhipu: return "glm-4.7"
         case .openai: return "gpt-4o"
         case .anthropic: return "claude-opus-4"
+        case .minimax: return "MiniMax-M2.7"
         case .moonshot: return "kimi-k2.5"
         case .google: return "gemini-2.0-flash"
         }
@@ -238,6 +274,8 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
             return ["kimi-k2.5", "kimi-k2-32k"] // K2.5 支持视觉
         case .google:
             return ["gemini-2.0-flash", "gemini-2.0-flash-thinking", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro-vision"]
+        case .minimax:
+            return []
         }
     }
     
@@ -251,6 +289,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "sk-ant-..."
         case .google: return "AIza..."
         case .moonshot: return "sk-..."
+        case .minimax: return "MiniMax API Key"
         }
     }
     
@@ -264,6 +303,98 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         case .anthropic: return "https://console.anthropic.com/settings/keys"
         case .google: return "https://makersuite.google.com/app/apikey"
         case .moonshot: return "https://platform.moonshot.cn/console/api-keys"
+        case .minimax: return "https://www.minimaxi.com/platform"
+        }
+    }
+    
+    /// 获取模型的上下文窗口和输出限制配置
+    func modelConfig(for model: String) -> ModelConfig {
+        switch self {
+        case .moonshot:
+            if model.contains("k2.5") {
+                // kimi-k2.5: 256K context, 8K output
+                return ModelConfig(contextWindow: 256_000, maxOutputTokens: 8_192, description: "256K上下文 / 8K输出")
+            } else if model.contains("32k") {
+                return ModelConfig(contextWindow: 32_000, maxOutputTokens: 4_096, description: "32K上下文 / 4K输出")
+            } else {
+                return ModelConfig(contextWindow: 128_000, maxOutputTokens: 4_096, description: "128K上下文 / 4K输出")
+            }
+            
+        case .openai:
+            if model.contains("gpt-4o") {
+                return ModelConfig(contextWindow: 128_000, maxOutputTokens: 16_384, description: "128K上下文 / 16K输出")
+            } else if model.contains("gpt-4") {
+                return ModelConfig(contextWindow: 128_000, maxOutputTokens: 8_192, description: "128K上下文 / 8K输出")
+            } else if model.contains("o3") {
+                return ModelConfig(contextWindow: 200_000, maxOutputTokens: 100_000, description: "200K上下文 / 100K输出")
+            } else {
+                return ModelConfig(contextWindow: 128_000, maxOutputTokens: 4_096, description: "128K上下文 / 4K输出")
+            }
+            
+        case .anthropic:
+            if model.contains("opus") {
+                return ModelConfig(contextWindow: 200_000, maxOutputTokens: 128_000, description: "200K上下文 / 128K输出")
+            } else if model.contains("sonnet") {
+                return ModelConfig(contextWindow: 200_000, maxOutputTokens: 8_192, description: "200K上下文 / 8K输出")
+            } else {
+                return ModelConfig(contextWindow: 200_000, maxOutputTokens: 4_096, description: "200K上下文 / 4K输出")
+            }
+            
+        case .google:
+            if model.contains("2.0") {
+                return ModelConfig(contextWindow: 1_000_000, maxOutputTokens: 8_192, description: "1M上下文 / 8K输出")
+            } else {
+                return ModelConfig(contextWindow: 1_000_000, maxOutputTokens: 8_192, description: "1M上下文 / 8K输出")
+            }
+            
+        case .deepseek:
+            if model.contains("reasoner") {
+                return ModelConfig(contextWindow: 64_000, maxOutputTokens: 8_192, description: "64K上下文 / 8K输出")
+            } else {
+                return ModelConfig(contextWindow: 64_000, maxOutputTokens: 8_192, description: "64K上下文 / 8K输出")
+            }
+            
+        case .doubao:
+            if model.contains("32k") {
+                return ModelConfig(contextWindow: 32_000, maxOutputTokens: 4_096, description: "32K上下文 / 4K输出")
+            } else {
+                return ModelConfig(contextWindow: 128_000, maxOutputTokens: 4_096, description: "128K上下文 / 4K输出")
+            }
+            
+        case .zhipu:
+            return ModelConfig(contextWindow: 128_000, maxOutputTokens: 4_096, description: "128K上下文 / 4K输出")
+            
+        case .ollama:
+            return ModelConfig(contextWindow: 128_000, maxOutputTokens: 8_192, description: "128K上下文 / 8K输出")
+        case .minimax:
+            return ModelConfig(contextWindow: 128_000, maxOutputTokens: 8_192, description: "128K上下文 / 8K输出")
+        }
+    }
+}
+
+/// 模型配置信息
+struct ModelConfig {
+    let contextWindow: Int      // 上下文窗口（输入+输出总计）
+    let maxOutputTokens: Int    // 单次最大输出
+    let description: String     // 简短描述
+    
+    /// 格式化的上下文窗口显示
+    var formattedContextWindow: String {
+        if contextWindow >= 1_000_000 {
+            return "\(contextWindow / 1_000_000)M"
+        } else if contextWindow >= 1000 {
+            return "\(contextWindow / 1000)K"
+        } else {
+            return "\(contextWindow)"
+        }
+    }
+    
+    /// 格式化的最大输出显示
+    var formattedMaxOutput: String {
+        if maxOutputTokens >= 1000 {
+            return "\(maxOutputTokens / 1000)K"
+        } else {
+            return "\(maxOutputTokens)"
         }
     }
 }
@@ -279,6 +410,7 @@ enum Capability: String, CaseIterable, Codable {
     case longContext
     case voiceRecognition
     case webSearch
+    case browserAutomation
     
     var displayName: String {
         switch self {
@@ -290,6 +422,7 @@ enum Capability: String, CaseIterable, Codable {
         case .longContext: return "长上下文"
         case .voiceRecognition: return "语音识别"
         case .webSearch: return "网络搜索"
+        case .browserAutomation: return "浏览器自动化"
         }
     }
     
@@ -303,6 +436,7 @@ enum Capability: String, CaseIterable, Codable {
         case .longContext: return "book.fill"
         case .voiceRecognition: return "waveform"
         case .webSearch: return "magnifyingglass"
+        case .browserAutomation: return "globe"
         }
     }
     
@@ -324,6 +458,8 @@ enum Capability: String, CaseIterable, Codable {
             return "识别和转录语音"
         case .webSearch:
             return "实时网络搜索"
+        case .browserAutomation:
+            return "自动化控制浏览器执行网页操作"
         }
     }
 }
@@ -589,6 +725,7 @@ private extension ProviderType {
         case .anthropic: return "🅰️"
         case .google: return "🇬"
         case .moonshot: return "🌙"
+        case .minimax: return "Ⓜ️"
         }
     }
 
@@ -618,6 +755,7 @@ enum Intent {
     case webSearch
     case voiceCommand
     case agentManagement
+    case browserAutomation
     
     var requiredCapability: Capability {
         switch self {
@@ -628,6 +766,7 @@ enum Intent {
         case .webSearch: return .webSearch
         case .voiceCommand: return .voiceRecognition
         case .agentManagement: return .textChat
+        case .browserAutomation: return .browserAutomation
         }
     }
     
@@ -640,6 +779,7 @@ enum Intent {
         case .webSearch: return "网络搜索"
         case .voiceCommand: return "语音命令"
         case .agentManagement: return "Agent 管理"
+        case .browserAutomation: return "浏览器自动化"
         }
     }
 }

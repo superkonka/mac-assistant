@@ -29,6 +29,12 @@ struct TraceStripView: View, Equatable {
         VStack(alignment: .leading, spacing: 12) {
             topRow
             titleBlock
+            
+            // CLI 式详细进度展示
+            if trace.state.isActive || !trace.executionLog.isEmpty {
+                cliProgressBlock
+            }
+            
             liveStatusBlock
             progressBlock
             chips
@@ -43,6 +49,123 @@ struct TraceStripView: View, Equatable {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(borderColor, lineWidth: 1)
         )
+    }
+    
+    /// CLI 式详细进度区块
+    private var cliProgressBlock: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // 当前步骤
+            if let currentStep = trace.currentStep, !currentStep.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(accentColor)
+                    Text(currentStep)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.primary)
+                    Spacer()
+                    if let progress = trace.progressPercent {
+                        Text("\(progress)%")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundColor(accentColor)
+                    }
+                }
+                
+                if let stepDetails = trace.stepDetails, !stepDetails.isEmpty {
+                    Text(stepDetails)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 16)
+                }
+            }
+            
+            // 部分输出预览
+            if let partialOutput = trace.partialOutput, !partialOutput.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "text.quote")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                        Text("最新输出")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    Text(partialOutput)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.primary.opacity(0.85))
+                        .lineLimit(3)
+                        .padding(8)
+                        .background(Color.secondary.opacity(0.06))
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+            
+            // 执行日志（最近3条）
+            if !trace.executionLog.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "terminal")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                        Text("执行日志")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(trace.executionLog.suffix(3)) { entry in
+                            HStack(spacing: 6) {
+                                Text(formatTime(entry.timestamp))
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                                    .frame(width: 50, alignment: .leading)
+                                
+                                Image(systemName: logIcon(for: entry.level))
+                                    .font(.system(size: 8))
+                                    .foregroundColor(logColor(for: entry.level))
+                                    .frame(width: 12)
+                                
+                                Text(entry.message)
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(logColor(for: entry.level))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .padding(8)
+                    .background(Color.black.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+    
+    private func formatTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter.string(from: date)
+    }
+    
+    private func logIcon(for level: TraceLogEntry.LogLevel) -> String {
+        switch level {
+        case .info: return "info.circle.fill"
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .error: return "xmark.circle.fill"
+        }
+    }
+    
+    private func logColor(for level: TraceLogEntry.LogLevel) -> Color {
+        switch level {
+        case .info: return .secondary
+        case .success: return .green
+        case .warning: return .orange
+        case .error: return .red
+        }
     }
 
     private var topRow: some View {

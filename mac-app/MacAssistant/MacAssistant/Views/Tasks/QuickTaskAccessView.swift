@@ -7,135 +7,70 @@
 
 import SwiftUI
 
-/// 快速任务访问视图 - 显示在主界面右上角的任务入口
+/// 快速任务访问视图 - 显示在顶部工具栏的快捷任务入口
 struct QuickTaskAccessView: View {
     @StateObject private var taskManager = UnifiedTaskManager.shared
     @State private var showTaskManager = false
     @State private var showPopover = false
+    private var totalTaskCount: Int {
+        taskManager.statistics.total
+    }
     
     var body: some View {
-        HStack(spacing: 8) {
-            // 任务统计指示器
-            if taskManager.statistics.total > 0 {
-                Button {
-                    showTaskManager = true
-                } label: {
-                    TaskStatusIndicator(
-                        pending: taskManager.statistics.pending,
-                        running: taskManager.statistics.running,
-                        completed: taskManager.statistics.completed,
-                        failed: taskManager.statistics.failed
+        Button {
+            showPopover.toggle()
+        } label: {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .frame(width: 32, height: 28)
+                    .background(Color.secondary.opacity(0.08))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
                     )
-                }
-                .buttonStyle(.plain)
-                .popover(isPresented: $showPopover, arrowEdge: .bottom) {
-                    QuickTaskListPopover()
-                        .frame(width: 350, height: 400)
-                }
-                .onHover { hovering in
-                    if hovering {
-                        showPopover = true
-                    }
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+
+                if totalTaskCount > 0 {
+                    Text("\(min(totalTaskCount, 99))")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.blue)
+                        .clipShape(Capsule())
+                        .offset(x: 6, y: -4)
                 }
             }
-            
-            // 主入口按钮
-            Button {
+        }
+        .buttonStyle(.plain)
+        .help("快捷任务列表")
+        .accessibilityLabel("快捷任务列表")
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            QuickTaskListPopover(onOpenManager: {
+                showPopover = false
                 showTaskManager = true
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "checklist")
-                    if taskManager.statistics.total > 0 {
-                        Text("\(taskManager.statistics.total)")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-            }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .sheet(isPresented: $showTaskManager) {
-                UnifiedTaskManagerView()
-                    .frame(minWidth: 600, minHeight: 500)
-            }
+            })
+            .frame(width: 350, height: 400)
         }
-    }
-}
-
-// MARK: - Task Status Indicator
-
-struct TaskStatusIndicator: View {
-    let pending: Int
-    let running: Int
-    let completed: Int
-    let failed: Int
-    
-    var body: some View {
-        HStack(spacing: 4) {
-            if running > 0 {
-                TaskStatusBadgeView(
-                    count: running,
-                    icon: "arrow.triangle.2.circlepath",
-                    color: .blue
-                )
-            }
-            
-            if pending > 0 {
-                TaskStatusBadgeView(
-                    count: pending,
-                    icon: "hourglass",
-                    color: .secondary
-                )
-            }
-            
-            if failed > 0 {
-                TaskStatusBadgeView(
-                    count: failed,
-                    icon: "exclamationmark.triangle",
-                    color: .red
-                )
-            }
-            
-            if completed > 0 && running == 0 && pending == 0 && failed == 0 {
-                TaskStatusBadgeView(
-                    count: completed,
-                    icon: "checkmark.circle",
-                    color: .green
-                )
-            }
+        .sheet(isPresented: $showTaskManager) {
+            UnifiedTaskManagerView()
+                .frame(minWidth: 600, minHeight: 500)
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-// MARK: - Status Badge
-
-struct TaskStatusBadgeView: View {
-    let count: Int
-    let icon: String
-    let color: Color
-    
-    var body: some View {
-        HStack(spacing: 2) {
-            Image(systemName: icon)
-                .font(.system(size: 10))
-            Text("\(count)")
-                .font(.system(size: 10, weight: .semibold))
-        }
-        .foregroundStyle(color)
     }
 }
 
 // MARK: - Quick Task List Popover
 
 struct QuickTaskListPopover: View {
+    let onOpenManager: (() -> Void)?
     @StateObject private var taskManager = UnifiedTaskManager.shared
     @Environment(\.dismiss) private var dismiss
+
+    init(onOpenManager: (() -> Void)? = nil) {
+        self.onOpenManager = onOpenManager
+    }
     
     private var recentTasks: [UnifiedTask] {
         Array(taskManager.tasks(filteredBy: .all).prefix(5))
@@ -152,7 +87,7 @@ struct QuickTaskListPopover: View {
                 
                 Button("查看全部") {
                     dismiss()
-                    // 这里应该打开完整任务管理器，通过通知或其他方式实现
+                    onOpenManager?()
                 }
                 .font(.caption)
             }
@@ -183,8 +118,8 @@ struct QuickTaskListPopover: View {
             // 底部操作
             HStack {
                 Button {
-                    // 打开任务管理器
                     dismiss()
+                    onOpenManager?()
                 } label: {
                     Label("任务管理器", systemImage: "arrow.up.forward.app")
                 }

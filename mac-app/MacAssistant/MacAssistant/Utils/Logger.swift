@@ -122,8 +122,8 @@ class FileLogger {
         Mac Assistant AutoAgent Log
         Started at: \(Date())
         Version: \(getAppVersion())
-        macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)
-        Device: \(ProcessInfo.processInfo.machineHardwareName)
+        macOS: \(ProcessInfo().operatingSystemVersionString)
+        Device: \(ProcessInfo().machineHardwareName)
         ========================================\n\n
         """
         appendToFile(header)

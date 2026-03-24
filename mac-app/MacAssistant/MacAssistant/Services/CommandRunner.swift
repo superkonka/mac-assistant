@@ -2,7 +2,7 @@
 //  CommandRunner.swift
 //  MacAssistant
 //
-//  主命令处理器，集成 OpenClaw 和 Agent 系统
+//  主命令处理器 - 纯原生运行时
 //
 
 import Foundation
@@ -10,12 +10,21 @@ import SwiftUI
 import Combine
 import AppKit
 import CoreGraphics
+import UserNotifications
 
 class CommandRunner: ObservableObject {
     private struct TaskExecutionResult {
         let agent: Agent
         let content: String
         let failed: Bool
+    }
+
+    private struct ConversationProgressSnapshot: Equatable {
+        let messageKey: String
+        let content: String
+        let agentID: String?
+        let agentName: String?
+        let metadata: [String: String]
     }
 
     private struct DirectKimiCLIFallbackPolicy {
@@ -51,18 +60,29 @@ class CommandRunner: ObservableObject {
     private let toolSkillRegistry = SkillRegistry.shared
     private let skillEvolutionAdvisor = SkillEvolutionAdvisor.shared
     private let memoryRecallCoordinator = MemoryRecallCoordinator.shared
-    private let runtimeAdapter: any ClawRuntimeAdapter
+    private let runtimeAdapter: any ConversationRuntimeAdapter
     private let localKimiCLIService = LocalKimiCLIService.shared
     private let requestPlanner = RequestPlanner.shared
     private let logger = ConversationLogger.shared
     private let preferences = UserPreferenceStore.shared
     private let executionJournal = ExecutionJournalStore.shared
-    private let taskManager = TaskManager.shared
+    @MainActor
     private let unifiedTaskManager = UnifiedTaskManager.shared
     private let initialSetupPromptKey = "initial_setup_prompt"
     private let pendingWorkflowDesignKey = "pending_workflow_design"
     private let workflowOriginalInputKey = "workflow_original_input"
     private let workflowTaskSessionIDKey = "workflow_task_session_id"
+    private let workflowDraftIDKey = "workflow_draft_id"
+    private let pendingWorkflowClarificationKey = "pending_workflow_clarification"
+    private let pendingWorkflowDraftKey = "pending_workflow_draft"
+    private let pendingWorkflowRunKey = "pending_workflow_run"
+    private let pendingWorkflowReplanKey = "pending_workflow_replan"
+    private let pendingWorkflowReplanPreviewKey = "pending_workflow_replan_preview"
+    private let workflowModificationInputKey = "workflow_modification_input"
+    private let workflowDefinitionIDKey = "workflow_definition_id"
+    private let workflowTaskDefinitionIDKey = "workflow_task_definition_id"
+    private let workflowRunIDKey = "workflow_run_id"
+    private let workflowStepIDKey = "workflow_step_id"
     private let directKimiCLIFallbackTimeout: TimeInterval = 90
     private let directKimiCLIInterruptedStreamFallbackTimeout: TimeInterval = 60
     private let screenRecordingSettingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
@@ -75,13 +95,18 @@ class CommandRunner: ObservableObject {
     private var traceDismissTasks: [UUID: Task<Void, Never>] = [:]
     private var traceSettleTasks: [UUID: Task<Void, Never>] = [:]
     private var isRestoringPersistedState = false
+    private var taskSessionProgressSnapshots: [String: ConversationProgressSnapshot] = [:]
+    private var unifiedTaskProgressSnapshots: [String: ConversationProgressSnapshot] = [:]
     
     static let shared = CommandRunner()
     
-    init(runtimeAdapter: any ClawRuntimeAdapter = OpenClawRuntimeAdapter.shared) {
+    init(runtimeAdapter: any ConversationRuntimeAdapter = NativeConversationRuntimeAdapter.shared) {
         self.runtimeAdapter = runtimeAdapter
         restorePersistedState()
         setupNotifications()
+        Task { @MainActor in
+            setupConversationProgressFeeds()
+        }
         Task {
             await reconcileInterruptedTaskSessions(trigger: "launch")
         }
@@ -139,8 +164,84 @@ class CommandRunner: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+        
+        // 监听健康监控告警
+        NotificationCenter.default.publisher(for: .healthMonitorAlert)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let userInfo = notification.userInfo as? [String: Any] else { return }
+                Task {
+                    await self?.handleHealthMonitorAlert(userInfo)
+                }
+            }
+            .store(in: &cancellables)
+        
+        // 监听健康监控 AI 诊断请求
+        NotificationCenter.default.publisher(for: .healthMonitorAIDiagnosis)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                guard let userInfo = notification.userInfo as? [String: Any] else { return }
+                Task {
+                    await self?.handleHealthMonitorAIDiagnosis(userInfo)
+                }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .workflowApprovalNeeded)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    self?.presentWorkflowApprovalRequest(notification)
+                }
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .workflowReplanRequested)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                Task { @MainActor [weak self] in
+                    self?.presentWorkflowReplanRequest(notification)
+                }
+            }
+            .store(in: &cancellables)
 
         _ = skillEvolutionAdvisor.scanNow()
+    }
+
+    @MainActor
+    private func setupConversationProgressFeeds() {
+        // 使用 reduce 处理可能的重复 key，保留最后一个值
+        taskSessionProgressSnapshots = taskSessions.compactMap { session -> (String, ConversationProgressSnapshot)? in
+            guard let snapshot = taskSessionProgressSnapshot(for: session) else { return nil }
+            return (conversationProgressIdentity(for: session), snapshot)
+        }.reduce(into: [:]) { dict, pair in
+            dict[pair.0] = pair.1
+        }
+        
+        unifiedTaskProgressSnapshots = unifiedTaskManager.tasks.compactMap { task -> (String, ConversationProgressSnapshot)? in
+            guard let snapshot = unifiedTaskProgressSnapshot(for: task) else { return nil }
+            return (conversationProgressIdentity(for: task), snapshot)
+        }.reduce(into: [:]) { dict, pair in
+            dict[pair.0] = pair.1
+        }
+
+        $taskSessions
+            .receive(on: RunLoop.main)
+            .sink { [weak self] sessions in
+                Task { @MainActor in
+                    self?.syncTaskSessionProgressFeed(with: sessions)
+                }
+            }
+            .store(in: &cancellables)
+
+        unifiedTaskManager.$tasks
+            .receive(on: RunLoop.main)
+            .sink { [weak self] tasks in
+                Task { @MainActor in
+                    self?.syncUnifiedTaskProgressFeed(with: tasks)
+                }
+            }
+            .store(in: &cancellables)
     }
     
     // MARK: - 主要处理入口
@@ -150,7 +251,8 @@ class CommandRunner: ObservableObject {
         let contextualImages = resolveImagesForRequest(text: text, explicitImages: images)
 
         let envelope = await MainActor.run { () -> RequestEnvelope in
-            RequestEnvelope(
+            let activeBrowserSession = BrowserSessionStore.shared.activeSession
+            return RequestEnvelope(
                 originalText: text,
                 images: contextualImages,
                 sessionTopology: conversationControl.currentTopology(),
@@ -159,7 +261,13 @@ class CommandRunner: ObservableObject {
                 lastMessage: messages.last,
                 creationFlowActive: creationSkill.isInCreationFlow,
                 resumableTaskSessionID: latestResumableTaskSessionID(),
-                activeWorkflowDesignContext: activeWorkflowDesignContext()
+                activeWorkflowDesignContext: activeWorkflowDesignContext(),
+                activeBrowserSession: activeBrowserSession,
+                activeBrowserSnapshot: activeBrowserSession?.latestSnapshot,
+                activeBrowserObservation: activeBrowserSession?.latestObservation ??
+                    activeBrowserSession?.latestSnapshot.map(BrowserObservation.init(snapshot:)),
+                activeBrowserDelta: activeBrowserSession?.latestDelta,
+                activeBrowserPlannerState: activeBrowserSession?.plannerState
             )
         }
         let request = AssembledConversationContext(
@@ -199,7 +307,7 @@ class CommandRunner: ObservableObject {
         }
         
         // 5. 准备带记忆上下文的提示词
-        let (enhancedText, _) = await MainActor.run {
+        _ = await MainActor.run {
             prepareRequestWithMemory(
                 text: request.text,
                 systemPrompt: nil
@@ -231,7 +339,7 @@ class CommandRunner: ObservableObject {
     ) async {
         // MARK: - 启动执行链路日志
         let sessionID = plan.envelope.id.uuidString
-        await ExecutionLogger.shared.startSession(
+        _ = await ExecutionLogger.shared.startSession(
             id: sessionID,
             userRequest: plan.envelope.originalText
         )
@@ -262,6 +370,15 @@ class CommandRunner: ObservableObject {
         }
 
         switch plan.primaryAction {
+        case .cancelPendingFlow:
+            await cancelPendingFlow(plan)
+
+        case .startBrowserSession(let url, let originalInput):
+            await executeBrowserSessionStart(url: url, originalInput: originalInput)
+
+        case .continueBrowserSession(let sessionID, let input):
+            await executeBrowserSessionContinuation(sessionID: sessionID, input: input)
+
         case .continueAgentCreationFlow(let input):
             await creationSkill.handleInput(input, runner: self)
 
@@ -388,6 +505,17 @@ class CommandRunner: ObservableObject {
         case .handleAgentSuggestion(let suggestion, let input):
             await handleAgentSuggestion(suggestion, input: input, images: plan.envelope.images)
 
+        case .executeNativeSkill(let skillID, let parameters, let title):
+            await handleNativeSkillExecution(
+                plan: plan,
+                skillID: skillID,
+                parameters: parameters,
+                title: title
+            )
+
+        case .executeSubtaskPlan(let subtaskPlan, let originalInput):
+            await handlePlannedSubtasks(plan: plan, subtaskPlan: subtaskPlan, originalInput: originalInput)
+
         case .routeMainConversation(let input):
             await processCleanInput(input, images: plan.envelope.images, anchorMessageID: anchorMessageID)
             
@@ -410,6 +538,63 @@ class CommandRunner: ObservableObject {
                 delaySeconds: delaySeconds
             )
             await MainActor.run { isProcessing = false }
+            
+        // MARK: - Workflow 编排场景（新增）
+        case .requestWorkflowClarification(let candidate, let slots):
+            await handleWorkflowClarification(plan: plan, candidate: candidate, slots: slots)
+            
+        case .createWorkflowDraft(let candidate, let originalInput):
+            await handleWorkflowDraftCreation(plan: plan, candidate: candidate, originalInput: originalInput)
+            
+        case .startWorkflowRun(let definitionID, let initialContext):
+            await handleWorkflowStart(plan: plan, definitionOrDraftID: definitionID, initialContext: initialContext)
+            
+        case .continueWorkflowRun(let runID, let stepID, let userResponse):
+            LogInfo("继续 WorkflowRun: \(runID), 步骤: \(stepID ?? "next"), 用户响应: \(userResponse)")
+            await handleWorkflowContinuation(plan: plan, runID: runID, stepID: stepID, userResponse: userResponse)
+            
+        case .reflectWorkflowRun(let runID, let trigger):
+            // 反思 workflow run（通常由定时器触发，不直接回复用户）
+            LogInfo("反思 WorkflowRun: \(runID), 触发器: \(trigger.rawValue)")
+            // TODO: 调用 ReflectionPlanner
+            await MainActor.run { isProcessing = false }
+            
+        case .remindUserAboutWorkflow(let runID, let reason, let priority):
+            // 提醒用户关于 workflow
+            let priorityEmoji = priority == .critical ? "🔴" : priority == .high ? "🟡" : "🔵"
+            let message = "\(priorityEmoji) Workflow 提醒\n\(reason)"
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: message,
+                        timestamp: Date(),
+                        metadata: [
+                            "workflow_run_id": runID,
+                            "reminder_priority": String(priority.rawValue)
+                        ]
+                    )
+                )
+                isProcessing = false
+            }
+            
+        // MARK: - Phase 2: MCP 原生调度
+        case .executeMCPService(let serviceID, let operation, let parameters):
+            await executeMCPServiceDirectly(
+                plan: plan,
+                serviceID: serviceID,
+                operation: operation,
+                parameters: parameters
+            )
+            
+        case .executeNativeServiceLifecycle(let serviceID, let action, let title):
+            // 原生服务生命周期管理（占位实现）
+            LogInfo("[CommandRunner] 执行原生服务生命周期: \(serviceID) - \(action.rawValue)")
+            await MainActor.run {
+                appendSystemMessage("[\(title)] 服务 \(serviceID) \(action.rawValue) 操作已触发")
+                isProcessing = false
+            }
         }
     }
 
@@ -424,6 +609,873 @@ class CommandRunner: ObservableObject {
             "images=\(plan.envelope.images.count) notices=\(plan.notices.count) " +
             "reason=\(plan.reason)"
         )
+    }
+
+    private func handlePlannedSubtasks(
+        plan: RequestPlan,
+        subtaskPlan: SubtaskPlan,
+        originalInput: String
+    ) async {
+        let decomposition = await MainActor.run {
+            SubtaskCoordinator.shared.enqueuePlan(subtaskPlan)
+        }
+
+        let taskIDs = await MainActor.run {
+            decomposition.subtasks.compactMap { SubtaskCoordinator.shared.unifiedTaskID(forSubtaskID: $0.id) }
+        }
+
+        for taskID in taskIDs {
+            await unifiedTaskManager.startTask(id: taskID)
+        }
+
+        let subtaskTitles = decomposition.subtasks.prefix(3).map(\.title).joined(separator: " / ")
+        let moreSuffix = decomposition.subtasks.count > 3 ? " 等 \(decomposition.subtasks.count) 个子任务" : ""
+
+        await MainActor.run {
+            messages.append(
+                ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: "我已经把这个请求拆成 \(decomposition.subtasks.count) 个子任务并提交到任务中心开始执行：\(subtaskTitles)\(moreSuffix)。后续你可以在任务中心查看每个子任务的进展。",
+                    timestamp: Date(),
+                    metadata: [
+                        "subtask_parent_id": decomposition.parentTaskID,
+                        "subtask_count": String(decomposition.subtasks.count),
+                        "planner_action": plan.summary,
+                        "original_input": originalInput
+                    ]
+                )
+            )
+            isProcessing = false
+        }
+    }
+
+    private func handleNativeSkillExecution(
+        plan: RequestPlan,
+        skillID: String,
+        parameters: [String: String],
+        title: String
+    ) async {
+        do {
+            let registry = await MainActor.run { SkillAdapterRegistry.shared }
+            if await MainActor.run(body: { SkillCatalog.shared.find(byID: skillID) == nil }) {
+                await registry.syncToCatalog()
+            }
+
+            let executionParameters = Dictionary(uniqueKeysWithValues: parameters.map { key, value in
+                (key, value as Any)
+            })
+            let result = try await registry.execute(skillID: skillID, parameters: executionParameters)
+            let content = formatNativeSkillExecutionResult(
+                title: title,
+                skillID: skillID,
+                parameters: parameters,
+                result: result
+            )
+
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: content,
+                        timestamp: Date(),
+                        metadata: [
+                            "native_skill_id": skillID,
+                            "planner_action": plan.summary
+                        ].merging(parameters) { current, _ in current }
+                    )
+                )
+                isProcessing = false
+            }
+        } catch {
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: "原生执行链调用失败：\(error.localizedDescription)",
+                        timestamp: Date(),
+                        metadata: [
+                            "native_skill_id": skillID,
+                            "planner_action": plan.summary
+                        ]
+                    )
+                )
+                isProcessing = false
+            }
+        }
+    }
+
+    private func formatNativeSkillExecutionResult(
+        title: String,
+        skillID: String,
+        parameters: [String: String],
+        result: SkillExecutionResult
+    ) -> String {
+        let operation = parameters["operation"] ?? "invoke"
+        let endpoint = parameters["endpoint"] ?? (operation == "health" ? "默认健康检查" : "默认入口")
+
+        if !result.success {
+            let response = result.output?["response"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let response, !response.isEmpty {
+                return """
+                \(title)失败。
+
+                - Skill: \(skillID)
+                - 操作: \(operation)
+                - Endpoint: \(endpoint)
+                - 错误: \(result.error ?? "未知错误")
+
+                返回内容：
+                \(response)
+                """
+            }
+
+            return """
+            \(title)失败。
+
+            - Skill: \(skillID)
+            - 操作: \(operation)
+            - Endpoint: \(endpoint)
+            - 错误: \(result.error ?? "未知错误")
+            """
+        }
+
+        let response = result.output?["response"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let statusCode = result.output?["status_code"] ?? "200"
+        let serviceName = result.output?["service_name"] ?? skillID
+
+        if let response, !response.isEmpty {
+            return """
+            已通过原生执行链完成「\(serviceName)」\(operation == "health" ? "检查" : "调用")。
+
+            - Skill: \(skillID)
+            - 操作: \(operation)
+            - Endpoint: \(endpoint)
+            - HTTP: \(statusCode)
+
+            返回内容：
+            \(response)
+            """
+        }
+
+        return """
+        已通过原生执行链完成「\(serviceName)」\(operation == "health" ? "检查" : "调用")。
+
+        - Skill: \(skillID)
+        - 操作: \(operation)
+        - Endpoint: \(endpoint)
+        - HTTP: \(statusCode)
+        """
+    }
+
+    // MARK: - Phase 2: MCP 原生调度执行
+    
+    /// 直接执行 MCP 服务调用（不经过 LLM runtime）
+    private func executeMCPServiceDirectly(
+        plan: RequestPlan,
+        serviceID: String,
+        operation: String,
+        parameters: [String: String]
+    ) async {
+        let sessionID = plan.envelope.id.uuidString
+        
+        LogInfo("[CommandRunner] 直接执行 MCP 服务: serviceID=\(serviceID), operation=\(operation)")
+        
+        // 记录执行链路日志
+        await ExecutionLogger.shared.log(
+            sessionID: sessionID,
+            level: .info,
+            component: "MCPExecutor",
+            message: "直接执行 MCP 服务: \(serviceID)",
+            details: [
+                "service_id": serviceID,
+                "operation": operation,
+                "parameters": parameters.description
+            ]
+        )
+        
+        // 显示开始状态
+        await MainActor.run {
+            appendSystemMessage("🔧 正在调用 \(serviceID)...")
+        }
+        
+        do {
+            // 构建执行参数
+            var executionParameters: [String: Any] = [
+                "operation": operation
+            ]
+            
+            // 如果 parameters 不为空，根据 operation 构造合适的 endpoint 和 body
+            if !parameters.isEmpty {
+                switch operation {
+                case "search", "query":
+                    if let keyword = parameters["keyword"] {
+                        executionParameters["endpoint"] = "/api/search"
+                        executionParameters["method"] = "POST"
+                        executionParameters["body"] = ["query": keyword]
+                    }
+                case "trending":
+                    executionParameters["endpoint"] = "/api/trending/list"
+                    executionParameters["method"] = "GET"
+                default:
+                    // 默认使用 health check
+                    executionParameters["endpoint"] = "/health"
+                    executionParameters["method"] = "GET"
+                }
+            }
+            
+            // 直接调用 SkillAdapterRegistry
+            let result = try await SkillAdapterRegistry.shared.execute(
+                skillID: "mcp.\(serviceID)",
+                parameters: executionParameters
+            )
+            
+            // 格式化结果
+            let content: String
+            if result.success, let output = result.output {
+                let serviceName = output["service_name"] ?? serviceID
+                let responseText = output["response"] ?? "调用成功"
+                let statusCode = output["status_code"] ?? "200"
+                
+                content = """
+                ✅ MCP 服务调用成功
+
+                - 服务: \(serviceName)
+                - 操作: \(operation)
+                - 状态: HTTP \(statusCode)
+
+                返回结果：
+                \(responseText)
+                """
+            } else {
+                let errorMsg = result.error ?? "未知错误"
+                content = """
+                ❌ MCP 服务调用失败
+
+                - 服务: \(serviceID)
+                - 操作: \(operation)
+                - 错误: \(errorMsg)
+                """
+            }
+            
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: content,
+                        timestamp: Date(),
+                        metadata: [
+                            "mcp_service_id": serviceID,
+                            "mcp_operation": operation,
+                            "mcp_success": String(result.success)
+                        ]
+                    )
+                )
+                isProcessing = false
+            }
+            
+        } catch {
+            LogError("[CommandRunner] MCP 服务调用异常: \(error)")
+            
+            await MainActor.run {
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: """
+                        ❌ MCP 服务调用异常
+
+                        - 服务: \(serviceID)
+                        - 操作: \(operation)
+                        - 错误: \(error.localizedDescription)
+                        """,
+                        timestamp: Date(),
+                        metadata: [
+                            "mcp_service_id": serviceID,
+                            "mcp_operation": operation,
+                            "mcp_error": error.localizedDescription
+                        ]
+                    )
+                )
+                isProcessing = false
+            }
+        }
+    }
+
+    private func handleWorkflowClarification(
+        plan: RequestPlan,
+        candidate: WorkflowCandidate,
+        slots: [PlanningSlot]
+    ) async {
+        do {
+            let draft = try await upsertWorkflowDraftForClarification(
+                plan: plan,
+                candidate: candidate,
+                slots: slots
+            )
+            await presentWorkflowDraft(draft)
+        } catch {
+            await presentWorkflowError("创建 workflow 草稿失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func handleWorkflowDraftCreation(
+        plan: RequestPlan,
+        candidate: WorkflowCandidate,
+        originalInput: String
+    ) async {
+        do {
+            if let existingDraftID = plan.metadata[workflowDraftIDKey] {
+                let modificationInput = plan.metadata[workflowModificationInputKey] ?? plan.envelope.originalText
+                let normalized = RequestPlanningHeuristics.normalized(modificationInput)
+                let genericModifyRequests: Set<String> = ["修改", "调整", "改一下", "编辑", "优化"]
+
+                guard !genericModifyRequests.contains(normalized) else {
+                    await presentWorkflowError(
+                        "告诉我你想怎么改这个 workflow 草稿，例如“增加发送通知步骤”或“去掉保存记录”。",
+                        metadata: [
+                            workflowDraftIDKey: existingDraftID,
+                            pendingWorkflowDraftKey: "true"
+                        ]
+                    )
+                    return
+                }
+
+                let stepNames = RequestPlanningHeuristics.workflowStepsPreview(from: modificationInput)
+                let steps = stepNames.map { WorkflowStepDef(name: $0, kind: .action) }
+                let draft = try await updateWorkflowDraftSteps(draftID: existingDraftID, steps: steps)
+                await presentWorkflowDraft(
+                    draft,
+                    preface: "我已经根据你的补充更新了这个 workflow 草稿。"
+                )
+                return
+            }
+
+            let draft = try await createWorkflowDraft(candidate: candidate, originalInput: originalInput)
+            await presentWorkflowDraft(draft)
+        } catch {
+            await presentWorkflowError("生成 workflow 草稿失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func handleWorkflowStart(
+        plan: RequestPlan,
+        definitionOrDraftID: String,
+        initialContext: [String: String]
+    ) async {
+        do {
+            let definition = try await publishedWorkflowDefinitionIfNeeded(id: definitionOrDraftID)
+            let task = await MainActor.run {
+                unifiedTaskManager.createWorkflowTask(
+                    title: definition.name,
+                    description: definition.description,
+                    definitionID: definition.id,
+                    initialContext: initialContext
+                )
+            }
+            await unifiedTaskManager.startTask(id: task.id)
+
+            await MainActor.run {
+                if let lastMessage = plan.envelope.lastMessage,
+                   lastMessage.metadata?[workflowDraftIDKey] == definitionOrDraftID {
+                    resolvePendingControlMessage(
+                        lastMessage,
+                        content: "已发布 workflow 草稿「\(definition.name)」，并转入任务中心执行。"
+                    )
+                }
+
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: "已发布并启动 workflow「\(definition.name)」。你可以在任务中心查看进度，后续需要继续输入时也会回到主会话。",
+                        timestamp: Date(),
+                        metadata: [
+                            workflowDefinitionIDKey: definition.id,
+                            workflowTaskDefinitionIDKey: task.id
+                        ]
+                    )
+                )
+                isProcessing = false
+            }
+        } catch {
+            await presentWorkflowError("启动 workflow 失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func handleWorkflowContinuation(
+        plan: RequestPlan,
+        runID: String,
+        stepID: String?,
+        userResponse: String
+    ) async {
+        LogInfo("继续 WorkflowRun: \(runID), stepID=\(stepID ?? "next")")
+
+        let taskDefinitionID: String?
+        if let plannedTaskDefinitionID = plan.metadata[workflowTaskDefinitionIDKey] {
+            taskDefinitionID = plannedTaskDefinitionID
+        } else {
+            taskDefinitionID = await MainActor.run {
+                unifiedTaskManager.workflowTaskID(forRunID: runID)
+            }
+        }
+        let runState = await MainActor.run { WorkflowRunCoordinator.shared.runState(runID: runID) }
+
+        if runState?.pendingApproval != nil {
+            guard let approved = RequestPlanningHeuristics.workflowApprovalDecision(from: userResponse) else {
+                await presentWorkflowError(
+                    "当前 workflow 正在等待审批。请回复“确认”继续执行，或回复“拒绝”终止这一步。",
+                    metadata: workflowPendingMetadata(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        stepID: stepID,
+                        needsReplan: false,
+                        needsReplanPreview: false
+                    )
+                )
+                return
+            }
+
+            await MainActor.run {
+                WorkflowRunCoordinator.shared.handleApprovalResponse(
+                    runID: runID,
+                    approved: approved,
+                    response: userResponse
+                )
+            }
+
+            await MainActor.run {
+                if let lastMessage = plan.envelope.lastMessage,
+                   lastMessage.metadata?[workflowRunIDKey] == runID {
+                    resolvePendingControlMessage(
+                        lastMessage,
+                        content: approved ? "已批准该 workflow 步骤，继续执行中。" : "已拒绝该 workflow 步骤。"
+                    )
+                }
+
+                messages.append(
+                    ChatMessage(
+                        id: UUID(),
+                        role: .assistant,
+                        content: approved ? "我已经收到你的审批结果，workflow 正在继续执行。" : "我已经记录这次拒绝，并停止当前 workflow 步骤。",
+                        timestamp: Date(),
+                        metadata: workflowPendingMetadata(
+                            runID: runID,
+                            taskDefinitionID: taskDefinitionID,
+                            stepID: stepID,
+                            needsReplan: false,
+                            needsReplanPreview: false
+                        )
+                    )
+                )
+                isProcessing = false
+            }
+            return
+        }
+
+        if let pendingReplan = runState?.pendingReplan {
+            let explicitDecision = RequestPlanningHeuristics.workflowApprovalDecision(from: userResponse)
+            let hasAlternativeSteps = !RequestPlanningHeuristics.workflowStepsPreview(from: userResponse).isEmpty
+
+            if explicitDecision == true {
+                do {
+                    let appliedSteps = try await MainActor.run {
+                        try WorkflowRunCoordinator.shared.applyPreparedReplan(runID: runID)
+                    }
+
+                    await MainActor.run {
+                        if let lastMessage = plan.envelope.lastMessage,
+                           lastMessage.metadata?[workflowRunIDKey] == runID {
+                            resolvePendingControlMessage(
+                                lastMessage,
+                                content: "已确认这份新的 workflow 方案，正在继续执行。"
+                            )
+                        }
+
+                        messages.append(
+                            ChatMessage(
+                                id: UUID(),
+                                role: .assistant,
+                                content: "我已经应用新的 workflow 方案，后续会按 \(appliedSteps.count) 个更新后的步骤继续执行。",
+                                timestamp: Date(),
+                                metadata: workflowPendingMetadata(
+                                    runID: runID,
+                                    taskDefinitionID: taskDefinitionID,
+                                    stepID: appliedSteps.first?.id,
+                                    needsReplan: false,
+                                    needsReplanPreview: false
+                                )
+                            )
+                        )
+                        isProcessing = false
+                    }
+                } catch {
+                    await presentWorkflowError(
+                        "应用新的 workflow 规划失败：\(error.localizedDescription)",
+                        metadata: workflowPendingMetadata(
+                            runID: runID,
+                            taskDefinitionID: taskDefinitionID,
+                            stepID: stepID,
+                            needsReplan: true,
+                            needsReplanPreview: true
+                        )
+                    )
+                }
+                return
+            }
+
+            if explicitDecision == false && !hasAlternativeSteps {
+                await presentWorkflowError(
+                    "好的，这个新方案先不应用。直接告诉我你希望怎么调整后续步骤，我会重新给你一版方案预览。",
+                    metadata: workflowPendingMetadata(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        stepID: pendingReplan.sourceStepID ?? stepID,
+                        needsReplan: true,
+                        needsReplanPreview: false
+                    )
+                )
+                return
+            }
+
+            do {
+                let preview = try await MainActor.run {
+                    try WorkflowRunCoordinator.shared.prepareReplan(
+                        runID: runID,
+                        userInput: userResponse
+                    )
+                }
+
+                await MainActor.run {
+                    if let lastMessage = plan.envelope.lastMessage,
+                       lastMessage.metadata?[workflowRunIDKey] == runID {
+                        resolvePendingControlMessage(
+                            lastMessage,
+                            content: "已收到新的调整要求，我先生成了一版新的 workflow 方案预览。"
+                        )
+                    }
+                    presentWorkflowReplanPreview(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        preview: preview
+                    )
+                }
+            } catch {
+                await presentWorkflowError(
+                    "生成新的 workflow 方案预览失败：\(error.localizedDescription)",
+                    metadata: workflowPendingMetadata(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        stepID: stepID,
+                        needsReplan: true,
+                        needsReplanPreview: false
+                    )
+                )
+            }
+            return
+        }
+
+        if case .waitingUser(let detail)? = runState?.blockingReason,
+           detail.contains("需要重新规划") || plan.metadata[pendingWorkflowReplanKey] == "true" {
+            do {
+                let preview = try await MainActor.run {
+                    try WorkflowRunCoordinator.shared.prepareReplan(
+                        runID: runID,
+                        userInput: userResponse
+                    )
+                }
+
+                await MainActor.run {
+                    if let lastMessage = plan.envelope.lastMessage,
+                       lastMessage.metadata?[workflowRunIDKey] == runID {
+                        resolvePendingControlMessage(
+                            lastMessage,
+                            content: "已收到新的规划要求，我先生成了一版新的 workflow 方案预览。"
+                        )
+                    }
+
+                    presentWorkflowReplanPreview(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        preview: preview
+                    )
+                    isProcessing = false
+                }
+            } catch {
+                await presentWorkflowError(
+                    "更新 workflow 规划失败：\(error.localizedDescription)",
+                    metadata: workflowPendingMetadata(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        stepID: stepID,
+                        needsReplan: true,
+                        needsReplanPreview: false
+                    )
+                )
+            }
+            return
+        }
+
+        guard let taskDefinitionID else {
+            await presentWorkflowError("找不到要继续的 workflow 任务。")
+            return
+        }
+
+        await unifiedTaskManager.continueTask(id: taskDefinitionID, with: userResponse)
+        await MainActor.run {
+            messages.append(
+                ChatMessage(
+                    id: UUID(),
+                    role: .assistant,
+                    content: "我已经把你的补充发送给 workflow 任务，继续执行中。",
+                    timestamp: Date(),
+                    metadata: workflowPendingMetadata(
+                        runID: runID,
+                        taskDefinitionID: taskDefinitionID,
+                        stepID: stepID,
+                        needsReplan: false,
+                        needsReplanPreview: false
+                    )
+                )
+            )
+            isProcessing = false
+        }
+    }
+
+    private func workflowPendingMetadata(
+        runID: String,
+        taskDefinitionID: String?,
+        stepID: String?,
+        needsReplan: Bool,
+        needsReplanPreview: Bool
+    ) -> [String: String] {
+        var metadata: [String: String] = [
+            workflowRunIDKey: runID
+        ]
+        if let taskDefinitionID {
+            metadata[workflowTaskDefinitionIDKey] = taskDefinitionID
+        }
+        if let stepID {
+            metadata[workflowStepIDKey] = stepID
+        }
+        if needsReplan || needsReplanPreview {
+            metadata[pendingWorkflowRunKey] = "true"
+            metadata[pendingWorkflowReplanKey] = "true"
+        }
+        if needsReplanPreview {
+            metadata[pendingWorkflowReplanPreviewKey] = "true"
+        }
+        return metadata
+    }
+
+    @MainActor
+    private func createWorkflowDraft(
+        candidate: WorkflowCandidate,
+        originalInput: String
+    ) throws -> WorkflowDraft {
+        try WorkflowDraftService.shared.createDraft(from: candidate, originalInput: originalInput)
+    }
+
+    @MainActor
+    private func updateWorkflowDraftSteps(
+        draftID: String,
+        steps: [WorkflowStepDef]
+    ) throws -> WorkflowDraft {
+        try WorkflowDraftService.shared.updateDraftSteps(draftID: draftID, steps: steps)
+    }
+
+    @MainActor
+    private func upsertWorkflowDraftForClarification(
+        plan: RequestPlan,
+        candidate: WorkflowCandidate,
+        slots: [PlanningSlot]
+    ) throws -> WorkflowDraft {
+        if let draftID = plan.metadata[workflowDraftIDKey] {
+            return try WorkflowDraftService.shared.fillSlots(draftID: draftID, slots: slots)
+        }
+
+        return try WorkflowDraftService.shared.createDraft(
+            from: candidate,
+            originalInput: plan.envelope.originalText
+        )
+    }
+
+    @MainActor
+    private func publishedWorkflowDefinitionIfNeeded(id: String) throws -> WorkflowDefinition {
+        if let definition = WorkflowDefinitionStore.shared.definition(id: id) {
+            return definition
+        }
+
+        return try WorkflowDraftService.shared.publishDraft(draftID: id)
+    }
+
+    @MainActor
+    private func presentWorkflowDraft(
+        _ draft: WorkflowDraft,
+        preface: String? = nil
+    ) {
+        var contentSections: [String] = []
+        if let preface, !preface.isEmpty {
+            contentSections.append(preface)
+        }
+        contentSections.append(WorkflowDraftService.shared.generateNextStepsSuggestion(draft: draft))
+        if draft.status == .ready {
+            contentSections.append(WorkflowDraftService.shared.generateExecutionPreview(draft: draft))
+        }
+
+        var metadata: [String: String] = [
+            workflowDraftIDKey: draft.id,
+            "workflow_candidate": draft.name
+        ]
+        if draft.status == .ready {
+            metadata[pendingWorkflowDraftKey] = "true"
+        } else if !draft.missingSlots.isEmpty {
+            metadata[pendingWorkflowClarificationKey] = "true"
+        }
+
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: contentSections.joined(separator: "\n\n"),
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+        isProcessing = false
+    }
+
+    @MainActor
+    private func presentWorkflowError(
+        _ content: String,
+        metadata: [String: String]? = nil
+    ) {
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: content,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+        isProcessing = false
+    }
+
+    @MainActor
+    private func presentWorkflowApprovalRequest(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let runID = userInfo["runID"] as? String,
+              let message = userInfo["message"] as? String else {
+            return
+        }
+
+        let taskDefinitionID = unifiedTaskManager.workflowTaskID(forRunID: runID)
+        let stepID = (userInfo["approval"] as? PendingApproval)?.stepID
+        var metadata: [String: String] = [
+            pendingWorkflowRunKey: "true",
+            workflowRunIDKey: runID
+        ]
+        if let taskDefinitionID, !taskDefinitionID.isEmpty {
+            metadata[workflowTaskDefinitionIDKey] = taskDefinitionID
+        }
+        if let stepID, !stepID.isEmpty {
+            metadata[workflowStepIDKey] = stepID
+        }
+
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: message,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+        isProcessing = false
+    }
+
+    @MainActor
+    private func presentWorkflowReplanRequest(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let runID = userInfo["runID"] as? String,
+              let reason = userInfo["reason"] as? String else {
+            return
+        }
+
+        let taskDefinitionID = unifiedTaskManager.workflowTaskID(forRunID: runID)
+        let stepID = userInfo["stepID"] as? String
+        var metadata: [String: String] = [
+            pendingWorkflowRunKey: "true",
+            pendingWorkflowReplanKey: "true",
+            workflowRunIDKey: runID
+        ]
+        if let taskDefinitionID, !taskDefinitionID.isEmpty {
+            metadata[workflowTaskDefinitionIDKey] = taskDefinitionID
+        }
+        if let stepID, !stepID.isEmpty {
+            metadata[workflowStepIDKey] = stepID
+        }
+        let content = """
+        当前 workflow 需要重新规划。
+
+        原因：\(reason)
+
+        直接告诉我你希望怎么调整后续步骤，例如“改成先收集未读消息，再生成回复草稿，最后等我确认发送”。
+        """
+
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: content,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+        isProcessing = false
+    }
+
+    @MainActor
+    private func presentWorkflowReplanPreview(
+        runID: String,
+        taskDefinitionID: String?,
+        preview: PendingWorkflowReplan
+    ) {
+        let previewLines = preview.proposedSteps
+            .enumerated()
+            .map { "\($0.offset + 1). \($0.element.name)" }
+            .joined(separator: "\n")
+        let content = """
+        我根据你的补充先生成了一版新的 workflow 方案预览：
+
+        \(previewLines)
+
+        如果你确认，就回复“确认”或“按这个执行”；如果还要改，直接继续描述你希望怎么调整。
+        """
+
+        var metadata = workflowPendingMetadata(
+            runID: runID,
+            taskDefinitionID: taskDefinitionID,
+            stepID: preview.proposedSteps.first?.id ?? preview.sourceStepID,
+            needsReplan: true,
+            needsReplanPreview: true
+        )
+        metadata[workflowDraftIDKey] = preview.draftID
+
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: content,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+        isProcessing = false
     }
 
     private func presentProjectSkillOverview() async {
@@ -501,13 +1553,13 @@ class CommandRunner: ObservableObject {
                 sections.append("2. 已就绪的扩展 Skills\n• 当前还没有可直接运行的外部 Skill。")
             } else {
                 sections.append(
-                    "2. 已就绪的扩展 Skills（\(eligibleSkills.count) 个）\n\(groupedOpenClawSkillSummary(for: eligibleSkills))"
+                    "2. 已就绪的扩展 Skills（\(eligibleSkills.count) 个）\n\(groupedSkillSummary(for: eligibleSkills))"
                 )
             }
 
             if !unavailableSkills.isEmpty {
                 sections.append(
-                    "3. 还没就绪的扩展 Skills（\(unavailableSkills.count) 个）\n\(unavailableOpenClawSkillSummary(for: unavailableSkills))"
+                    "3. 还没就绪的扩展 Skills（\(unavailableSkills.count) 个）\n\(unavailableSkillSummary(for: unavailableSkills))"
                 )
             } else {
                 sections.append("3. 环境状态\n• 当前已检测到的扩展 Skills 都满足运行条件。")
@@ -525,15 +1577,15 @@ class CommandRunner: ObservableObject {
             return sections.joined(separator: "\n\n")
         } catch {
             LogWarning(
-                "OpenClaw skills overview fallback triggered error=\(error.localizedDescription)"
+                "Skills overview fallback triggered error=\(error.localizedDescription)"
             )
             return projectSkillOverviewMessage()
         }
     }
 
-    private func fetchSkillsStatusForOverview(timeoutSeconds: Double) async throws -> OpenClawSkillsStatusReport {
+    private func fetchSkillsStatusForOverview(timeoutSeconds: Double) async throws -> SkillsStatusReport {
         let runtimeAdapter = self.runtimeAdapter
-        return try await withThrowingTaskGroup(of: OpenClawSkillsStatusReport.self) { group in
+        return try await withThrowingTaskGroup(of: SkillsStatusReport.self) { group in
             group.addTask {
                 try await runtimeAdapter.skillsStatus()
             }
@@ -639,7 +1691,7 @@ class CommandRunner: ObservableObject {
         • 影子对比：\(shadowStatus)
         • Dispatcher：已启用，会决定主会话 / side task
         • Local System Guard：已启用，只在高置信度系统操作时才会本地截走
-        • Self-heal：已启用，负责 Agent 回退、Kimi CLI 登录恢复和 OpenClaw 自愈
+        • Self-heal：已启用，负责 Agent 回退和 Kimi CLI 登录恢复
 
         你现在可以直接在面板里切换：
         • 规则优先
@@ -667,22 +1719,22 @@ class CommandRunner: ObservableObject {
         }
     }
 
-    private func groupedOpenClawSkillSummary(for skills: [OpenClawSkillStatus]) -> String {
-        let grouped = Dictionary(grouping: skills, by: openClawSkillGroupTitle(for:))
+    private func groupedSkillSummary(for skills: [SkillStatus]) -> String {
+        let grouped = Dictionary(grouping: skills, by: skillGroupTitle(for:))
         let orderedTitles = ["开发与仓库", "系统与运维", "内容与平台", "信息查询", "扩展工具"]
 
         return orderedTitles.compactMap { title -> String? in
             guard let groupSkills = grouped[title], !groupSkills.isEmpty else { return nil }
             let lines = groupSkills
                 .sorted(by: { $0.name < $1.name })
-                .map { "• `\($0.name)`: \(friendlyOpenClawSummary(for: $0))" }
+                .map { "• `\($0.name)`: \(friendlySummary(for: $0))" }
                 .joined(separator: "\n")
             return "\(title)\n\(lines)"
         }
         .joined(separator: "\n\n")
     }
 
-    private func unavailableOpenClawSkillSummary(for skills: [OpenClawSkillStatus]) -> String {
+    private func unavailableSkillSummary(for skills: [SkillStatus]) -> String {
         let missingDependencies = Array(
             Set(
                 skills.flatMap { skill in
@@ -722,7 +1774,7 @@ class CommandRunner: ObservableObject {
         """
     }
 
-    private func openClawSkillGroupTitle(for skill: OpenClawSkillStatus) -> String {
+    private func skillGroupTitle(for skill: SkillStatus) -> String {
         let haystack = "\(skill.name) \(skill.description)".lowercased()
 
         if haystack.contains("weather") || haystack.contains("forecast") || haystack.contains("temperature") {
@@ -744,7 +1796,7 @@ class CommandRunner: ObservableObject {
         return "扩展工具"
     }
 
-    private func friendlyOpenClawSummary(for skill: OpenClawSkillStatus) -> String {
+    private func friendlySummary(for skill: SkillStatus) -> String {
         switch skill.name {
         case "coding-agent":
             return "复杂编码任务、重构和 PR 处理"
@@ -920,7 +1972,7 @@ class CommandRunner: ObservableObject {
             continuingExistingSession: true
         )
 
-        await MainActor.run {
+        _ = await MainActor.run {
             appendTaskSessionMessage(
                 sessionID: sessionID,
                 role: .user,
@@ -1057,7 +2109,7 @@ class CommandRunner: ObservableObject {
 
         要求：
         - 只围绕当前用户需求，不要默认股票、富途、交易等旧场景。
-        - 不要提内部路由、主会话、子会话、OpenClaw 等实现细节。
+        - 不要提内部路由、主会话、子会话等实现细节。
         - 用中文直接输出可读方案。
         \(continuingExistingSession ? "- 这次是在继续细化已有方案，请吸收用户这次补充，输出更新后的完整版本，避免只给零散补丁。" : "")
         """
@@ -1712,6 +2764,183 @@ class CommandRunner: ObservableObject {
     }
 
     @MainActor
+    private func cancelPendingFlow(_ plan: RequestPlan) {
+        var cancelledItems: [String] = []
+        func record(_ label: String) {
+            guard !cancelledItems.contains(label) else { return }
+            cancelledItems.append(label)
+        }
+
+        if creationSkill.isInCreationFlow {
+            creationSkill.cancel()
+            record("Agent 创建流程")
+        }
+
+        if let browserLabel = BrowserSessionCoordinator.shared.cancelPendingFlow(
+            sessionID: plan.envelope.activeBrowserSession?.id ??
+                plan.envelope.lastMessage?.metadata?[BrowserConversationMetadataKeys.pendingSessionID]
+        ) {
+            record(browserLabel)
+        }
+
+        if let lastMessage = plan.envelope.lastMessage,
+           let label = resolvePendingFlowCancellation(for: lastMessage) {
+            record(label)
+        }
+
+        if plan.envelope.activeWorkflowDesignContext != nil,
+           plan.envelope.lastMessage?.metadata?[pendingWorkflowDesignKey] != "true" {
+            record("独立规划跟进")
+        }
+
+        let content: String
+        if cancelledItems.isEmpty {
+            content = "主会话没有检测到仍在等待处理的挂起流程，继续普通对话。"
+        } else {
+            content = "主会话已取消\(cancelledItems.joined(separator: "、"))，继续普通对话。"
+        }
+
+        messages.append(
+            ChatMessage(
+                id: UUID(),
+                role: .assistant,
+                content: content,
+                timestamp: Date(),
+                agentId: "builtin-main-session-guard",
+                agentName: "主会话"
+            )
+        )
+        isProcessing = false
+    }
+
+    @MainActor
+    private func executeBrowserSessionStart(url: String, originalInput: String) async {
+        let messages = await BrowserSessionCoordinator.shared.startSession(
+            url: url,
+            originalInput: originalInput
+        )
+        for message in messages {
+            self.messages.append(message)
+        }
+        isProcessing = false
+    }
+
+    @MainActor
+    private func executeBrowserSessionContinuation(sessionID: String, input: String) async {
+        let messages = await BrowserSessionCoordinator.shared.continueSession(
+            sessionID: sessionID,
+            userInput: input
+        )
+        for message in messages {
+            self.messages.append(message)
+        }
+        isProcessing = false
+    }
+
+    @MainActor
+    private func resolvePendingFlowCancellation(for message: ChatMessage) -> String? {
+        if message.metadata?[initialSetupPromptKey] == "true" {
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次初始化配置提醒，主会话继续。"
+            )
+            return "初始化配置提醒"
+        }
+
+        if let pendingSwitchAgentID = message.metadata?["pending_switch"] {
+            let agentName = agentStore.agent(withId: pendingSwitchAgentID)?.displayName ?? "目标 Agent"
+            resolvePendingControlMessage(
+                message,
+                content: "已取消切换到 \(agentName) 的建议，继续保留当前主会话。"
+            )
+            return "Agent 切换建议"
+        }
+
+        if message.metadata?["pending_skill_evolution_id"] != nil {
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次 Skill 优化提案确认，主会话继续。"
+            )
+            return "Skill 优化提案"
+        }
+
+        if message.metadata?[pendingWorkflowDesignKey] == "true" {
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次业务规划引导，主会话继续。"
+            )
+            return "业务规划引导"
+        }
+
+        if let draftID = message.metadata?[workflowDraftIDKey],
+           (
+            message.metadata?[pendingWorkflowClarificationKey] == "true" ||
+            message.metadata?[pendingWorkflowDraftKey] == "true"
+           ) {
+            try? WorkflowDraftService.shared.discardDraft(draftID: draftID)
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次 workflow 草稿创建，主会话继续。"
+            )
+            return "Workflow 草稿创建"
+        }
+
+        if let workflowRunID = message.metadata?[workflowRunIDKey],
+           message.metadata?[pendingWorkflowRunKey] == "true" {
+            if let draftID = message.metadata?[workflowDraftIDKey] {
+                try? WorkflowDraftService.shared.discardDraft(draftID: draftID)
+            }
+            WorkflowRunCoordinator.shared.cancelWorkflow(runID: workflowRunID)
+            resolvePendingControlMessage(
+                message,
+                content: "已取消当前 workflow 的等待流程，主会话继续。"
+            )
+            return "Workflow 等待流程"
+        }
+
+        if message.metadata?[BrowserConversationMetadataKeys.pendingSessionID] != nil {
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次网页协同流程，主会话继续。"
+            )
+            return "网页协同流程"
+        }
+
+        if let suggestion = message.detectedSkillSuggestion {
+            resolveDetectedSkillSuggestionMessage(
+                messageID: message.id,
+                content: "已取消这次 \(suggestion.skill.name) 建议，主会话继续。"
+            )
+            return "\(suggestion.skill.name) 建议"
+        }
+
+        if let pendingSkill = message.metadata?["pending_skill"],
+           let skill = AISkill(rawValue: pendingSkill) {
+            resolvePendingControlMessage(
+                message,
+                content: "已取消这次 \(skill.name) 建议，主会话继续。"
+            )
+            return "\(skill.name) 建议"
+        }
+
+        return nil
+    }
+
+    @MainActor
+    private func resolvePendingControlMessage(_ message: ChatMessage, content: String) {
+        replaceMessage(
+            id: message.id,
+            with: ChatMessage(
+                id: message.id,
+                role: .system,
+                content: content,
+                timestamp: message.timestamp,
+                linkedTaskSessionID: message.linkedTaskSessionID
+            )
+        )
+    }
+
+    @MainActor
     private func resolveDetectedSkillSuggestionMessage(messageID: UUID, content: String) {
         guard let index = messages.firstIndex(where: { $0.id == messageID }) else { return }
         let timestamp = messages[index].timestamp
@@ -1748,7 +2977,7 @@ class CommandRunner: ObservableObject {
         let sessionID = anchorMessageID.uuidString
         
         // 启动执行链路日志
-        await ExecutionLogger.shared.startSession(
+        _ = await ExecutionLogger.shared.startSession(
             id: sessionID,
             userRequest: text
         )
@@ -1758,13 +2987,13 @@ class CommandRunner: ObservableObject {
                 anchorMessageID: anchorMessageID,
                 agentName: agent.displayName,
                 intentName: intent.displayName,
-                summary: "OpenClaw 正在把这次请求交给 \(agent.displayName)",
+                summary: "原生运行时正在把这次请求交给 \(agent.displayName)",
                 sessionID: sessionID
             )
         }
         
-        // 发送给 OpenClaw
-        await sendToOpenClaw(
+        // 发送给运行时适配器（默认原生，必要时回退到兼容层）
+        await sendToRuntime(
             agent: agent,
             text: text,
             images: images,
@@ -1851,9 +3080,9 @@ class CommandRunner: ObservableObject {
         }
     }
     
-    // MARK: - OpenClaw 集成
+    // MARK: - 运行时适配器
     
-    private func sendToOpenClaw(
+    private func sendToRuntime(
         agent: Agent,
         text: String,
         images: [String],
@@ -1916,7 +3145,7 @@ class CommandRunner: ObservableObject {
             await ExecutionLogger.shared.log(
                 sessionID: logSessionID,
                 level: .info,
-                component: "OpenClaw",
+                component: "RuntimeAdapter",
                 message: "开始发送请求",
                 details: [
                     "agent": agent.name,
@@ -1924,24 +3153,27 @@ class CommandRunner: ObservableObject {
                 ]
             )
             
+            LogInfo("[CommandRunner] 请求交由 \(type(of: runtimeAdapter)) 处理")
+            
             let fullContent = try await sendViaGateway(
                 agent: agent,
                 sessionKey: mainSession.mainSessionKey,
                 sessionLabel: mainSession.mainSessionLabel,
                 text: text,
                 images: images,
-                assistantMessageID: assistantMessage.id
+                assistantMessageID: assistantMessage.id,
+                traceID: traceID
             )
             
             let duration = Date().timeIntervalSince(startTime)
             logger.logSystemResponse(fullContent, agent: agent)
-            logger.logPerformance(operation: "openclaw_request", duration: duration)
+            logger.logPerformance(operation: "runtime_request", duration: duration)
             
             // 记录成功完成
             await ExecutionLogger.shared.log(
                 sessionID: logSessionID,
                 level: .success,
-                component: "OpenClaw",
+                component: "Runtime",
                 message: "请求处理完成",
                 details: ["duration": "\(String(format: "%.2f", duration))s"]
             )
@@ -1962,7 +3194,7 @@ class CommandRunner: ObservableObject {
             }
             
         } catch {
-            logger.logError(error, context: "发送请求到 OpenClaw")
+            logger.logError(error, context: "运行时请求失败")
 
             var terminalError = error
             var terminalAgent = agent
@@ -2011,6 +3243,25 @@ class CommandRunner: ObservableObject {
                         ),
                         content: "⏳ \(fallbackAgent.name) 正在继续处理..."
                     )
+                    
+                    // 同步到主会话：Agent 回退
+                    let fallbackReason = UserFacingErrorFormatter.recoveryFailureSummary(for: error)
+                    upsertConversationProgressMessage(
+                        key: "agent_fallback_\(assistantMessage.id)",
+                        content: "**\(agent.displayName)** \(fallbackReason)，正在切换到 **\(fallbackAgent.name)** 继续处理...",
+                        agentID: fallbackAgent.id,
+                        agentName: fallbackAgent.name,
+                        metadata: [
+                            "message_key": "agent_fallback_\(assistantMessage.id)",
+                            "is_progress_update": "true",
+                            "progress_source": "agent_fallback",
+                            "from_agent": agent.id,
+                            "from_agent_name": agent.displayName,
+                            "to_agent": fallbackAgent.id,
+                            "to_agent_name": fallbackAgent.name,
+                            "fallback_reason": fallbackReason
+                        ]
+                    )
                 }
 
                 do {
@@ -2021,7 +3272,8 @@ class CommandRunner: ObservableObject {
                         sessionLabel: mainSession.mainSessionLabel,
                         text: text,
                         images: images,
-                        assistantMessageID: assistantMessage.id
+                        assistantMessageID: assistantMessage.id,
+                        traceID: traceID
                     )
 
                     let duration = Date().timeIntervalSince(startTime)
@@ -2071,11 +3323,23 @@ class CommandRunner: ObservableObject {
                 agentName: terminalAgent.displayName,
                 providerName: terminalAgent.provider.displayName
             )
+
+            if isKimiCLIAuthenticationFailure(terminalError, agent: terminalAgent) {
+                await finalizeMainConversationFailure(
+                    assistantMessage: assistantMessage,
+                    traceID: traceID,
+                    logSessionID: logSessionID,
+                    agent: terminalAgent,
+                    error: terminalError,
+                    message: baseUserFacingMessage,
+                    isRecoverable: false  // 认证失败不可自动恢复
+                )
+                return
+            }
             
             // 如果是流中断，让Planner做智能决策
             var finalMessage = baseUserFacingMessage
             var shouldScheduleBackgroundRecovery = false
-            var backgroundRecoveryDelay = 10
             
             // MARK: - 方案C：Planner驱动的异常处理决策
             // 对所有错误类型都进行Planner决策，并创建可恢复的任务会话
@@ -2104,13 +3368,11 @@ class CommandRunner: ObservableObject {
             case .scheduleBackgroundRecovery(let delay):
                 // 安排后台恢复（方案A：兜底）
                 shouldScheduleBackgroundRecovery = true
-                backgroundRecoveryDelay = delay
                 finalMessage = baseUserFacingMessage + "\n\n⏱️ 已安排在\(delay)秒后自动检查恢复，你也可以点击「继续处理」立即恢复。"
                 
             case .convertToBackgroundTask:
                 // 转为后台任务
                 shouldScheduleBackgroundRecovery = true
-                backgroundRecoveryDelay = 5
                 finalMessage = baseUserFacingMessage + "\n\n🔄 这是一个可能需要较长时间的任务，已转为后台继续执行，完成后会通知你。"
                 
             case .promptCheckStatus:
@@ -2137,34 +3399,43 @@ class CommandRunner: ObservableObject {
                 )
             )
             await ExceptionHandlingPlanner.shared.executeDecision(decision, scenario: scenario, runner: self)
+
+            let recoveryTaskTitle = text.prefix(30).description + (text.count > 30 ? "..." : "")
+            let recoveryErrorMessage = shouldScheduleBackgroundRecovery
+                ? "已安排后台自动恢复，或点击「继续处理」立即重试"
+                : "点击「继续处理」重试"
+            let terminalAgentID = terminalAgent.id
+            let terminalAgentName = terminalAgent.name
+            let terminalErrorDescription = terminalError.localizedDescription
+            let mainSessionKey = mainSession.mainSessionKey
+            let statusSummary = finalMessage
+            let taskStatus: TaskSessionStatus = shouldScheduleBackgroundRecovery ? .partial : .waitingUser
             
             // MARK: - 创建可恢复的任务会话
             // 对所有异常都创建任务卡片，让用户可以「继续处理」
             await MainActor.run {
                 // 生成唯一的任务会话ID（使用时间戳避免冲突）
-                let taskSessionID = "\(mainSession.mainSessionKey)-\(Int(Date().timeIntervalSince1970))"
+                let taskSessionID = "\(mainSessionKey)-\(Int(Date().timeIntervalSince1970))"
                 
                 // [迁移] 同时创建统一任务（新的统一任务系统）
                 let unifiedTask = UnifiedTaskManager.shared.createExceptionRecoveryTask(
-                    title: text.prefix(30).description + (text.count > 30 ? "..." : ""),
+                    title: recoveryTaskTitle,
                     originalRequest: text,
-                    errorMessage: shouldScheduleBackgroundRecovery
-                        ? "已安排后台自动恢复，或点击「继续处理」立即重试"
-                        : "点击「继续处理」重试",
-                    gatewaySessionKey: mainSession.mainSessionKey,
+                    errorMessage: recoveryErrorMessage,
+                    gatewaySessionKey: mainSessionKey,
                     messages: [
                         TaskMessage(
                             id: UUID(),
                             role: .user,
                             content: text,
                             timestamp: Date(),
-                            agentID: terminalAgent.id,
-                            agentName: terminalAgent.name
+                            agentID: terminalAgentID,
+                            agentName: terminalAgentName
                         ),
                         TaskMessage(
                             id: UUID(),
                             role: .system,
-                            content: "请求处理中断: \(terminalError.localizedDescription)",
+                            content: "请求处理中断: \(terminalErrorDescription)",
                             timestamp: Date(),
                             agentID: nil,
                             agentName: nil
@@ -2176,11 +3447,11 @@ class CommandRunner: ObservableObject {
                 // [兼容] 保留旧版AgentTaskSession供过渡期间使用
                 let taskSession = AgentTaskSession(
                     id: taskSessionID,
-                    title: text.prefix(30).description + (text.count > 30 ? "..." : ""),
+                    title: recoveryTaskTitle,
                     originalRequest: text,
-                    status: shouldScheduleBackgroundRecovery ? .partial : .waitingUser,
-                    statusSummary: finalMessage,
-                    mainAgentName: terminalAgent.name,
+                    status: taskStatus,
+                    statusSummary: statusSummary,
+                    mainAgentName: terminalAgentName,
                     intentName: "异常恢复",
                     messages: [
                         TaskSessionMessage(
@@ -2192,14 +3463,12 @@ class CommandRunner: ObservableObject {
                         TaskSessionMessage(
                             id: UUID(),
                             role: .system,
-                            content: "请求处理中断: \(terminalError.localizedDescription)",
+                            content: "请求处理中断: \(terminalErrorDescription)",
                             timestamp: Date()
                         )
                     ],
-                    errorMessage: shouldScheduleBackgroundRecovery 
-                        ? "已安排后台自动恢复，或点击「继续处理」立即重试"
-                        : "点击「继续处理」重试",
-                    gatewaySessionKey: mainSession.mainSessionKey,
+                    errorMessage: recoveryErrorMessage,
+                    gatewaySessionKey: mainSessionKey,
                     canResume: true
                 )
                 self.taskSessions.append(taskSession)
@@ -2210,38 +3479,63 @@ class CommandRunner: ObservableObject {
                 self.objectWillChange.send()
             }
             
-            let terminalAgentID = terminalAgent.id
-            let terminalAgentName = terminalAgent.name
-            
-            // 记录异常结束
-            await ExecutionLogger.shared.logError(
-                sessionID: logSessionID,
-                component: "CommandRunner",
+            await finalizeMainConversationFailure(
+                assistantMessage: assistantMessage,
+                traceID: traceID,
+                logSessionID: logSessionID,
+                agent: terminalAgent,
                 error: terminalError,
-                context: "请求处理失败"
+                message: finalMessage,
+                isRecoverable: true  // 已创建恢复任务，是可恢复的
             )
-            await ExecutionLogger.shared.endSession(
-                id: logSessionID,
-                status: .failed
-            )
-            
-            await MainActor.run {
-                if let traceID {
+        }
+    }
+
+    private func finalizeMainConversationFailure(
+        assistantMessage: ChatMessage,
+        traceID: UUID?,
+        logSessionID: String,
+        agent: Agent,
+        error: Error,
+        message: String,
+        isRecoverable: Bool = false
+    ) async {
+        await ExecutionLogger.shared.logError(
+            sessionID: logSessionID,
+            component: "CommandRunner",
+            error: error,
+            context: isRecoverable ? "请求处理中断（可恢复）" : "请求处理失败"
+        )
+        await ExecutionLogger.shared.endSession(
+            id: logSessionID,
+            status: isRecoverable ? .interrupted : .failed
+        )
+
+        await MainActor.run {
+            if let traceID {
+                if isRecoverable {
+                    // 可恢复错误：Trace 标记为中断状态，而不是失败
+                    updateExecutionTrace(
+                        traceID: traceID,
+                        state: .failed,
+                        summary: "请求处理中断，已创建恢复任务"
+                    )
+                } else {
                     failExecutionTrace(traceID: traceID, summary: "这次请求处理失败")
                 }
-                upsertAssistantMessage(
-                    template: ChatMessage(
-                        id: assistantMessage.id,
-                        role: .assistant,
-                        content: finalMessage,
-                        timestamp: assistantMessage.timestamp,
-                        agentId: terminalAgentID,
-                        agentName: terminalAgentName
-                    ),
-                    content: finalMessage
-                )
-                isProcessing = false
             }
+            upsertAssistantMessage(
+                template: ChatMessage(
+                    id: assistantMessage.id,
+                    role: .assistant,
+                    content: message,
+                    timestamp: assistantMessage.timestamp,
+                    agentId: agent.id,
+                    agentName: agent.name
+                ),
+                content: message
+            )
+            isProcessing = false
         }
     }
 
@@ -2509,19 +3803,21 @@ class CommandRunner: ObservableObject {
         conversationControl.currentTopology().taskSessionKey(for: sessionID)
     }
 
-    private func gatewaySessionLabel(forTaskSessionID sessionID: String, baseLabel: String?) -> String? {
+    private func gatewaySessionLabel(forTaskSessionID sessionID: String, baseLabel: String?, isResume: Bool = false) -> String? {
         guard let baseLabel = baseLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
               !baseLabel.isEmpty else {
             return nil
         }
-        return OpenClawGatewayClient.uniqueSessionLabel(base: baseLabel, uniqueSource: sessionID)
+        // 恢复任务时添加恢复标识，确保 label 唯一
+        let effectiveBase = isResume ? "\(baseLabel) (恢复)" : baseLabel
+        return "\(effectiveBase)-\(sessionID)"
     }
 
     private func directKimiCLIFallbackPolicy(after error: Error) -> DirectKimiCLIFallbackPolicy {
         if UserFacingErrorFormatter.isStreamInterruptedError(error) {
             return DirectKimiCLIFallbackPolicy(
                 timeout: directKimiCLIInterruptedStreamFallbackTimeout,
-                statusSummary: "OpenClaw 长时间没有回传完整结果，已切换到直连 Kimi CLI 快速补结果",
+                statusSummary: "主运行时长时间没有回传完整结果，已切换到直连 Kimi CLI 快速补结果",
                 logReason: "stream_interrupted"
             )
         }
@@ -2529,7 +3825,7 @@ class CommandRunner: ObservableObject {
         if UserFacingErrorFormatter.isTransientServiceError(error) {
             return DirectKimiCLIFallbackPolicy(
                 timeout: directKimiCLIFallbackTimeout,
-                statusSummary: "OpenClaw 当前不可用，已切换到直连 Kimi CLI",
+                statusSummary: "主运行时当前不可用，已切换到直连 Kimi CLI",
                 logReason: "transient_gateway_failure"
             )
         }
@@ -2558,7 +3854,8 @@ class CommandRunner: ObservableObject {
         text: String,
         images: [String],
         taskSessionID: String? = nil,
-        assistantMessageID: UUID
+        assistantMessageID: UUID,
+        traceID: UUID? = nil
     ) async throws -> String {
         // MARK: - Memory Context Injection
         // 秘书的基本职责：记住上下文，在发送前增强提示词
@@ -2568,6 +3865,19 @@ class CommandRunner: ObservableObject {
                 sessionID: taskSessionID ?? sessionKey,
                 systemPrompt: nil
             )
+        }
+        
+        // 更新 Trace：开始发送
+        if let traceID = traceID {
+            await MainActor.run {
+                self.updateTraceStep(
+                    traceID: traceID,
+                    step: "建立连接",
+                    details: "正在与 \(agent.displayName) 建立会话",
+                    progress: 10,
+                    log: "[→] 请求发送中..."
+                )
+            }
         }
         
         do {
@@ -2582,6 +3892,9 @@ class CommandRunner: ObservableObject {
                 onAssistantText: { [weak self] partialText in
                     guard let self else { return }
                     guard self.gatewayReturnedError(partialText) == nil else { return }
+                    
+                    let textLength = partialText.count
+                    
                     if let taskSessionID {
                         await MainActor.run {
                             self.updateTaskSessionMessage(
@@ -2592,7 +3905,7 @@ class CommandRunner: ObservableObject {
                             self.updateTaskSessionStatus(
                                 sessionID: taskSessionID,
                                 status: .running,
-                                summary: "\(agent.displayName) 正在通过 OpenClaw 持续输出结果"
+                                summary: "\(agent.displayName) 正在持续输出结果"
                             )
                         }
                     } else {
@@ -2600,8 +3913,37 @@ class CommandRunner: ObservableObject {
                             self.updateAssistantMessage(id: assistantMessageID, content: partialText)
                         }
                     }
+                    
+                    // 更新 Trace：接收流式输出
+                    if let traceID = traceID {
+                        await MainActor.run {
+                            let progress = min(10 + (textLength / 100), 90)
+                            let displayText = partialText.suffix(100)
+                            self.updateExecutionTrace(
+                                traceID: traceID,
+                                currentStep: "接收响应",
+                                stepDetails: "已接收 \(textLength) 字符",
+                                partialOutput: String(displayText),
+                                progressPercent: progress,
+                                addLog: (.info, "[←] 已接收 \(textLength) 字符")
+                            )
+                        }
+                    }
                 }
             )
+            
+            // 更新 Trace：完成
+            if let traceID = traceID {
+                await MainActor.run {
+                    self.updateTraceStep(
+                        traceID: traceID,
+                        step: "完成",
+                        details: "请求处理完成",
+                        progress: 100,
+                        log: "[✓] 请求完成"
+                    )
+                }
+            }
 
             if let surfacedError = gatewayReturnedError(content) {
                 throw surfacedError
@@ -2683,7 +4025,7 @@ class CommandRunner: ObservableObject {
         let upstreamError = compactErrorDescription(error)
 
         LogWarning(
-            "OpenClaw fallback -> direct Kimi CLI start " +
+            "Runtime fallback -> direct Kimi CLI start " +
             "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
             "timeout=\(Int(policy.timeout))s reason=\(policy.logReason) upstreamError=\(upstreamError)"
         )
@@ -2718,7 +4060,7 @@ class CommandRunner: ObservableObject {
                 attachments: images,
                 sessionKey: sessionKey,
                 timeout: policy.timeout,
-                requestSource: "openclaw-fallback:\(policy.logReason)",
+                requestSource: "runtime-fallback:\(policy.logReason)",
                 systemPrompt: systemPrompt  // Phase 4: 传递系统提示词
             )
             let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2726,7 +4068,7 @@ class CommandRunner: ObservableObject {
                 : content
 
             LogInfo(
-                "OpenClaw fallback -> direct Kimi CLI success " +
+                "Runtime fallback -> direct Kimi CLI success " +
                 "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
                 "timeout=\(Int(policy.timeout))s contentLength=\(resolvedContent.count)"
             )
@@ -2746,7 +4088,7 @@ class CommandRunner: ObservableObject {
             return resolvedContent
         } catch {
             LogError(
-                "OpenClaw fallback -> direct Kimi CLI failed " +
+                "Runtime fallback -> direct Kimi CLI failed " +
                 "agent=\(agent.id) sessionKey=\(sessionKey) target=\(fallbackTarget) " +
                 "timeout=\(Int(policy.timeout))s reason=\(policy.logReason) upstreamError=\(upstreamError)",
                 error: error
@@ -2916,29 +4258,6 @@ class CommandRunner: ObservableObject {
     }
 
     @MainActor
-    private func appendTaskSessionMessage(
-        sessionID: String,
-        role: MessageRole,
-        content: String,
-        agentName: String? = nil
-    ) -> UUID {
-        let message = TaskSessionMessage(
-            role: role,
-            content: content,
-            agentName: agentName
-        )
-        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else {
-            return message.id
-        }
-        taskSessions[index].messages.append(message)
-        taskSessions[index].updatedAt = Date()
-        if role == .assistant {
-            taskSessions[index].latestAssistantText = content
-        }
-        return message.id
-    }
-
-    @MainActor
     private func updateTaskSessionMessage(
         sessionID: String,
         messageID: UUID,
@@ -2960,69 +4279,6 @@ class CommandRunner: ObservableObject {
             updatedSessions[sessionIndex].latestAssistantText = content
         }
         taskSessions = updatedSessions
-    }
-
-    @MainActor
-    private func updateTaskSessionStatus(
-        sessionID: String,
-        status: TaskSessionStatus,
-        summary: String,
-        isExpanded: Bool? = nil,
-        resultSummary: String? = nil,
-        errorMessage: String? = nil
-    ) {
-        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else { return }
-
-        var didChange = false
-
-        if taskSessions[index].status != status {
-            taskSessions[index].status = status
-            didChange = true
-        }
-        if taskSessions[index].statusSummary != summary {
-            taskSessions[index].statusSummary = summary
-            didChange = true
-        }
-        if let isExpanded, taskSessions[index].isExpanded != isExpanded {
-            taskSessions[index].isExpanded = isExpanded
-            didChange = true
-        }
-        if let resultSummary, taskSessions[index].resultSummary != resultSummary {
-            taskSessions[index].resultSummary = resultSummary
-            didChange = true
-        } else if resultSummary == nil,
-                  status != .completed,
-                  taskSessions[index].resultSummary != nil {
-            taskSessions[index].resultSummary = nil
-            didChange = true
-        }
-        if let errorMessage, taskSessions[index].errorMessage != errorMessage {
-            taskSessions[index].errorMessage = errorMessage
-            didChange = true
-        } else if errorMessage == nil,
-                  status != .failed,
-                  status != .partial,
-                  status != .waitingUser,
-                  taskSessions[index].errorMessage != nil {
-            taskSessions[index].errorMessage = nil
-            didChange = true
-        }
-        if status != .completed, taskSessions[index].dismissedAt != nil {
-            taskSessions[index].dismissedAt = nil
-            didChange = true
-        }
-
-        guard didChange else { return }
-        taskSessions[index].updatedAt = Date()
-        
-        // 通知后台任务状态变化（插入主对话）
-        notifyTaskSessionStatusChange(
-            sessionID: sessionID,
-            title: taskSessions[index].title,
-            status: status,
-            resultSummary: resultSummary,
-            errorMessage: errorMessage
-        )
     }
 
     @MainActor
@@ -3164,66 +4420,48 @@ class CommandRunner: ObservableObject {
         originalRequest: String
     ) async {
         LogInfo("[CommandRunner] 处理统一任务恢复请求: taskID=\(taskID), sessionKey=\(gatewaySessionKey)")
-        
-        do {
-            // 尝试恢复任务会话
-            // 1. 先查找是否有对应的 AgentTaskSession
-            let existingSessionID = await MainActor.run {
-                taskSessions.first { $0.gatewaySessionKey == gatewaySessionKey }?.id
-            }
-            
-            var success = false
-            var resultContent: String?
-            
-            if let sessionID = existingSessionID {
-                // 使用现有的恢复逻辑
-                await resumeTaskSessionIfPossible(sessionID)
-                success = true
-                resultContent = "任务会话已恢复"
-            } else {
-                // 直接重新发送请求
-                await MainActor.run {
-                    self.isProcessing = true
-                }
-                
-                // 重新处理原始请求
-                await processInput(originalRequest, images: [])
-                
-                await MainActor.run {
-                    self.isProcessing = false
-                    success = true
-                    resultContent = "请求已重新处理"
-                }
-            }
-            
-            // 发送恢复完成通知
+
+        // 尝试恢复任务会话
+        // 1. 先查找是否有对应的 AgentTaskSession
+        let existingSessionID = await MainActor.run {
+            taskSessions.first { $0.gatewaySessionKey == gatewaySessionKey }?.id
+        }
+
+        let success: Bool
+        let resultContent: String
+
+        if let sessionID = existingSessionID {
+            // 使用现有的恢复逻辑
+            await resumeTaskSessionIfPossible(sessionID)
+            success = true
+            resultContent = "任务会话已恢复"
+        } else {
+            // 直接重新发送请求
             await MainActor.run {
-                NotificationCenter.default.post(
-                    name: .taskRecoveryCompleted,
-                    object: nil,
-                    userInfo: [
-                        "taskID": taskID,
-                        "success": success,
-                        "content": resultContent ?? ""
-                    ]
-                )
+                self.isProcessing = true
             }
-            
-        } catch {
-            LogError("[CommandRunner] 统一任务恢复失败: \(error)")
-            
-            // 发送失败通知
+
+            // 重新处理原始请求
+            await processInput(originalRequest, images: [])
+
             await MainActor.run {
-                NotificationCenter.default.post(
-                    name: .taskRecoveryCompleted,
-                    object: nil,
-                    userInfo: [
-                        "taskID": taskID,
-                        "success": false,
-                        "error": error.localizedDescription
-                    ]
-                )
+                self.isProcessing = false
             }
+            success = true
+            resultContent = "请求已重新处理"
+        }
+
+        // 发送恢复完成通知
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .taskRecoveryCompleted,
+                object: nil,
+                userInfo: [
+                    "taskID": taskID,
+                    "success": success,
+                    "content": resultContent
+                ]
+            )
         }
     }
 
@@ -3336,13 +4574,28 @@ class CommandRunner: ObservableObject {
                 requestStartedAt: Date(),
                 canResume: false
             )
+            
+            // 同步到主会话：任务恢复开始
+            upsertConversationProgressMessage(
+                key: "task_resume_\(sessionID)",
+                content: "**\(agent.name)** 正在继续处理「\(snapshot.title)」...",
+                agentID: agent.id,
+                agentName: agent.name,
+                metadata: [
+                    "message_key": "task_resume_\(sessionID)",
+                    "is_progress_update": "true",
+                    "progress_source": "task_resume",
+                    "task_session_id": sessionID,
+                    "resume_phase": "started"
+                ]
+            )
         }
 
         do {
             let continuedContent = try await sendViaGateway(
                 agent: agent,
                 sessionKey: sessionKey,
-                sessionLabel: gatewaySessionLabel(forTaskSessionID: sessionID, baseLabel: snapshot.title),
+                sessionLabel: gatewaySessionLabel(forTaskSessionID: sessionID, baseLabel: snapshot.title, isResume: true),
                 text: snapshot.originalRequest,
                 images: snapshot.inputImages ?? [],
                 taskSessionID: sessionID,
@@ -3365,6 +4618,22 @@ class CommandRunner: ObservableObject {
                     lastReconciledAt: Date()
                 )
                 appendAssistantConversationMessage("我已经继续完成了刚才中断的任务：\n\n\(continuedContent)")
+                
+                // 同步到主会话：任务恢复完成
+                upsertConversationProgressMessage(
+                    key: "task_resume_\(sessionID)",
+                    content: "**\(agent.displayName)** 已完成「\(snapshot.title)」。",
+                    agentID: agent.id,
+                    agentName: agent.name,
+                    metadata: [
+                        "message_key": "task_resume_\(sessionID)",
+                        "is_progress_update": "true",
+                        "progress_source": "task_resume",
+                        "task_session_id": sessionID,
+                        "resume_phase": "completed"
+                    ]
+                )
+                
                 isProcessing = false
             }
             return true
@@ -3405,6 +4674,21 @@ class CommandRunner: ObservableObject {
                         latestAssistantText: content,
                         canResume: false,
                         lastReconciledAt: Date()
+                    )
+                    
+                    // 同步到主会话：智能恢复完成
+                    upsertConversationProgressMessage(
+                        key: "task_resume_\(sessionID)",
+                        content: "**\(agent.displayName)** 已通过智能恢复完成「\(snapshot.title)」。",
+                        agentID: agent.id,
+                        agentName: agent.name,
+                        metadata: [
+                            "message_key": "task_resume_\(sessionID)",
+                            "is_progress_update": "true",
+                            "progress_source": "task_resume",
+                            "task_session_id": sessionID,
+                            "resume_phase": "smart_recovered"
+                        ]
                     )
                     appendAssistantConversationMessage("我已经通过智能恢复完成了任务：\n\n\(content)")
                     isProcessing = false
@@ -3523,7 +4807,7 @@ class CommandRunner: ObservableObject {
             appendTaskSessionMessage(
                 sessionID: sessionID,
                 role: .assistant,
-                content: "⏳ \(agent.name) 正在通过 OpenClaw 处理...",
+                content: "⏳ \(agent.name) 正在处理...",
                 agentName: agent.name
             )
         }
@@ -3657,7 +4941,7 @@ class CommandRunner: ObservableObject {
             let terminalAgentName = terminalAgent.displayName
             let isStreamInterrupted = UserFacingErrorFormatter.isStreamInterruptedError(terminalError)
             let isKimiLoginFailure = isKimiCLIAuthenticationFailure(terminalError, agent: terminalAgent)
-            let initialStreamingPlaceholder = "⏳ \(terminalAgent.name) 正在通过 OpenClaw 处理..."
+            let initialStreamingPlaceholder = "⏳ \(terminalAgent.name) 正在处理..."
             let preservedAssistantText = await MainActor.run {
                 taskSession(for: sessionID)?.latestAssistantText?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3935,7 +5219,7 @@ class CommandRunner: ObservableObject {
         3. 如果信息不足，明确说明还缺什么。
         """
 
-        _ = await sendToOpenClaw(agent: reflectionAgent, text: reflectionPrompt, images: [], traceID: traceID)
+        _ = await sendToRuntime(agent: reflectionAgent, text: reflectionPrompt, images: [], traceID: traceID)
     }
 
     private func streamLocalBridgeForTask(
@@ -3970,7 +5254,7 @@ class CommandRunner: ObservableObject {
             throw NSError(
                 domain: "CommandRunner",
                 code: 15,
-                userInfo: [NSLocalizedDescriptionKey: "本地 OpenClaw Bridge 请求失败"]
+                userInfo: [NSLocalizedDescriptionKey: "本地运行时请求失败"]
             )
         }
 
@@ -4052,7 +5336,7 @@ class CommandRunner: ObservableObject {
 
         let responseText: String
         switch agent.provider {
-        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot, .minimax:
             responseText = try await callOpenAICompatibleProvider(
                 agent: agent,
                 text: text,
@@ -4077,7 +5361,7 @@ class CommandRunner: ObservableObject {
             throw NSError(
                 domain: "CommandRunner",
                 code: 17,
-                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
+                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走本地运行时，不应走远端 provider 分支。"]
             )
         }
 
@@ -4124,7 +5408,7 @@ class CommandRunner: ObservableObject {
             throw NSError(
                 domain: "CommandRunner",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "本地 OpenClaw Bridge 请求失败"]
+                userInfo: [NSLocalizedDescriptionKey: "本地运行时请求失败"]
             )
         }
 
@@ -4181,7 +5465,7 @@ class CommandRunner: ObservableObject {
 
         let responseText: String
         switch agent.provider {
-        case .deepseek, .doubao, .zhipu, .openai, .moonshot:
+        case .deepseek, .doubao, .zhipu, .openai, .moonshot, .minimax:
             responseText = try await callOpenAICompatibleProvider(
                 agent: agent,
                 text: text,
@@ -4206,7 +5490,7 @@ class CommandRunner: ObservableObject {
             throw NSError(
                 domain: "CommandRunner",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走 OpenClaw Bridge，不应走远端 provider 分支。"]
+                userInfo: [NSLocalizedDescriptionKey: "本地 Agent 应该走本地运行时，不应走远端 provider 分支。"]
             )
         }
 
@@ -4239,7 +5523,7 @@ class CommandRunner: ObservableObject {
             ],
             "stream": false
         ]
-        body["temperature"] = agent.config.temperature
+        body["temperature"] = adjustedTemperature(for: agent)
         body["max_tokens"] = agent.config.maxTokens
 
         let data = try await performJSONRequest(
@@ -4293,7 +5577,7 @@ class CommandRunner: ObservableObject {
                 ["role": "user", "content": content]
             ]
         ]
-        body["temperature"] = agent.config.temperature
+        body["temperature"] = adjustedTemperature(for: agent)
 
         let data = try await performJSONRequest(
             url: endpoint,
@@ -4359,7 +5643,7 @@ class CommandRunner: ObservableObject {
             ]
         ]
         body["generationConfig"] = [
-            "temperature": agent.config.temperature,
+            "temperature": adjustedTemperature(for: agent),
             "maxOutputTokens": agent.config.maxTokens
         ]
 
@@ -4456,6 +5740,21 @@ class CommandRunner: ObservableObject {
         }
 
         return data
+    }
+
+    /// 根据模型调整 temperature
+    /// 某些模型（如 kimi-k2.5）只支持特定的 temperature 值
+    private func adjustedTemperature(for agent: Agent) -> Double {
+        let model = agent.model.lowercased()
+        
+        // kimi-k2.5 只支持 temperature = 1
+        if model.contains("kimi-k2.5") || model.contains("kimi-k2") {
+            return 1.0
+        }
+        
+        // 其他模型使用配置的值，但确保在有效范围内
+        let temp = agent.config.temperature
+        return max(0.0, min(2.0, temp))
     }
 
     private func extractProviderErrorMessage(from data: Data) -> String? {
@@ -4645,6 +5944,138 @@ class CommandRunner: ObservableObject {
         messages.append(recoveredMessage)
         scheduleTraceSettlementIfNeeded(forAssistantMessageID: template.id, content: content)
         LogInfo("恢复缺失的 assistant 消息并补写最终内容: \(template.id.uuidString)")
+        
+        // 检测并同步服务状态
+        Task {
+            await MainActor.run {
+                detectAndSyncServiceState(from: content)
+            }
+        }
+    }
+    
+    // MARK: - 服务状态同步
+    
+    /// 从 AI 响应中检测服务状态变更并同步
+    @MainActor
+    private func detectAndSyncServiceState(from content: String) {
+        // 1. 快速检查是否是服务操作相关内容
+        guard ServiceStateParser.isServiceStartRelated(content) ||
+              content.contains("MCP") ||
+              content.contains("服务") ||
+              content.contains("启动") ||
+              content.contains("停止") else {
+            return
+        }
+        
+        // 2. 提取服务列表（如果是批量操作）
+        let serviceList = ServiceStateParser.extractServiceList(from: content)
+        if !serviceList.isEmpty {
+            // 批量更新服务状态
+            for (name, status, detail) in serviceList {
+                syncServiceState(
+                    serviceName: name,
+                    statusText: status,
+                    detail: detail,
+                    content: content
+                )
+            }
+            return
+        }
+        
+        // 3. 单服务操作 - 识别服务名称
+        if let serviceID = UnifiedServiceState.shared.findServiceID(byName: content) ??
+                          ServiceStateParser().identifyService(in: content) {
+            // 解析操作类型和结果
+            let operation = detectOperationType(from: content)
+            let parser = ServiceStateParser()
+            let result = parser.parse(result: content, for: serviceID)
+            
+            // 同步到统一状态中心
+            UnifiedServiceState.shared.handleMainSessionOperation(
+                serviceName: serviceID,
+                operation: operation,
+                result: content
+            )
+            
+            LogInfo("[CommandRunner] 同步服务状态: \(serviceID) -> \(result.status?.displayName ?? "unknown")")
+        }
+    }
+    
+    /// 检测操作类型
+    private func detectOperationType(from content: String) -> ServiceOperation {
+        let lowercased = content.lowercased()
+        
+        if lowercased.contains("启动") || lowercased.contains("start") {
+            return .start
+        } else if lowercased.contains("停止") || lowercased.contains("stop") {
+            return .stop
+        } else if lowercased.contains("重启") || lowercased.contains("restart") {
+            return .restart
+        } else {
+            return .check
+        }
+    }
+    
+    /// 同步服务状态（从表格格式提取）
+    @MainActor
+    private func syncServiceState(
+        serviceName: String,
+        statusText: String,
+        detail: String,
+        content: String
+    ) {
+        guard let serviceID = UnifiedServiceState.shared.findServiceID(byName: serviceName) else {
+            LogWarning("[CommandRunner] 无法找到服务: \(serviceName)")
+            return
+        }
+        
+        // 解析状态
+        let status: ServiceRuntimeStatus
+        if statusText.contains("运行中") || statusText.contains("✅") {
+            status = .running
+        } else if statusText.contains("停止") || statusText.contains("❌") {
+            status = .stopped
+        } else {
+            status = .unknown
+        }
+        
+        // 解析 PID 或端口
+        var metadata: [String: String] = [:]
+        if detail.contains("PID") {
+            let pidPattern = try? NSRegularExpression(pattern: #"(\d+)"#, options: [])
+            let matches = pidPattern?.matches(
+                in: detail,
+                options: [],
+                range: NSRange(location: 0, length: detail.utf16.count)
+            )
+            if let match = matches?.first, match.numberOfRanges > 1 {
+                let range = match.range(at: 1)
+                if let r = Range(range, in: detail) {
+                    metadata["pid"] = String(detail[r])
+                }
+            }
+        } else if detail.contains("port") {
+            let portPattern = try? NSRegularExpression(pattern: #"(\d+)"#, options: [])
+            let matches = portPattern?.matches(
+                in: detail,
+                options: [],
+                range: NSRange(location: 0, length: detail.utf16.count)
+            )
+            if let match = matches?.first, match.numberOfRanges > 1 {
+                let range = match.range(at: 1)
+                if let r = Range(range, in: detail) {
+                    metadata["port"] = String(detail[r])
+                }
+            }
+        }
+        
+        // 更新状态
+        UnifiedServiceState.shared.updateServiceState(
+            serviceID: serviceID,
+            status: status,
+            source: .aiOperation,
+            metadata: metadata
+        )
     }
 
     @MainActor
@@ -4684,30 +6115,142 @@ class CommandRunner: ObservableObject {
     @MainActor
     private func updateExecutionTrace(
         traceID: UUID,
-        state: ExecutionTraceState,
+        state: ExecutionTraceState? = nil,
         agentName: String? = nil,
         intentName: String? = nil,
         transitionLabel: String? = nil,
-        summary: String? = nil
+        summary: String? = nil,
+        currentStep: String? = nil,
+        stepDetails: String? = nil,
+        partialOutput: String? = nil,
+        progressPercent: Int? = nil,
+        currentTool: String? = nil,
+        addLog: (level: TraceLogEntry.LogLevel, message: String)? = nil
     ) {
         guard var trace = messageExecutionTraces[traceID] else { return }
+        let oldState = trace.state
         traceDismissTasks[traceID]?.cancel()
-        trace.state = state
+        
+        if let state = state {
+            trace.state = state
+        }
         if let agentName {
             trace.agentName = agentName
         }
         if let intentName {
             trace.intentName = intentName
         }
-        trace.transitionLabel = transitionLabel
-        if let summary {
+        if let transitionLabel = transitionLabel {
+            trace.transitionLabel = transitionLabel
+        }
+        if let summary = summary {
             trace.summary = summary
         }
-        if !state.isActive {
+        if let currentStep = currentStep {
+            trace.currentStep = currentStep
+        }
+        if let stepDetails = stepDetails {
+            trace.stepDetails = stepDetails
+        }
+        if let partialOutput = partialOutput {
+            trace.partialOutput = partialOutput
+        }
+        if let progressPercent = progressPercent {
+            trace.progressPercent = progressPercent
+        }
+        if let currentTool = currentTool {
+            trace.currentTool = currentTool
+        }
+        if let addLog = addLog {
+            trace.executionLog.append(TraceLogEntry(level: addLog.level, message: addLog.message))
+        }
+        
+        trace.lastUpdatedAt = Date()
+        
+        if let newState = state, !newState.isActive {
             trace.finishedAt = Date()
         }
         messageExecutionTraces[traceID] = trace
         refreshCurrentExecutionTrace()
+        
+        // 同步到主会话：关键状态变化时更新进展消息
+        if let newState = state, oldState != newState && shouldSyncTraceStateToMainConversation(oldState: oldState, newState: newState) {
+            syncTraceStateToMainConversation(trace: trace, previousState: oldState)
+        }
+    }
+    
+    /// 快速更新 Trace 步骤（用于 CLI 式详细进度）
+    @MainActor
+    private func updateTraceStep(
+        traceID: UUID,
+        step: String,
+        details: String? = nil,
+        progress: Int? = nil,
+        log: String? = nil
+    ) {
+        updateExecutionTrace(
+            traceID: traceID,
+            currentStep: step,
+            stepDetails: details,
+            progressPercent: progress,
+            addLog: log.map { (.info, $0) }
+        )
+    }
+    
+    /// 判断是否应该同步 Trace 状态到主会话
+    private func shouldSyncTraceStateToMainConversation(oldState: ExecutionTraceState, newState: ExecutionTraceState) -> Bool {
+        // 路由完成、开始执行、回退、完成、失败等关键节点同步
+        switch (oldState, newState) {
+        case (.routing, .running),      // 路由完成，开始执行
+             (.routing, .fallback),     // 路由直接到回退
+             (.running, .fallback),     // 执行中回退
+             (.fallback, .running),     // 回退后继续执行
+             (.running, .synthesizing), // 执行完成，开始整合
+             (_, .completed),           // 任何状态到完成
+             (_, .failed):              // 任何状态到失败
+            return true
+        default:
+            return false
+        }
+    }
+    
+    /// 同步 Trace 状态到主会话进展消息
+    @MainActor
+    private func syncTraceStateToMainConversation(trace: ExecutionTrace, previousState: ExecutionTraceState) {
+        let content: String
+        let agentName = trace.agentName
+        
+        switch trace.state {
+        case .running where previousState == .routing:
+            content = "**\(agentName)** 已接管并开始处理..."
+        case .running where previousState == .fallback:
+            content = "**\(agentName)** 正在继续处理（已从回退恢复）..."
+        case .fallback:
+            content = "**\(agentName)** 执行遇到问题，正在切换到备用方案..."
+        case .synthesizing:
+            content = "**\(agentName)** 已生成初步结果，正在整合..."
+        case .completed:
+            content = "**\(agentName)** 已完成处理。"
+        case .failed:
+            content = "**\(agentName)** 处理失败。"
+        default:
+            return
+        }
+        
+        upsertConversationProgressMessage(
+            key: "trace_progress_\(trace.id)",
+            content: content,
+            agentID: nil,
+            agentName: agentName,
+            metadata: [
+                "message_key": "trace_progress_\(trace.id)",
+                "is_progress_update": "true",
+                "progress_source": "execution_trace",
+                "trace_id": trace.id.uuidString,
+                "trace_state": trace.state.rawValue,
+                "previous_state": previousState.rawValue
+            ]
+        )
     }
 
     @MainActor
@@ -4716,6 +6259,8 @@ class CommandRunner: ObservableObject {
         traceSettleTasks[traceID] = nil
         updateExecutionTrace(traceID: traceID, state: .completed, summary: summary)
         scheduleExecutionTraceDismiss(traceID: traceID, after: 1.6)
+        // 清理对应的进展消息
+        scheduleProgressMessageCleanup(key: "trace_progress_\(traceID)", after: 3.0)
     }
 
     @MainActor
@@ -4724,6 +6269,27 @@ class CommandRunner: ObservableObject {
         traceSettleTasks[traceID] = nil
         updateExecutionTrace(traceID: traceID, state: .failed, summary: summary)
         scheduleExecutionTraceDismiss(traceID: traceID, after: 4)
+        // 清理对应的进展消息
+        scheduleProgressMessageCleanup(key: "trace_progress_\(traceID)", after: 6.0)
+    }
+    
+    /// 调度清理进展消息
+    @MainActor
+    private func scheduleProgressMessageCleanup(key: String, after delay: TimeInterval) {
+        Task { @MainActor [weak self] in
+            let duration = UInt64(max(delay, 0) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: duration)
+            guard let self else { return }
+            
+            // 找到并删除对应的进展消息
+            if let index = self.messages.firstIndex(where: { 
+                $0.metadata?["message_key"] == key && $0.metadata?["is_progress_update"] == "true"
+            }) {
+                var updatedMessages = self.messages
+                updatedMessages.remove(at: index)
+                self.messages = updatedMessages
+            }
+        }
     }
 
     @MainActor
@@ -4997,6 +6563,286 @@ class CommandRunner: ObservableObject {
     }
 
     @MainActor
+    private func upsertConversationProgressMessage(
+        key: String,
+        content: String,
+        agentID: String? = nil,
+        agentName: String? = nil,
+        metadata: [String: String]
+    ) {
+        if let index = messages.firstIndex(where: { $0.metadata?["message_key"] == key && $0.linkedTaskSessionID == nil }) {
+            let existing = messages[index]
+            let mergedMetadata = (existing.metadata ?? [:]).merging(metadata) { _, new in new }
+            guard existing.content != content ||
+                    existing.agentId != agentID ||
+                    existing.agentName != agentName ||
+                    existing.metadata != mergedMetadata else {
+                return
+            }
+
+            var updatedMessages = messages
+            updatedMessages[index].content = content
+            updatedMessages[index].agentId = agentID
+            updatedMessages[index].agentName = agentName
+            updatedMessages[index].metadata = mergedMetadata
+            messages = updatedMessages
+            return
+        }
+
+        let message = ChatMessage(
+            id: UUID(),
+            role: .assistant,
+            content: content,
+            timestamp: Date(),
+            agentId: agentID,
+            agentName: agentName,
+            metadata: metadata
+        )
+        messages.append(message)
+    }
+
+    @MainActor
+    private func syncTaskSessionProgressFeed(with sessions: [AgentTaskSession]) {
+        let nextSnapshots: [String: ConversationProgressSnapshot] = sessions.compactMap { session -> (String, ConversationProgressSnapshot)? in
+            guard let snapshot = taskSessionProgressSnapshot(for: session) else { return nil }
+            return (conversationProgressIdentity(for: session), snapshot)
+        }.reduce(into: [:]) { dict, pair in
+            dict[pair.0] = pair.1
+        }
+
+        for (identity, snapshot) in nextSnapshots {
+            guard taskSessionProgressSnapshots[identity] != snapshot else { continue }
+            upsertConversationProgressMessage(
+                key: snapshot.messageKey,
+                content: snapshot.content,
+                agentID: snapshot.agentID,
+                agentName: snapshot.agentName,
+                metadata: snapshot.metadata
+            )
+        }
+
+        taskSessionProgressSnapshots = nextSnapshots
+    }
+
+    @MainActor
+    private func syncUnifiedTaskProgressFeed(with tasks: [UnifiedTask]) {
+        let bridgedGatewayKeys = Set(taskSessions.compactMap(\.gatewaySessionKey))
+        let nextSnapshots: [String: ConversationProgressSnapshot] = tasks.compactMap { task -> (String, ConversationProgressSnapshot)? in
+            if let gatewaySessionKey = task.gatewaySessionKey,
+               bridgedGatewayKeys.contains(gatewaySessionKey) {
+                return nil
+            }
+            guard let snapshot = unifiedTaskProgressSnapshot(for: task) else { return nil }
+            return (conversationProgressIdentity(for: task), snapshot)
+        }.reduce(into: [:]) { dict, pair in
+            dict[pair.0] = pair.1
+        }
+
+        for (identity, snapshot) in nextSnapshots {
+            guard unifiedTaskProgressSnapshots[identity] != snapshot else { continue }
+            upsertConversationProgressMessage(
+                key: snapshot.messageKey,
+                content: snapshot.content,
+                agentID: snapshot.agentID,
+                agentName: snapshot.agentName,
+                metadata: snapshot.metadata
+            )
+        }
+
+        unifiedTaskProgressSnapshots = nextSnapshots
+    }
+
+    private func conversationProgressIdentity(for session: AgentTaskSession) -> String {
+        session.gatewaySessionKey.map { "gateway:\($0)" } ?? "task-session:\(session.id)"
+    }
+
+    private func conversationProgressIdentity(for task: UnifiedTask) -> String {
+        task.gatewaySessionKey.map { "gateway:\($0)" } ?? "unified-task:\(task.id)"
+    }
+
+    private func taskSessionProgressSnapshot(for session: AgentTaskSession) -> ConversationProgressSnapshot? {
+        let identity = conversationProgressIdentity(for: session)
+        let phase = session.status.rawValue
+        let detail = taskSessionProgressDetail(for: session)
+        let content: String
+
+        switch session.status {
+        case .queued:
+            content = """
+            已收到「\(session.title)」，并转为独立任务。
+            当前进展：\(detail)
+            """
+        case .running:
+            content = """
+            「\(session.title)」正在处理中。
+            当前进展：\(detail)
+            """
+        case .partial:
+            content = """
+            「\(session.title)」暂时中断，已保留当前进度。
+            当前情况：\(detail)
+            """
+        case .waitingUser:
+            content = """
+            「\(session.title)」需要你继续处理。
+            当前情况：\(detail)
+            """
+        case .completed:
+            content = """
+            「\(session.title)」已完成。
+            关键结果：\(detail)
+            """
+        case .failed:
+            content = """
+            「\(session.title)」执行失败。
+            原因：\(detail)
+            """
+        }
+
+        return ConversationProgressSnapshot(
+            messageKey: "conversation_progress_\(identity)_\(phase)",
+            content: content,
+            agentID: session.delegateAgentID,
+            agentName: session.delegateAgentName ?? session.mainAgentName,
+            metadata: [
+                "message_key": "conversation_progress_\(identity)_\(phase)",
+                "is_progress_update": "true",
+                "progress_source": "task_session",
+                "progress_identity": identity,
+                "progress_phase": phase,
+                "task_session_id": session.id
+            ]
+        )
+    }
+
+    private func taskSessionProgressDetail(for session: AgentTaskSession) -> String {
+        switch session.status {
+        case .completed:
+            if session.intentName != "独立处理" {
+                return "执行已经结束，结果正在同步回主会话。"
+            }
+            return compactConversationProgressText(
+                session.resultSummary ??
+                session.latestAssistantText ??
+                session.statusSummary
+            )
+        case .failed, .waitingUser, .partial:
+            return compactConversationProgressText(
+                session.errorMessage ??
+                session.resultSummary ??
+                session.latestAssistantText ??
+                session.statusSummary
+            )
+        case .queued, .running:
+            return compactConversationProgressText(session.statusSummary)
+        }
+    }
+
+    private func unifiedTaskProgressSnapshot(for task: UnifiedTask) -> ConversationProgressSnapshot? {
+        let identity = conversationProgressIdentity(for: task)
+        let phase = taskProgressPhase(for: task)
+        let detail = unifiedTaskProgressDetail(for: task)
+        let content: String
+
+        switch phase {
+        case "scheduled":
+            content = """
+            「\(task.title)」已排期。
+            当前进展：\(detail)
+            """
+        case UnifiedTaskStatus.pending.rawValue:
+            content = """
+            「\(task.title)」已进入任务中心，等待开始。
+            当前进展：\(detail)
+            """
+        case UnifiedTaskStatus.running.rawValue:
+            content = """
+            「\(task.title)」正在执行。
+            当前进展：\(detail)
+            """
+        case UnifiedTaskStatus.paused.rawValue:
+            content = """
+            「\(task.title)」等待继续处理。
+            当前情况：\(detail)
+            """
+        case UnifiedTaskStatus.completed.rawValue:
+            content = """
+            「\(task.title)」已完成。
+            关键结果：\(detail)
+            """
+        case UnifiedTaskStatus.failed.rawValue:
+            content = """
+            「\(task.title)」执行失败。
+            原因：\(detail)
+            """
+        default:
+            return nil
+        }
+
+        return ConversationProgressSnapshot(
+            messageKey: "conversation_progress_\(identity)_\(phase)",
+            content: content,
+            agentID: task.assignedAgentID,
+            agentName: task.assignedAgentName,
+            metadata: [
+                "message_key": "conversation_progress_\(identity)_\(phase)",
+                "is_progress_update": "true",
+                "progress_source": "unified_task",
+                "progress_identity": identity,
+                "progress_phase": phase,
+                "task_id": task.id
+            ]
+        )
+    }
+
+    private func taskProgressPhase(for task: UnifiedTask) -> String {
+        if task.status == .pending, let scheduledTime = task.scheduledTime, scheduledTime > Date() {
+            return "scheduled"
+        }
+        return task.status.rawValue
+    }
+
+    private func unifiedTaskProgressDetail(for task: UnifiedTask) -> String {
+        switch taskProgressPhase(for: task) {
+        case "scheduled":
+            if let scheduledTime = task.scheduledTime {
+                return "计划于 \(scheduledTime.formatted(date: .abbreviated, time: .shortened)) 执行。"
+            }
+            return compactConversationProgressText(task.description)
+        case UnifiedTaskStatus.completed.rawValue:
+            return compactConversationProgressText(
+                task.result ??
+                task.messages.last?.content ??
+                task.logs.last?.message ??
+                task.description
+            )
+        case UnifiedTaskStatus.failed.rawValue, UnifiedTaskStatus.paused.rawValue:
+            return compactConversationProgressText(
+                task.errorMessage ??
+                task.logs.last?.message ??
+                task.description
+            )
+        case UnifiedTaskStatus.running.rawValue, UnifiedTaskStatus.pending.rawValue:
+            return compactConversationProgressText(
+                task.logs.last?.message ??
+                task.messages.last?.content ??
+                (task.description.isEmpty ? task.title : task.description)
+            )
+        default:
+            return compactConversationProgressText(task.description)
+        }
+    }
+
+    private func compactConversationProgressText(_ text: String?) -> String {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return "处理中" }
+        if trimmed.count <= 120 {
+            return trimmed
+        }
+        return "\(trimmed.prefix(120))..."
+    }
+
+    @MainActor
     private func activeWorkflowDesignContext() -> WorkflowDesignContinuationContext? {
         if let lastMessage = messages.last,
            let sessionID = lastMessage.metadata?[workflowTaskSessionIDKey] ?? lastMessage.linkedTaskSessionID,
@@ -5137,7 +6983,7 @@ class CommandRunner: ObservableObject {
     }
 
     private func presentInitialSetupPrompt(for action: String? = nil) {
-        let actionText = action ?? "使用 OpenClaw"
+        let actionText = action ?? "开始对话"
         let content = """
         ⚙️ 当前还没有可用的 LLM 或 CLI Agent
 
@@ -5246,5 +7092,325 @@ extension CommandRunner {
             )
             isProcessing = false
         }
+    }
+}
+
+// MARK: - Service Task Management Public APIs
+
+extension CommandRunner {
+    
+    /// 添加任务会话（Public API for ServiceTaskManager）
+    @MainActor
+    func addTaskSession(_ session: AgentTaskSession) {
+        taskSessions.append(session)
+    }
+    
+    /// 添加消息到主会话（Public API for ServiceTaskManager）
+    @MainActor
+    func appendMessage(_ message: ChatMessage) {
+        messages.append(message)
+    }
+    
+    /// 添加任务会话消息（Public API for ServiceTaskManager）
+    @MainActor
+    @discardableResult
+    func appendTaskSessionMessage(
+        sessionID: String,
+        role: MessageRole,
+        content: String,
+        agentName: String? = nil
+    ) -> UUID {
+        let message = TaskSessionMessage(
+            role: role,
+            content: content,
+            agentName: agentName
+        )
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else {
+            LogWarning("[CommandRunner] 尝试向不存在的任务会话添加消息: \(sessionID)")
+            return message.id
+        }
+        taskSessions[index].messages.append(message)
+        taskSessions[index].updatedAt = Date()
+        if role == .assistant {
+            taskSessions[index].latestAssistantText = content
+        }
+        return message.id
+    }
+    
+    /// 更新任务会话状态（Public API for ServiceTaskManager）
+    @MainActor
+    func updateTaskSessionStatus(
+        sessionID: String,
+        status: TaskSessionStatus,
+        summary: String,
+        isExpanded: Bool? = nil,
+        resultSummary: String? = nil,
+        errorMessage: String? = nil
+    ) {
+        guard let index = taskSessions.firstIndex(where: { $0.id == sessionID }) else {
+            LogWarning("[CommandRunner] 尝试更新不存在的任务会话状态: \(sessionID)")
+            return
+        }
+        
+        var didChange = false
+        
+        if taskSessions[index].status != status {
+            taskSessions[index].status = status
+            didChange = true
+        }
+        if taskSessions[index].statusSummary != summary {
+            taskSessions[index].statusSummary = summary
+            didChange = true
+        }
+        if let isExpanded, taskSessions[index].isExpanded != isExpanded {
+            taskSessions[index].isExpanded = isExpanded
+            didChange = true
+        }
+        if let resultSummary, taskSessions[index].resultSummary != resultSummary {
+            taskSessions[index].resultSummary = resultSummary
+            didChange = true
+        }
+        if let errorMessage, taskSessions[index].errorMessage != errorMessage {
+            taskSessions[index].errorMessage = errorMessage
+            didChange = true
+        }
+        
+        guard didChange else { return }
+        taskSessions[index].updatedAt = Date()
+        
+        // 通知后台任务状态变化（插入主对话）
+        notifyTaskSessionStatusChange(
+            sessionID: sessionID,
+            title: taskSessions[index].title,
+            status: status,
+            resultSummary: resultSummary,
+            errorMessage: errorMessage
+        )
+    }
+    
+    /// 设置当前执行跟踪（Public API for ServiceTaskManager）
+    func setCurrentExecutionTrace(_ trace: ExecutionTrace) {
+        currentExecutionTrace = trace
+    }
+    
+    // MARK: - Service Task Execution Public API
+    
+    /// 执行服务管理任务（Public API for ServiceTaskManager）
+    /// 这个方法是 ServiceTaskManager 调用 AI 的入口
+    @MainActor
+    func executeServiceTask(
+        taskSessionID: String,
+        prompt: String,
+        agent: Agent? = nil
+    ) async throws -> String {
+        // 获取 Agent
+        let targetAgent = agent
+            ?? orchestrator.currentAgent
+            ?? agentStore.defaultAgent
+            ?? agentStore.agents.first!
+        
+        // 生成 session key
+        let sessionKey = gatewaySessionKey(forTaskSessionID: taskSessionID)
+        
+        // 添加初始消息到任务会话
+        let assistantMessageID = appendTaskSessionMessage(
+            sessionID: taskSessionID,
+            role: .assistant,
+            content: "⏳ \(targetAgent.name) 正在处理...",
+            agentName: targetAgent.name
+        )
+        
+        // 调用 Gateway 执行 AI 请求
+        let result = try await sendViaGateway(
+            agent: targetAgent,
+            sessionKey: sessionKey,
+            sessionLabel: "服务管理 - \(taskSessionID)",
+            text: prompt,
+            images: [],
+            taskSessionID: taskSessionID,
+            assistantMessageID: assistantMessageID
+        )
+        
+        return result
+    }
+}
+
+// MARK: - Health Monitor Integration
+
+extension CommandRunner {
+    
+    /// 处理健康监控告警
+    @MainActor
+    private func handleHealthMonitorAlert(_ userInfo: [String: Any]) {
+        guard let serviceID = userInfo["service_id"] as? String,
+              let serviceName = userInfo["service_name"] as? String,
+              let severityRaw = userInfo["severity"] as? String,
+              let severity = HealthSeverity(rawValue: severityRaw),
+              let message = userInfo["message"] as? String else {
+            return
+        }
+        
+        // 根据严重级别决定通知方式
+        let icon: String
+        let title: String
+        let color: String
+        
+        switch severity {
+        case .info:
+            icon = "ℹ️"
+            title = "服务状态"
+            color = "blue"
+        case .warning:
+            icon = "⚠️"
+            title = "服务警告"
+            color = "orange"
+        case .error:
+            icon = "❌"
+            title = "服务异常"
+            color = "red"
+        case .critical:
+            icon = "🚨"
+            title = "服务严重异常"
+            color = "red"
+        }
+        
+        // 发送到主会话
+        let alertMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: """
+            \(icon) **\(title)**
+            
+            服务：\(serviceName)
+            级别：\(severity.displayName)
+            详情：\(message)
+            
+            [查看详情] [AI 诊断] [忽略]
+            """,
+            timestamp: Date(),
+            metadata: [
+                "health_alert": "true",
+                "service_id": serviceID,
+                "severity": severityRaw,
+                "message": message
+            ]
+        )
+        
+        messages.append(alertMessage)
+        
+        // 发送系统通知
+        sendSystemNotification(
+            title: title,
+            body: "\(serviceName): \(message)"
+        )
+        
+        LogInfo("[CommandRunner] 健康监控告警已发送到主会话: \(serviceName) - \(severity.displayName)")
+    }
+    
+    /// 处理健康监控 AI 诊断请求
+    @MainActor
+    private func handleHealthMonitorAIDiagnosis(_ userInfo: [String: Any]) async {
+        guard let serviceID = userInfo["service_id"] as? String,
+              let serviceName = userInfo["service_name"] as? String else {
+            return
+        }
+        
+        // 获取服务信息
+        guard ServiceManager.shared.services.contains(where: { $0.id == serviceID }) else {
+            return
+        }
+        
+        // 发送到主会话，询问用户是否进行 AI 诊断
+        let diagnosisRequestMessage = ChatMessage(
+            id: UUID(),
+            role: .system,
+            content: """
+            🔍 **AI 诊断请求**
+            
+            服务「\(serviceName)」健康检查失败，是否让 AI 进行诊断分析？
+            
+            AI 将会：
+            • 检查服务日志
+            • 分析配置问题
+            • 提供修复建议
+            
+            [立即诊断] [稍后处理] [忽略]
+            """,
+            timestamp: Date(),
+            metadata: [
+                "ai_diagnosis_request": "true",
+                "service_id": serviceID,
+                "service_name": serviceName
+            ]
+        )
+        
+        messages.append(diagnosisRequestMessage)
+        
+        LogInfo("[CommandRunner] AI 诊断请求已发送到主会话: \(serviceName)")
+    }
+    
+    /// 发送系统通知
+    private func sendSystemNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let request = UNNotificationRequest(
+            identifier: "macassistant-system-\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+
+        UNUserNotificationCenter.current().add(request) { error in
+            if let error {
+                LogWarning("[CommandRunner] 发送系统通知失败: \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    /// 执行 AI 健康诊断（响应用户点击"立即诊断"）
+    @MainActor
+    func performAIHealthDiagnosis(serviceID: String) async {
+        guard let service = ServiceManager.shared.services.first(where: { $0.id == serviceID }) else {
+            return
+        }
+        
+        isProcessing = true
+        
+        // 构建诊断提示词
+        let prompt = """
+        请帮我诊断服务「\(service.name)」的健康问题。
+        
+        服务配置：
+        - 服务 ID: \(service.id)
+        - 工作目录: \(service.path ?? "未指定")
+        - 端口: \(service.port?.description ?? "无")
+        - 启动命令: \(service.startCommand ?? "未配置")
+        
+        请按以下步骤执行诊断：
+        1. 检查服务进程是否存在
+        2. 检查端口是否监听
+        3. 查看最近的日志文件（最近 100 行）
+        4. 检查配置文件是否有错误
+        5. 分析可能的原因并提供修复建议
+        
+        请以清晰的格式输出诊断报告。
+        """
+        
+        // 发送到 AI
+        let message = ChatMessage(
+            id: UUID(),
+            role: .user,
+            content: prompt,
+            timestamp: Date()
+        )
+        
+        await MainActor.run {
+            messages.append(message)
+        }
+        
+        // 调用 AI 处理
+        await processInput(prompt)
     }
 }

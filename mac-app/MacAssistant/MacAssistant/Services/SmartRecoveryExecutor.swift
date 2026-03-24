@@ -350,16 +350,19 @@ final class SmartRecoveryExecutor {
         images: [String],
         notifyUser: @escaping (String) -> Void
     ) async -> RecoveryResult {
-        // 使用 SubtaskCoordinator 拆分任务
+        // 先由规划层生成子任务蓝图，再交给协调器落地执行
         notifyUser("📋 正在分析任务并拆解...")
-        
-        let subtasks = SubtaskCoordinator.shared.decomposeTask(text)
-        
-        notifyUser("✂️ 任务已拆解为 \(subtasks.subtasks.count) 个子任务")
+
+        let decomposition = await MainActor.run {
+            let plan = SubtaskPlanningService.shared.planTask(text)
+            return SubtaskCoordinator.shared.enqueuePlan(plan)
+        }
+
+        notifyUser("✂️ 任务已拆解为 \(decomposition.subtasks.count) 个子任务")
         
         // 执行子任务
-        for (index, subtask) in subtasks.subtasks.enumerated() {
-            notifyUser("📝 执行子任务 \(index + 1)/\(subtasks.subtasks.count): \(subtask.title)")
+        for (index, subtask) in decomposition.subtasks.enumerated() {
+            notifyUser("📝 执行子任务 \(index + 1)/\(decomposition.subtasks.count): \(subtask.title)")
             // 简化实现
             try? await Task.sleep(nanoseconds: 1 * 1_000_000_000)
         }

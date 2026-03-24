@@ -38,6 +38,8 @@ final class ConversationController: ObservableObject {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
 
+        print("[DEBUG] [ConversationController] 收到输入: \(text)")
+
         let request = contextAssembler.assemble(
             ConversationAssemblyInput(
                 text: text,
@@ -49,7 +51,9 @@ final class ConversationController: ObservableObject {
                 lastMessage: stores.messages.last,
                 creationFlowActive: creationSkill.isInCreationFlow,
                 messages: stores.messages,
-                taskSessions: stores.taskSessions
+                taskSessions: stores.taskSessions,
+                activeBrowserSessionID: stores.activeBrowserSessionID,
+                browserSessions: stores.browserSessions
             )
         )
 

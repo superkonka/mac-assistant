@@ -13,14 +13,19 @@ final class ConversationRuntime: ObservableObject {
     @Published private(set) var stores: ConversationStores = .empty
 
     private let runner: CommandRunner
-    private let taskManager = TaskManager.shared
+    private let unifiedTaskManager = UnifiedTaskManager.shared
+    private let browserSessionStore = BrowserSessionStore.shared
+    private let unifiedSessionPrefix = "unified-task-"
+    private var dismissedUnifiedSessionDates: [String: Date] = [:]
     private var cancellables: Set<AnyCancellable> = []
 
     init(runner: CommandRunner = .shared) {
         self.runner = runner
+        _ = LegacyTaskMigrationService.shared
 
         bindRunner()
-        bindTaskManager()
+        bindUnifiedTaskManager()
+        bindBrowserSessions()
         refreshStores()
     }
 
@@ -44,10 +49,29 @@ final class ConversationRuntime: ObservableObject {
     }
 
     func dismissTaskSessionFromTabs(_ id: String) {
+        if isUnifiedTaskSession(id) {
+            guard let session = stores.taskSessions.first(where: { $0.id == id }),
+                  session.status == .completed else {
+                return
+            }
+
+            dismissedUnifiedSessionDates[id] = Date()
+            refreshStores()
+            return
+        }
+
         runner.dismissTaskSessionFromTabs(id)
     }
 
     func resumeTaskSession(_ id: String) {
+        if let taskID = unifiedTaskID(from: id) {
+            unifiedTaskManager.focusTask(id: taskID)
+            Task {
+                await unifiedTaskManager.continueTask(id: taskID)
+            }
+            return
+        }
+
         runner.resumeTaskSession(id)
     }
 
@@ -98,10 +122,29 @@ final class ConversationRuntime: ObservableObject {
             .store(in: &cancellables)
     }
 
+    private func bindUnifiedTaskManager() {
+        unifiedTaskManager.$tasks
+            .sink { [weak self] _ in self?.refreshStores() }
+            .store(in: &cancellables)
+    }
+
+    private func bindBrowserSessions() {
+        browserSessionStore.$sessions
+            .sink { [weak self] _ in self?.refreshStores() }
+            .store(in: &cancellables)
+
+        browserSessionStore.$activeSessionID
+            .sink { [weak self] _ in self?.refreshStores() }
+            .store(in: &cancellables)
+    }
+
     private func refreshStores() {
-        // 将 TaskManager 的任务转换为 AgentTaskSession 并合并
-        let taskManagerSessions = convertTaskManagerTasksToSessions()
-        let mergedSessions = runner.taskSessions + taskManagerSessions
+        let unifiedSessions = convertUnifiedTasksToSessions()
+        let unifiedGatewaySessionKeys = Set(unifiedSessions.compactMap(\.gatewaySessionKey))
+        let runnerSessions = filteredRunnerSessions(
+            excludingGatewaySessionKeys: unifiedGatewaySessionKeys
+        )
+        let mergedSessions = runnerSessions + unifiedSessions
         
         stores = ConversationStores(
             messages: runner.messages,
@@ -109,90 +152,169 @@ final class ConversationRuntime: ObservableObject {
             tracesByID: runner.messageExecutionTraces,
             currentTrace: runner.currentExecutionTrace,
             isProcessing: runner.isProcessing,
-            lastScreenshotPath: runner.lastScreenshotPath
+            lastScreenshotPath: runner.lastScreenshotPath,
+            activeBrowserSessionID: browserSessionStore.activeSessionID,
+            browserSessions: browserSessionStore.sessions
         )
     }
-    
-    private func bindTaskManager() {
-        // 监听 TaskManager 的变化
-        taskManager.$pendingTasks
-            .sink { [weak self] _ in self?.refreshStores() }
-            .store(in: &cancellables)
-        
-        taskManager.$runningTasks
-            .sink { [weak self] _ in self?.refreshStores() }
-            .store(in: &cancellables)
-        
-        taskManager.$completedTasks
-            .sink { [weak self] _ in self?.refreshStores() }
-            .store(in: &cancellables)
+    private func filteredRunnerSessions(excludingGatewaySessionKeys gatewaySessionKeys: Set<String>) -> [AgentTaskSession] {
+        runner.taskSessions.filter { session in
+            guard let gatewaySessionKey = session.gatewaySessionKey else {
+                return true
+            }
+
+            return !gatewaySessionKeys.contains(gatewaySessionKey)
+        }
     }
-    
-    /// 将 TaskManager 的任务转换为 AgentTaskSession
-    private func convertTaskManagerTasksToSessions() -> [AgentTaskSession] {
-        var sessions: [AgentTaskSession] = []
-        
-        // 转换待执行任务
-        for task in taskManager.pendingTasks {
-            sessions.append(convertTaskItemToSession(task))
-        }
-        
-        // 转换执行中任务
-        for task in taskManager.runningTasks {
-            sessions.append(convertTaskItemToSession(task))
-        }
-        
-        // 转换已完成任务（只显示最近5个）
-        let recentCompleted = taskManager.completedTasks.suffix(5)
-        for task in recentCompleted {
-            sessions.append(convertTaskItemToSession(task))
-        }
-        
-        return sessions
+
+    private func convertUnifiedTasksToSessions() -> [AgentTaskSession] {
+        let activeTasks = unifiedTaskManager.tasks.filter { $0.status != .completed }
+        let recentCompletedTasks = unifiedTaskManager.tasks
+            .filter { $0.status == .completed }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(5)
+
+        let visibleTasks = uniqueTasks(activeTasks + Array(recentCompletedTasks))
+            .sorted { lhs, rhs in
+                if lhs.updatedAt == rhs.updatedAt {
+                    return lhs.createdAt > rhs.createdAt
+                }
+                return lhs.updatedAt > rhs.updatedAt
+            }
+
+        return visibleTasks.map(convertUnifiedTaskToSession)
     }
-    
-    /// 将单个 TaskItem 转换为 AgentTaskSession
-    private func convertTaskItemToSession(_ task: TaskItem) -> AgentTaskSession {
-        // 映射状态
-        let sessionStatus: TaskSessionStatus
-        switch task.status {
-        case .pending:
-            sessionStatus = .queued
-        case .running:
-            sessionStatus = .running
-        case .paused:
-            sessionStatus = .waitingUser
-        case .completed:
-            sessionStatus = .completed
-        case .failed:
-            sessionStatus = .failed
-        }
-        
-        // 转换消息
-        let sessionMessages = task.messages.map { msg in
-            TaskSessionMessage(
-                id: UUID(),
-                role: msg.role == .user ? .user : (msg.role == .assistant ? .assistant : .system),
-                content: msg.content,
-                timestamp: msg.timestamp,
-                agentName: msg.agentName
-            )
-        }
-        
+
+    private func convertUnifiedTaskToSession(_ task: UnifiedTask) -> AgentTaskSession {
+        let sessionID = unifiedSessionID(for: task.id)
+
         return AgentTaskSession(
-            id: "taskmanager-\(task.id)",
+            id: sessionID,
             title: task.title,
-            originalRequest: task.inputContext,
+            originalRequest: task.originalRequest ?? task.inputContext,
             createdAt: task.createdAt,
             updatedAt: task.updatedAt,
-            status: sessionStatus,
-            statusSummary: task.description,
+            status: taskSessionStatus(for: task),
+            statusSummary: taskSessionSummary(for: task),
             mainAgentName: task.assignedAgentName,
-            intentName: task.type.rawValue.replacingOccurrences(of: "_", with: " "),
-            messages: sessionMessages,
+            intentName: task.type.displayName,
+            isExpanded: true,
+            messages: taskSessionMessages(for: task),
             resultSummary: task.result,
-            errorMessage: task.status == .failed ? "任务执行失败" : nil,
-            canResume: task.status == .pending || task.status == .paused
+            errorMessage: task.errorMessage,
+            gatewaySessionKey: task.gatewaySessionKey,
+            requestStartedAt: task.startedAt,
+            latestAssistantText: latestAssistantText(for: task),
+            canResume: canResume(task),
+            lastReconciledAt: task.updatedAt,
+            dismissedAt: dismissedUnifiedSessionDates[sessionID]
         )
+    }
+
+    private func taskSessionStatus(for task: UnifiedTask) -> TaskSessionStatus {
+        switch task.status {
+        case .pending:
+            return task.type == .exceptionRecovery ? .waitingUser : .queued
+        case .running:
+            return .running
+        case .paused:
+            return .waitingUser
+        case .completed:
+            return .completed
+        case .failed:
+            return .failed
+        }
+    }
+
+    private func taskSessionSummary(for task: UnifiedTask) -> String {
+        if task.status == .failed, let errorMessage = task.errorMessage, !errorMessage.isEmpty {
+            return errorMessage
+        }
+
+        if task.status == .completed, let result = task.result, !result.isEmpty {
+            return String(result.prefix(120))
+        }
+
+        if let scheduledTime = task.scheduledTime, task.status == .pending {
+            return "计划执行于 \(scheduledTime.formatted(date: .abbreviated, time: .shortened))"
+        }
+
+        if !task.description.isEmpty {
+            return task.description
+        }
+
+        if let latestLog = task.logs.last, !latestLog.message.isEmpty {
+            return latestLog.message
+        }
+
+        if !task.inputContext.isEmpty {
+            return String(task.inputContext.prefix(120))
+        }
+
+        return task.type.displayName
+    }
+
+    private func taskSessionMessages(for task: UnifiedTask) -> [TaskSessionMessage] {
+        let mappedMessages = task.messages.map { message in
+            TaskSessionMessage(
+                id: message.id,
+                role: messageRole(for: message.role),
+                content: message.content,
+                timestamp: message.timestamp,
+                agentName: message.agentName
+            )
+        }
+
+        guard !mappedMessages.isEmpty else {
+            return task.logs.suffix(6).map { log in
+                TaskSessionMessage(
+                    role: .system,
+                    content: log.message,
+                    timestamp: log.timestamp,
+                    agentName: log.source
+                )
+            }
+        }
+
+        return mappedMessages
+    }
+
+    private func latestAssistantText(for task: UnifiedTask) -> String? {
+        task.messages.last(where: { $0.role == .assistant })?.content
+    }
+
+    private func canResume(_ task: UnifiedTask) -> Bool {
+        task.status != .running
+    }
+
+    private func messageRole(for role: TaskMessage.TaskMessageRole) -> MessageRole {
+        switch role {
+        case .user:
+            return .user
+        case .assistant:
+            return .assistant
+        case .system, .cli:
+            return .system
+        }
+    }
+
+    private func uniqueTasks(_ tasks: [UnifiedTask]) -> [UnifiedTask] {
+        var seen = Set<String>()
+        return tasks.filter { task in
+            seen.insert(task.id).inserted
+        }
+    }
+
+    private func unifiedSessionID(for taskID: String) -> String {
+        "\(unifiedSessionPrefix)\(taskID)"
+    }
+
+    private func unifiedTaskID(from sessionID: String) -> String? {
+        guard sessionID.hasPrefix(unifiedSessionPrefix) else { return nil }
+        return String(sessionID.dropFirst(unifiedSessionPrefix.count))
+    }
+
+    private func isUnifiedTaskSession(_ sessionID: String) -> Bool {
+        unifiedTaskID(from: sessionID) != nil
     }
 }

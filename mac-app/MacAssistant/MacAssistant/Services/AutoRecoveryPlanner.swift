@@ -72,7 +72,6 @@ final class AutoRecoveryPlanner: ObservableObject {
     
     private let analyzer = ExecutionAnalyzer.shared
     private let agentStore = AgentStore.shared
-    private let coordinator = SubtaskCoordinator.shared
     
     private var executionCancellables: [UUID: Task<Void, Never>] = [:]
     
@@ -370,8 +369,7 @@ final class AutoRecoveryPlanner: ObservableObject {
     }
     
     private func executeTaskSplit(_ plan: RecoveryPlan) async -> Bool {
-        // 使用 SubtaskCoordinator 拆分任务
-        // 简化实现
+        // 这里不再由 SubtaskCoordinator 自主规划，后续应由 Planner 生成 SubtaskPlan 再交执行层落地
         return true
     }
     

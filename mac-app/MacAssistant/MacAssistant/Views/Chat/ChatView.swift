@@ -13,9 +13,8 @@ struct ChatView: View {
     @StateObject private var agentStore = AgentStore.shared
     @StateObject private var orchestrator = AgentOrchestrator.shared
     @StateObject private var intelligence = ConversationIntelligence.shared
-    @StateObject private var clawDoctor = OpenClawDoctor.shared
+    @StateObject private var runtimeDoctor = RuntimeDoctor.shared
     @StateObject private var skillsBrowserState = SkillsBrowserState.shared
-    @StateObject private var taskManager = TaskManager.shared
     
     @State private var inputText: String = ""
     @State private var scrollProxy: ScrollViewProxy? = nil
@@ -24,8 +23,8 @@ struct ChatView: View {
     @State private var showSkills: Bool = false
     @State private var showClawDoctor: Bool = false
     @State private var showDiskMonitor: Bool = false
-    @State private var showToDoList: Bool = false
     @State private var showBundleStore: Bool = false
+    @State private var showBrowserAgent: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
@@ -38,8 +37,6 @@ struct ChatView: View {
     @ObservedObject private var diskManager = DiskManager.shared
 
     private let bottomAnchorID = "chat-bottom-anchor"
-    private let taskShelfTopInset: CGFloat = 88
-    private let taskShelfTrailingInset: CGFloat = 20
     private let taskPanelTopInset: CGFloat = 68
     private let taskPanelTrailingInset: CGFloat = 124
     
@@ -54,7 +51,7 @@ struct ChatView: View {
         .onAppear {
             setupNotifications()
             presentInitialSetupIfNeeded()
-            clawDoctor.startMonitoring()
+            runtimeDoctor.startMonitoring()
             Task {
                 await diskManager.startMonitoring()
             }
@@ -106,7 +103,7 @@ struct ChatView: View {
                 .frame(width: 760, height: 540)
         }
         .popover(isPresented: $showClawDoctor, attachmentAnchor: .point(.top), arrowEdge: .top) {
-            OpenClawDoctorPanelView(doctor: clawDoctor)
+            RuntimeDoctorPanelView(doctor: runtimeDoctor)
         }
         .sheet(isPresented: $showDiskMonitor) {
             DiskMonitorView()
@@ -116,92 +113,96 @@ struct ChatView: View {
             BundleStoreView()
                 .frame(minWidth: 800, minHeight: 700)
         }
-        .popover(isPresented: $showToDoList, attachmentAnchor: .point(.topTrailing), arrowEdge: .top) {
-            ToDoListView()
+        .sheet(isPresented: $showBrowserAgent) {
+            SimpleBrowserAgentView()
+                .frame(minWidth: 760, minHeight: 560)
         }
     }
     
     // MARK: - 子视图
     
     private var topBar: some View {
-        HStack(spacing: 10) {
-            // Agent 选择器
-            Button(action: { showAgentList = true }) {
-                HStack(spacing: 4) {
-                    Text(orchestrator.currentAgent?.emoji ?? "🤖")
-                    Text(orchestrator.currentAgent?.name ?? (agentStore.needsInitialSetup ? "配置 Agent" : "选择 Agent"))
-                        .font(.system(size: 13, weight: .medium))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 10))
+        HStack(spacing: 0) {
+            // ===== 左侧：核心功能区 =====
+            HStack(spacing: 8) {
+                // Agent 选择器
+                Button(action: { showAgentList = true }) {
+                    HStack(spacing: 4) {
+                        Text(orchestrator.currentAgent?.emoji ?? "🤖")
+                        Text(orchestrator.currentAgent?.name ?? (agentStore.needsInitialSetup ? "配置 Agent" : "选择 Agent"))
+                            .font(.system(size: 13, weight: .medium))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9))
+                    }
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.secondary.opacity(0.12))
+                    .cornerRadius(6)
                 }
-                .foregroundColor(.primary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color.secondary.opacity(0.1))
-                .cornerRadius(6)
+                .buttonStyle(PlainButtonStyle())
+
+                RuntimeStatusEntry(doctor: runtimeDoctor) {
+                    showClawDoctor = true
+                }
             }
-            .buttonStyle(PlainButtonStyle())
+            
+            // 分隔线
+            Divider()
+                .frame(height: 24)
+                .padding(.horizontal, 12)
+            
+            // ===== 中间：工具功能区 =====
+            HStack(spacing: 4) {
+                // 任务中心按钮（统一最近任务与任务管理）
+                UnifiedTaskEntryButton()
+                
+                // 服务管理按钮
+                ServiceEntryButton()
+                
+                // AI 浏览器入口按钮
+                BrowserAgentEntryButton {
+                    showBrowserAgent = true
+                }
 
-            OpenClawStatusEntry(doctor: clawDoctor) {
-                showClawDoctor = true
+                toolbarIconButton(
+                    systemImage: "internaldrive",
+                    helpText: "磁盘管理"
+                ) {
+                    showDiskMonitor = true
+                }
             }
-
-            Spacer(minLength: 12)
-
+            
+            Spacer()
+            
+            // 智能建议（如果有）
             if let suggestion = orchestrator.getSuggestion(for: inputText) {
                 Text(suggestion)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
-                    .frame(maxWidth: 220, alignment: .trailing)
+                    .frame(maxWidth: 200, alignment: .trailing)
             }
-
-            // 子任务按钮
-            SubtaskEntryButton()
             
-            // 任务列表按钮（ToDoList）
-            Button(action: { showToDoList = true }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "checklist")
-                        .font(.system(size: 14))
-                    let taskCount = TaskManager.shared.pendingTasks.count + TaskManager.shared.runningTasks.count
-                    if taskCount > 0 {
-                        Text("\(taskCount)")
-                            .font(.system(size: 10, weight: .semibold))
-                    }
+            // ===== 右侧：扩展功能区 =====
+            HStack(spacing: 4) {
+                toolbarIconButton(
+                    systemImage: "cube.box",
+                    helpText: "Bundle Store"
+                ) {
+                    showBundleStore = true
                 }
-                .foregroundColor(.primary)
+
+                toolbarIconButton(
+                    systemImage: "gear",
+                    helpText: "设置"
+                ) {
+                    showSkills = true
+                }
             }
-            .buttonStyle(PlainButtonStyle())
-            .help("任务列表")
-            
-            // 磁盘管理按钮
-            Button(action: { showDiskMonitor = true }) {
-                Image(systemName: "internaldrive")
-                    .font(.system(size: 14))
-                    .foregroundColor(.primary)
-            }
-            .buttonStyle(PlainButtonStyle())
-            .help("磁盘管理")
-            
-            // Bundle Store 按钮
-            Button(action: { showBundleStore = true }) {
-                Image(systemName: "cube.box")
-                    .font(.system(size: 14))
-            }
-            .buttonStyle(PlainButtonStyle())
-            .help("Bundle Store")
-            
-            // 设置按钮
-            Button(action: { showSkills = true }) {
-                Image(systemName: "wand.and.stars")
-                    .font(.system(size: 14))
-            }
-            .buttonStyle(PlainButtonStyle())
-            .help("Skills")
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
         .background(AppColors.controlBackground)
     }
 
@@ -209,12 +210,6 @@ struct ChatView: View {
         VStack(spacing: 0) {
             ZStack(alignment: .topTrailing) {
                 messageList
-
-                // [统一任务管理] 快速任务访问入口
-                QuickTaskAccessView()
-                    .padding(.trailing, 16)
-                    .padding(.top, 12)
-                    .zIndex(3)
 
                 // [兼容] 任务会话详情面板
                 taskSessionPanel
@@ -482,11 +477,35 @@ struct ChatView: View {
             scrollToBottom(proxy: scrollProxy, animated: true, force: true)
         }
         
+        // 浏览器命令检测已移至 ConversationController 统一处理
+        // 这样可以避免重复逻辑，确保所有输入都经过统一的路由
         conversationController.processInput(text)
     }
     
     private func takeScreenshot() {
         conversationController.handleScreenshot()
+    }
+
+    private func toolbarIconButton(
+        systemImage: String,
+        helpText: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundColor(.primary)
+                .frame(width: 32, height: 28)
+                .background(Color.secondary.opacity(0.08))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .help(helpText)
+        .accessibilityLabel(helpText)
     }
     
     private func setupNotifications() {

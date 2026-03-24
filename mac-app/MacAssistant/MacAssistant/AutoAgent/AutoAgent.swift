@@ -119,7 +119,25 @@ class AutoAgent: ObservableObject {
         LogInfo("🤖 AutoAgent 初始化开始")
         requestNotificationPermissions()
         setupTimers()
+        
+        // 启动 PlannerWakeService
+        Task { @MainActor in
+            PlannerWakeService.shared.start()
+            LogInfo("✅ PlannerWakeService 已启动")
+        }
+        
         LogInfo("✅ AutoAgent 初始化完成")
+    }
+    
+    func stop() {
+        urgentScanTimer?.invalidate()
+        deepAnalysisTimer?.invalidate()
+        
+        Task { @MainActor in
+            PlannerWakeService.shared.stop()
+        }
+        
+        LogInfo("🛑 AutoAgent 已停止")
     }
     
     deinit {
@@ -254,8 +272,16 @@ class AutoAgent: ObservableObject {
             return
         }
         
-        // 简化深度分析：只记录系统状态，不做主动 AI 分析
-        // AI 分析由用户主动触发（通过对话）
+        // 使用 PlannerWakeService 替换原有的深度分析
+        Task {
+            LogInfo("[AutoAgent] 触发 Planner 周期巡检")
+            await PlannerWakeService.shared.wake(
+                trigger: .periodicLightCheck,
+                reason: "AutoAgent 周期巡检"
+            )
+        }
+        
+        // 保留系统状态记录
         let context = currentContext ?? collectSystemContext()
         LogDebug("📊 系统状态记录: CPU \(Int(context.cpuUsage))%, 内存 \(Int(context.memoryUsage))%")
     }

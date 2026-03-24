@@ -1,6 +1,6 @@
 //
 //  MacAssistantApp.swift
-//  OpenClaw 版 - OpenClaw + Kimi Bridge v5.0.0
+//  Native Runtime Edition
 //
 
 import SwiftUI
@@ -35,16 +35,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusBar()
         setupMainWindow()
 
-        // 启动 Gateway
-        Task {
-            do {
-                try await OpenClawGatewayClient.shared.prepareGateway()
-                LogInfo("🦞 OpenClaw gateway wrapper 已就绪")
-            } catch {
-                LogError("OpenClaw gateway wrapper 启动失败", error: error)
-            }
-        }
+        // 初始化服务任务管理器
+        _ = ServiceTaskManager.shared
+        LogInfo("🤖 服务任务管理器已初始化")
         
+        // 初始化 Skill Catalog 系统（Phase 5）
+        Task { @MainActor in
+            // 触发 SkillCatalog 懒加载
+            _ = SkillCatalog.shared
+            
+            // 同步所有适配器
+            await SkillAdapterRegistry.shared.syncToCatalog()
+            
+            // 输出统计
+            let stats = SkillCatalog.shared.statistics()
+            LogInfo("🎯 Skill Catalog 已初始化: \(stats.total) 个 Skills")
+            LogInfo("   - 按类型: \(stats.byType)")
+            LogInfo("   - 按领域: \(stats.byDomain)")
+        }
+
         // 启动 AutoAgent 分析
         AutoAgent.shared.requestImmediateAnalysis()
         
@@ -60,7 +69,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
-        window?.title = "Mac Assistant - OpenClaw"
+        window?.title = "Mac Assistant"
         window?.contentView = NSHostingView(rootView: contentView)
         window?.setFrameAutosaveName("MainWindow")
     }
@@ -177,20 +186,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.terminate(nil)
     }
     
-    /// 引导完成，启动 Gateway 和显示主窗口
+    /// 引导完成，显示主窗口
     @objc func onboardingDidComplete() {
         LogInfo("🎉 引导完成，启动主功能")
-        
-        Task {
-            do {
-                _ = try await OpenClawGatewayClient.shared.prepareGateway()
-                LogInfo("🦞 OpenClaw gateway wrapper 已就绪")
-            } catch {
-                LogError("OpenClaw gateway wrapper 启动失败", error: error)
-            }
-        }
-        
-        // 显示主窗口
         showWindow()
     }
 
