@@ -119,72 +119,38 @@ struct ChatView: View {
     
     private var topBar: some View {
         HStack(spacing: 0) {
-            // ===== 左侧：核心功能区 =====
-            HStack(spacing: 8) {
-                // Agent 选择器
-                Button(action: { showAgentList = true }) {
-                    HStack(spacing: 4) {
-                        Text(orchestrator.currentAgent?.emoji ?? "🤖")
-                        Text(orchestrator.currentAgent?.name ?? (agentStore.needsInitialSetup ? "配置 Agent" : "选择 Agent"))
-                            .font(.system(size: 13, weight: .medium))
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9))
-                    }
-                    .foregroundColor(.primary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Color.secondary.opacity(0.12))
-                    .cornerRadius(6)
+            // ===== 左侧：Agent 选择器 =====
+            Button(action: { showAgentList = true }) {
+                HStack(spacing: 4) {
+                    Text(orchestrator.currentAgent?.emoji ?? "🤖")
+                    Text(orchestrator.currentAgent?.name ?? (agentStore.needsInitialSetup ? "配置 Agent" : "选择 Agent"))
+                        .font(.system(size: 13, weight: .medium))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9))
                 }
-                .buttonStyle(PlainButtonStyle())
-
-                RuntimeStatusEntry(doctor: runtimeDoctor) {
-                    showClawDoctor = true
-                }
+                .foregroundColor(.primary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(6)
             }
+            .buttonStyle(PlainButtonStyle())
             
-            // 分隔线
-            ToolbarDivider()
-            
-            // ===== 中间：工具功能区 =====
-            HStack(spacing: 4) {
-                // 任务中心按钮（统一最近任务与任务管理）
-                UnifiedTaskEntryButton()
-                
-                // 服务管理按钮
-                ServiceEntryButton()
-                
-                // AI 浏览器入口按钮（暂时隐藏）
-                // BrowserAgentEntryButton { showBrowserAgent = true }
-
-                ToolbarIconButton(
-                    systemImage: "internaldrive",
-                    helpText: "磁盘管理"
-                ) {
-                    showDiskMonitor = true
-                }
-            }
-            
-            Spacer()
-            
-            // 智能建议（如果有）
+            // ===== 中间：智能建议（如果有）=====
             if let suggestion = orchestrator.getSuggestion(for: inputText) {
+                Spacer()
                 Text(suggestion)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .frame(maxWidth: 200, alignment: .trailing)
+                Spacer()
+            } else {
+                Spacer()
             }
             
-            // ===== 右侧：扩展功能区 =====
-            HStack(spacing: 4) {
-                ToolbarIconButton(
-                    systemImage: "gear",
-                    helpText: "设置"
-                ) {
-                    showSkills = true
-                }
-            }
+            // ===== 右侧：四个入口 =====
+            SmartToolbar()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
