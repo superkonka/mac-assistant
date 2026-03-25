@@ -70,7 +70,13 @@ final class SkillExecutor {
             return .failure(error: "Skill '\(skillId)' 未找到")
         }
         
-        // 2. 验证输入参数
+        // 2. 检查是否启用
+        guard SkillCatalog.shared.isEnabled(id: skillId) else {
+            LogError("[SkillExecutor] Skill 已禁用: \(skillId)")
+            return .failure(error: "Skill '\(skillId)' 已禁用，请在 Skills 管理中启用")
+        }
+        
+        // 3. 验证输入参数
         let validation = validateInput(manifest: manifest, input: input)
         if !validation.isValid {
             return .failure(error: "缺少必需参数: \(validation.missingParams.joined(separator: ", "))")
@@ -84,7 +90,8 @@ final class SkillExecutor {
             result = await executeLocalSkill(manifest: manifest, input: input, context: context)
             
         case .browser:
-            result = await executeBrowserSkill(manifest: manifest, input: input, context: context)
+            // Browser 技能已移除
+            result = .failure(error: "Browser 技能已不可用")
             
         case .agent:
             result = await executeAgentSkill(manifest: manifest, input: input, context: context)
@@ -169,7 +176,9 @@ final class SkillExecutor {
         }
         
         // 2. 尝试从 executorConfig 获取命令
-        if let command = manifest.executorConfig["command"] {
+        if var command = manifest.executorConfig["command"] {
+            // 替换模板变量 {{key}} 为实际值
+            command = substituteTemplateVariables(command, input: input, manifest: manifest)
             return await executeShellCommand(command, input: input)
         }
         
@@ -180,79 +189,61 @@ final class SkillExecutor {
         )
     }
     
-    /// 执行浏览器 Skill
+    /// 替换命令模板中的变量 {{key}} 为实际值
+    private func substituteTemplateVariables(
+        _ command: String,
+        input: [String: Any],
+        manifest: SkillManifest
+    ) -> String {
+        var result = command
+        
+        // 遍历所有参数定义，替换模板变量
+        for param in manifest.inputSchema.parameters {
+            let key = param.name
+            let placeholder = "{{\(key)}}"
+            
+            // 获取参数值：从 input 中获取，或使用默认值
+            let value: String
+            if let inputValue = input[key] {
+                value = String(describing: inputValue)
+            } else if let defaultValue = param.defaultValue {
+                value = defaultValue
+            } else {
+                // 必需参数缺失，保持原样（后续命令会失败）
+                continue
+            }
+            
+            // 替换模板变量
+            result = result.replacingOccurrences(of: placeholder, with: value)
+        }
+        
+        // 处理 text 参数（兼容旧格式，将 input["text"] 作为未匹配变量的备选）
+        if let textValue = input["text"] as? String {
+            // 如果还有未替换的 {{xxx}} 变量，尝试用 text 替换
+            let pattern = #"\{\{([^}]+)\}\}"#
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []) {
+                let range = NSRange(result.startIndex..., in: result)
+                let matches = regex.matches(in: result, options: [], range: range)
+                
+                // 从后往前替换，避免位置变化
+                for match in matches.reversed() {
+                    if let matchRange = Range(match.range, in: result) {
+                        result.replaceSubrange(matchRange, with: textValue)
+                    }
+                }
+            }
+        }
+        
+        return result
+    }
+    
+    /// 执行浏览器 Skill（已弃用）
     private func executeBrowserSkill(
         manifest: SkillManifest,
         input: [String: Any],
         context: SkillExecutionContext
     ) async -> SkillExecutionResult {
-        LogInfo("[SkillExecutor] 执行浏览器 Skill: \(manifest.name)")
-        
-        // 获取 BrowserAgentService
-        let browserService = BrowserAgentService.shared
-        
-        // 根据 Skill ID 执行不同操作
-        switch manifest.id {
-        case "browser.navigate":
-            guard let url = input["url"] as? String else {
-                return .failure(error: "缺少 url 参数")
-            }
-            
-            do {
-                try await browserService.navigate(to: url)
-                return .success(
-                    output: "已导航到: \(url)",
-                    data: ["url": url, "skill": manifest.id]
-                )
-            } catch {
-                return .failure(error: "导航失败: \(error.localizedDescription)")
-            }
-            
-        case "browser.screenshot":
-            // 浏览器截图
-            do {
-                let screenshotResult = try await browserService.screenshot()
-                if screenshotResult.success {
-                    let screenshotData = screenshotResult.data
-                    return .success(
-                        output: "浏览器截图已捕获",
-                        data: ["screenshot_data": screenshotData as Any, "skill": manifest.id]
-                    )
-                } else {
-                    return .failure(error: "截图失败: \(screenshotResult.message)")
-                }
-            } catch {
-                return .failure(error: "截图失败: \(error.localizedDescription)")
-            }
-            
-        case "whatsapp.send":
-            guard let contact = input["contact"] as? String,
-                  let message = input["message"] as? String else {
-                return .failure(error: "缺少 contact 或 message 参数")
-            }
-            
-            let whatsappURL = "https://web.whatsapp.com/send?phone=\(contact)&text=\(message.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")"
-            
-            do {
-                try await browserService.navigate(to: whatsappURL)
-                return .success(
-                    output: "已打开 WhatsApp 网页版，准备发送消息给 \(contact)",
-                    data: ["contact": contact, "skill": manifest.id]
-                )
-            } catch {
-                return .failure(error: "打开 WhatsApp 失败: \(error.localizedDescription)")
-            }
-            
-        default:
-            return .success(
-                output: "浏览器 Skill '\(manifest.name)' 已准备",
-                data: [
-                    "skill_id": manifest.id,
-                    "capabilities": manifest.capabilities.map { $0.fullIdentifier },
-                    "input": input
-                ]
-            )
-        }
+        return .failure(error: "Browser 技能已不可用")
     }
     
     /// 执行 Agent Skill

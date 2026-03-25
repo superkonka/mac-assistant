@@ -383,6 +383,10 @@ actor STDIOConnection {
         }
     }
     
+    private func setPendingRequest(id: String, continuation: CheckedContinuation<MCPResponse, Error>) {
+        pendingRequests[id] = continuation
+    }
+    
     func sendRequest(_ request: MCPRequest) async throws -> MCPResponse {
         guard !isClosed, let stdin = stdin else {
             throw MCPError.connectionClosed
@@ -394,10 +398,15 @@ actor STDIOConnection {
         }
         
         return try await withTimeout(seconds: 30) {
-            try await withCheckedThrowingContinuation { continuation in
-                self.pendingRequests[request.id] = continuation
+            let requestId = request.id
+            let dataToSend = (jsonString + "\n").data(using: .utf8)
+            return try await withCheckedThrowingContinuation { continuation in
+                Task { @Sendable [weak self] in
+                    guard let self = self else { return }
+                    await self.setPendingRequest(id: requestId, continuation: continuation)
+                }
                 
-                if let lineData = (jsonString + "\n").data(using: .utf8) {
+                if let lineData = dataToSend {
                     stdin.fileHandleForWriting.write(lineData)
                 }
             }
@@ -569,17 +578,25 @@ actor WebSocketConnection {
         }
         
         let data = try JSONEncoder().encode(request)
+        let requestId = request.id
         
         return try await withCheckedThrowingContinuation { continuation in
-            pendingRequests[request.id] = continuation
+            Task { @Sendable [weak self] in
+                guard let self = self else { return }
+                await self.setPendingRequest(id: requestId, continuation: continuation)
+            }
             
             task.send(.data(data)) { [weak self] error in
                 if let error = error {
-                    Task { await self?.removePendingRequest(id: request.id) }
+                    Task { await self?.removePendingRequest(id: requestId) }
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+    
+    private func setPendingRequest(id: String, continuation: CheckedContinuation<MCPResponse, Error>) {
+        pendingRequests[id] = continuation
     }
     
     private func removePendingRequest(id: String) {

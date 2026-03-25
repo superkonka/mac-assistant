@@ -113,9 +113,22 @@ final class IntentMatcher {
     }
     
     private func registerSkillCapabilities() {
+        // 为每个 Skill 定义精准的关键词，避免模糊匹配
+        let skillKeywords: [AISkill: [String]] = [
+            .screenshot: ["截图", "屏幕", "拍照", "capture", "screen", "snapshot", "图像识别"],
+            .analyzeDisk: ["磁盘", "硬盘", "存储", "空间", "容量", "disk", "storage", "清理", "大文件"],
+            .codeReview: ["代码", "审查", "review", "code", "质量", "优化建议"],
+            .explainSelection: ["解释", "选中", "selection", "说明", "含义"],
+            .translateText: ["翻译", "translate", "语言", "英文", "中文", "转换"],
+            .summarizeText: ["总结", "摘要", "summarize", "概括", "核心内容"]
+        ]
+        
         for skill in AISkill.allCases {
-            let keywords = extractKeywords(from: skill.name + " " + skill.description)
-            let vector = embeddingService.embed(skill.description + " " + skill.name)
+            // 使用预定义的关键词，避免提取出模糊词汇
+            let keywords = skillKeywords[skill] ?? extractKeywords(from: skill.name + " " + skill.description)
+            // 向量化时优先使用关键词，让语义更精准
+            let vectorText = skill.name + " " + keywords.joined(separator: " ")
+            let vector = embeddingService.embed(vectorText)
             
             capabilityRegistry.append(CapabilityVector(
                 id: "skill_\(skill.rawValue)",
@@ -195,9 +208,47 @@ final class IntentMatcher {
     }
     
     /// 匹配多个相关能力（用于任务拆解）
-    func matchMultipleIntents(_ userInput: String, maxResults: Int = 3, threshold: Double = 0.3) -> [IntentMatch] {
+    /// - 提高阈值避免无关匹配
+    /// - 去重避免同类技能重复执行
+    func matchMultipleIntents(_ userInput: String, maxResults: Int = 2, threshold: Double = 0.55) -> [IntentMatch] {
         let allMatches = matchIntent(userInput, threshold: threshold)
-        return Array(allMatches.prefix(maxResults))
+        
+        // 去重：同一 domain 的技能只保留得分最高的
+        var seenDomains: Set<String> = []
+        var uniqueMatches: [IntentMatch] = []
+        
+        for match in allMatches {
+            let domain = extractDomain(from: match.capability.id)
+            if !seenDomains.contains(domain) {
+                seenDomains.insert(domain)
+                uniqueMatches.append(match)
+                
+                if uniqueMatches.count >= maxResults {
+                    break
+                }
+            }
+        }
+        
+        return uniqueMatches
+    }
+    
+    /// 提取 domain 用于去重
+    private func extractDomain(from capabilityID: String) -> String {
+        // disk_manager_analyze -> disk
+        // resource_analyzer -> resource
+        // skill_screenshot -> screenshot
+        if capabilityID.hasPrefix("skill_") {
+            return capabilityID.replacingOccurrences(of: "skill_", with: "")
+        }
+        if capabilityID.hasPrefix("agent_") {
+            return "agent"
+        }
+        // 提取前缀作为 domain
+        let components = capabilityID.split(separator: "_")
+        if components.count >= 1 {
+            return String(components[0])
+        }
+        return capabilityID
     }
     
     // MARK: - 辅助方法
@@ -259,15 +310,38 @@ final class IntentMatcher {
 extension SubtaskCoordinator {
     
     /// 基于向量意图匹配的智能任务拆解
+    /// - 只在高置信度匹配时才拆解
+    /// - 避免过度拆分简单请求
     @MainActor
     func analyzeAndDecomposeWithIntentMatching(request: String) -> [Subtask] {
         let matcher = IntentMatcher.shared
-        let matches = matcher.matchMultipleIntents(request, maxResults: 4, threshold: 0.3)
+        
+        // 先尝试单一最佳匹配
+        if let bestMatch = matcher.matchBestIntent(request, threshold: 0.7) {
+            // 如果最佳匹配置信度足够高，不拆解，直接执行
+            let parentID = UUID().uuidString
+            let subtask = createSubtaskFromMatch(bestMatch, index: 0, parentID: parentID, request: request)
+            addSubtasks([subtask])
+            LogInfo("意图匹配: 单一高置信度匹配 \(bestMatch.capability.name) (\(String(format: "%.2f", bestMatch.score)))")
+            return [subtask]
+        }
+        
+        // 否则尝试多意图匹配（需要多个相关能力）
+        let matches = matcher.matchMultipleIntents(request, maxResults: 2, threshold: 0.55)
         
         guard !matches.isEmpty else {
             return [createGenericSubtask(request: request)]
         }
         
+        // 如果只有一个匹配，不拆解
+        if matches.count == 1 {
+            let parentID = UUID().uuidString
+            let subtask = createSubtaskFromMatch(matches[0], index: 0, parentID: parentID, request: request)
+            addSubtasks([subtask])
+            return [subtask]
+        }
+        
+        // 多个匹配时才拆解
         let parentID = UUID().uuidString
         var subtasks: [Subtask] = []
         
@@ -276,11 +350,9 @@ extension SubtaskCoordinator {
             subtasks.append(subtask)
         }
         
-        // 保存子任务
         addSubtasks(subtasks)
         
-        // 记录匹配结果
-        LogInfo("意图匹配结果: \(matches.count) 个匹配")
+        LogInfo("意图匹配: 拆解为 \(matches.count) 个子任务")
         for match in matches {
             LogInfo("  - \(match.capability.name): \(String(format: "%.2f", match.score))")
         }

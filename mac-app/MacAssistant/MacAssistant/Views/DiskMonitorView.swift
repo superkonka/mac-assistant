@@ -6,7 +6,7 @@
 import SwiftUI
 
 // 简单的磁盘信息结构
-struct SimpleDiskInfo: Identifiable {
+struct SimpleDiskInfo: Identifiable, Codable {
     let id = UUID()
     let name: String
     let path: String
@@ -20,6 +20,73 @@ struct SimpleCacheItem: Identifiable {
     let path: String
     let icon: String
     var size: String = "计算中..."
+}
+
+// MARK: - 磁盘分析结果存储
+
+@MainActor
+final class DiskAnalysisStore: ObservableObject {
+    static let shared = DiskAnalysisStore()
+    
+    @Published var lastResults: AnalysisResults?
+    @Published var lastAnalysisTime: Date?
+    @Published var isAnalyzing = false
+    
+    private let resultsKey = "diskAnalysis.lastResults"
+    private let timeKey = "diskAnalysis.lastTime"
+    
+    init() {
+        loadSavedResults()
+    }
+    
+    func saveResults(_ results: AnalysisResults) {
+        lastResults = results
+        lastAnalysisTime = Date()
+        
+        // 保存到 UserDefaults
+        if let encoded = try? JSONEncoder().encode(results) {
+            UserDefaults.standard.set(encoded, forKey: resultsKey)
+        }
+        UserDefaults.standard.set(lastAnalysisTime, forKey: timeKey)
+    }
+    
+    func loadSavedResults() {
+        if let data = UserDefaults.standard.data(forKey: resultsKey),
+           let decoded = try? JSONDecoder().decode(AnalysisResults.self, from: data) {
+            lastResults = decoded
+        }
+        lastAnalysisTime = UserDefaults.standard.object(forKey: timeKey) as? Date
+    }
+    
+    func clearResults() {
+        lastResults = nil
+        lastAnalysisTime = nil
+        UserDefaults.standard.removeObject(forKey: resultsKey)
+        UserDefaults.standard.removeObject(forKey: timeKey)
+    }
+}
+
+// 可持久化的分析结果
+struct AnalysisResults: Codable {
+    var categories: [CategoryResult] = []
+    var largeFiles: [LargeFileResult] = []
+    var analyzedPaths: [String] = []
+    
+    struct CategoryResult: Codable {
+        let name: String
+        let icon: String
+        let colorName: String
+        let size: String
+        let bytes: Int64
+    }
+    
+    struct LargeFileResult: Codable, Identifiable {
+        let id = UUID()
+        let name: String
+        let path: String
+        let size: String
+        let bytes: Int64
+    }
 }
 
 struct DiskMonitorView: View {
@@ -365,15 +432,9 @@ struct SimpleCacheRow: View {
 // MARK: - 智能分析
 
 struct SmartAnalysisTab: View {
-    @State private var isAnalyzing = false
+    @StateObject private var store = DiskAnalysisStore.shared
     @State private var progress: Double = 0
     @State private var currentPath = ""
-    @State private var results: AnalysisResults?
-    
-    struct AnalysisResults {
-        var categories: [(name: String, icon: String, color: Color, size: String)] = []
-        var largeFiles: [(name: String, path: String, size: String)] = []
-    }
     
     var body: some View {
         ScrollView {
@@ -393,21 +454,21 @@ struct SmartAnalysisTab: View {
                     
                     Spacer()
                     
-                    Button(isAnalyzing ? "停止" : "开始分析") {
-                        if isAnalyzing {
+                    Button(store.isAnalyzing ? "停止" : (store.lastResults != nil ? "重新分析" : "开始分析")) {
+                        if store.isAnalyzing {
                             stopAnalysis()
                         } else {
                             startAnalysis()
                         }
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(isAnalyzing ? .red : .blue)
+                    .tint(store.isAnalyzing ? .red : .blue)
                 }
                 .padding()
                 .background(Color.gray.opacity(0.1))
                 .cornerRadius(10)
                 
-                if isAnalyzing {
+                if store.isAnalyzing {
                     VStack(spacing: 12) {
                         ProgressView()
                             .scaleEffect(1.2)
@@ -432,8 +493,26 @@ struct SmartAnalysisTab: View {
                     .cornerRadius(10)
                 }
                 
-                if let results = results, !isAnalyzing {
-                    SimpleAnalysisResultsView(results: results)
+                // 显示上次分析结果
+                if let results = store.lastResults, !store.isAnalyzing {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("上次分析: \(formatTime(store.lastAnalysisTime))")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Spacer()
+                            
+                            Button("清除记录") {
+                                store.clearResults()
+                            }
+                            .font(.caption)
+                            .buttonStyle(.plain)
+                            .foregroundColor(.red)
+                        }
+                        
+                        SimpleAnalysisResultsView(results: results)
+                    }
                 }
             }
             .padding()
@@ -441,10 +520,9 @@ struct SmartAnalysisTab: View {
     }
     
     private func startAnalysis() {
-        isAnalyzing = true
+        store.isAnalyzing = true
         progress = 0
         currentPath = ""
-        results = nil
         
         DispatchQueue.global(qos: .userInitiated).async {
             analyzeHomeDirectory()
@@ -452,7 +530,14 @@ struct SmartAnalysisTab: View {
     }
     
     private func stopAnalysis() {
-        isAnalyzing = false
+        store.isAnalyzing = false
+    }
+    
+    private func formatTime(_ date: Date?) -> String {
+        guard let date = date else { return "未知时间" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
     
     private func analyzeHomeDirectory() {
@@ -469,7 +554,7 @@ struct SmartAnalysisTab: View {
         var largeFiles: [(String, String, Int64)] = []
         
         for (index, path) in pathsToScan.enumerated() {
-            if !isAnalyzing { break }
+            if !store.isAnalyzing { break }
             
             DispatchQueue.main.async {
                 self.currentPath = path
@@ -521,23 +606,33 @@ struct SmartAnalysisTab: View {
             Thread.sleep(forTimeInterval: 0.1)
         }
         
-        let mappedFiles = largeFiles.map { (name: $0.0, path: $0.1, size: formatSize($0.2)) }
-            .sorted { $0.size > $1.size }
-            .prefix(5)
-            .map { ($0.name, $0.path, $0.size) }
+        // 构建结果
+        let sortedFiles = largeFiles.sorted { $0.2 > $1.2 }.prefix(10)
+        let fileResults = sortedFiles.map { 
+            AnalysisResults.LargeFileResult(
+                name: $0.0,
+                path: $0.1,
+                size: formatSize($0.2),
+                bytes: $0.2
+            )
+        }
+        
+        let categories = [
+            AnalysisResults.CategoryResult(name: "文档", icon: "doc.text", colorName: "blue", size: "1.2 GB", bytes: 1_200_000_000),
+            AnalysisResults.CategoryResult(name: "图片", icon: "photo", colorName: "green", size: "2.5 GB", bytes: 2_500_000_000),
+            AnalysisResults.CategoryResult(name: "视频", icon: "video", colorName: "red", size: "5.8 GB", bytes: 5_800_000_000),
+            AnalysisResults.CategoryResult(name: "其他", icon: "doc", colorName: "gray", size: "800 MB", bytes: 800_000_000)
+        ]
         
         DispatchQueue.main.async {
-            if self.isAnalyzing {
-                self.results = AnalysisResults(
-                    categories: [
-                        ("文档", "doc.text", .blue, "1.2 GB"),
-                        ("图片", "photo", .green, "2.5 GB"),
-                        ("视频", "video", .red, "5.8 GB"),
-                        ("其他", "doc", .gray, "800 MB")
-                    ],
-                    largeFiles: mappedFiles
+            if self.store.isAnalyzing {
+                let results = AnalysisResults(
+                    categories: categories,
+                    largeFiles: fileResults,
+                    analyzedPaths: pathsToScan
                 )
-                self.isAnalyzing = false
+                self.store.saveResults(results)
+                self.store.isAnalyzing = false
                 self.progress = 1.0
             }
         }
@@ -548,12 +643,16 @@ struct SmartAnalysisTab: View {
         if gb >= 1 {
             return String(format: "%.2f GB", gb)
         }
-        return String(format: "%.0f MB", Double(bytes) / 1_000_000)
+        let mb = Double(bytes) / 1_000_000
+        if mb >= 1 {
+            return String(format: "%.0f MB", mb)
+        }
+        return "\(bytes) B"
     }
 }
 
 struct SimpleAnalysisResultsView: View {
-    let results: SmartAnalysisTab.AnalysisResults
+    let results: AnalysisResults
     
     var body: some View {
         VStack(spacing: 16) {
@@ -571,7 +670,7 @@ struct SimpleAnalysisResultsView: View {
                         VStack(spacing: 4) {
                             Image(systemName: category.icon)
                                 .font(.system(size: 18))
-                                .foregroundColor(category.color)
+                                .foregroundColor(colorFromName(category.colorName))
                             
                             Text(category.name)
                                 .font(.caption)
@@ -597,7 +696,7 @@ struct SimpleAnalysisResultsView: View {
                     Text("大文件发现 (>10MB)")
                         .font(.headline)
                     
-                    ForEach(results.largeFiles, id: \.path) { file in
+                    ForEach(results.largeFiles) { file in
                         HStack {
                             Image(systemName: "doc.fill")
                                 .foregroundColor(.secondary)
@@ -624,6 +723,20 @@ struct SimpleAnalysisResultsView: View {
                 .background(Color.gray.opacity(0.05))
                 .cornerRadius(10)
             }
+        }
+    }
+    
+    private func colorFromName(_ name: String) -> Color {
+        switch name {
+        case "blue": return .blue
+        case "green": return .green
+        case "red": return .red
+        case "gray": return .gray
+        case "orange": return .orange
+        case "purple": return .purple
+        case "pink": return .pink
+        case "yellow": return .yellow
+        default: return .primary
         }
     }
 }
