@@ -32,7 +32,7 @@ struct ParentTaskResults {
     }
     
     var allSuccessful: Bool {
-        subtaskResults.allMatch { $0.status == .completed }
+        subtaskResults.allSatisfy { $0.status == .completed }
     }
     
     var summary: String {
@@ -216,6 +216,7 @@ final class SubtaskResultAggregator {
 extension SubtaskCoordinator {
     /// 获取指定父任务的所有子任务
     func getSubtasks(forParent parentTaskID: String) -> [Subtask] {
-        return subtasks.filter { $0.parentTaskID == parentTaskID }
+        return (pendingSubtasks + runningSubtasks + completedSubtasks)
+            .filter { $0.parentTaskID == parentTaskID }
     }
 }

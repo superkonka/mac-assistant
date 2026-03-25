@@ -10,54 +10,153 @@ import SwiftUI
 struct UnifiedTaskEntryButton: View {
     @StateObject private var manager = UnifiedTaskManager.shared
     @State private var showTaskPanel = false
+    @State private var isHovered = false
 
     private var highlightedCount: Int {
         manager.statistics.pending + manager.statistics.running + manager.statistics.failed
+    }
+
+    private var buttonState: ToolbarButtonState {
+        if highlightedCount == 0 {
+            return .idle
+        }
+        if manager.statistics.failed > 0 {
+            return .error(count: highlightedCount)
+        }
+        return .active(count: highlightedCount)
     }
 
     var body: some View {
         Button {
             showTaskPanel.toggle()
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Image(systemName: "list.bullet.rectangle")
-                    .font(.system(size: 13, weight: .semibold))
-
-                Text("任务")
                     .font(.system(size: 12, weight: .semibold))
 
-                if highlightedCount > 0 {
-                    Text("\(min(highlightedCount, 99))")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(
-                            Capsule()
-                                .fill(Color.white.opacity(0.3))
-                        )
+                Text("任务")
+                    .font(.system(size: 11, weight: .semibold))
+
+                // 智能徽章
+                if case let .active(count) = buttonState, count > 0 {
+                    BadgeView(
+                        count: count,
+                        style: .highlighted,
+                        color: .blue
+                    )
+                } else if case let .error(count) = buttonState, count > 0 {
+                    BadgeView(
+                        count: count,
+                        style: .urgent,
+                        color: .red
+                    )
                 }
             }
-            .foregroundColor(highlightedCount > 0 ? .white : .primary)
+            .foregroundColor(foregroundColor)
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(highlightedCount > 0 ? Color.blue : Color.secondary.opacity(0.15))
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(backgroundColor)
+                    .shadow(
+                        color: shadowColor.opacity(isHovered ? 0.2 : 0.1),
+                        radius: isHovered ? 3 : 2,
+                        x: 0,
+                        y: isHovered ? 1 : 0.5
+                    )
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(
-                        highlightedCount > 0 ? Color.blue.opacity(0.2) : Color.secondary.opacity(0.16),
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .strokeBorder(
+                        borderGradient,
                         lineWidth: 1
                     )
             )
+            .scaleEffect(isHovered ? 1.02 : 1.0)
+            .animation(.easeInOut(duration: 0.15), value: isHovered)
         }
         .buttonStyle(.plain)
-        .help("任务中心 - 统一查看最近任务和任务管理")
+        .help(taskHelpText)
         .accessibilityLabel("任务中心")
         .popover(isPresented: $showTaskPanel, arrowEdge: .top) {
             UnifiedTaskPanelView(onClose: { showTaskPanel = false })
                 .frame(width: 440, height: 500)
+        }
+        .onHover { hovering in
+            isHovered = hovering
+        }
+    }
+
+    // MARK: - 视觉属性
+
+    private var foregroundColor: Color {
+        switch buttonState {
+        case .idle:
+            return .primary
+        case .active, .error:
+            return .white
+        case .warning:
+            return .primary
+        case .checking:
+            return .secondary
+        }
+    }
+
+    private var backgroundColor: Color {
+        switch buttonState {
+        case .idle:
+            return Color.secondary.opacity(0.1)
+        case .active:
+            return Color.blue
+        case .error:
+            return Color.red.opacity(0.9)
+        case .warning:
+            return Color.orange.opacity(0.15)
+        case .checking:
+            return Color.secondary.opacity(0.08)
+        }
+    }
+
+    private var borderGradient: some ShapeStyle {
+        switch buttonState {
+        case .idle:
+            return Color.secondary.opacity(0.15)
+        case .active:
+            return Color.blue.opacity(0.3)
+        case .error:
+            return Color.red.opacity(0.4)
+        case .warning:
+            return Color.orange.opacity(0.3)
+        case .checking:
+            return Color.secondary.opacity(0.15)
+        }
+    }
+
+    private var shadowColor: Color {
+        switch buttonState {
+        case .idle, .checking:
+            return .gray
+        case .active:
+            return .blue
+        case .error:
+            return .red
+        case .warning:
+            return .orange
+        }
+    }
+
+    private var taskHelpText: String {
+        switch buttonState {
+        case .idle:
+            return "任务中心 - 暂无活跃任务"
+        case .active(let count):
+            return "任务中心 - \(count) 个活跃任务"
+        case .error(let count):
+            return "任务中心 - \(count) 个任务需要关注"
+        case .warning(let count):
+            return "任务中心 - \(count) 个任务待处理"
+        case .checking:
+            return "任务中心 - 正在同步..."
         }
     }
 }

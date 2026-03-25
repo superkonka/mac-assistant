@@ -144,9 +144,7 @@ struct ChatView: View {
             }
             
             // 分隔线
-            Divider()
-                .frame(height: 24)
-                .padding(.horizontal, 12)
+            ToolbarDivider()
             
             // ===== 中间：工具功能区 =====
             HStack(spacing: 4) {
@@ -159,7 +157,7 @@ struct ChatView: View {
                 // AI 浏览器入口按钮（暂时隐藏）
                 // BrowserAgentEntryButton { showBrowserAgent = true }
 
-                toolbarIconButton(
+                ToolbarIconButton(
                     systemImage: "internaldrive",
                     helpText: "磁盘管理"
                 ) {
@@ -180,7 +178,7 @@ struct ChatView: View {
             
             // ===== 右侧：扩展功能区 =====
             HStack(spacing: 4) {
-                toolbarIconButton(
+                ToolbarIconButton(
                     systemImage: "gear",
                     helpText: "设置"
                 ) {
@@ -377,28 +375,6 @@ struct ChatView: View {
         conversationController.handleScreenshot()
     }
 
-    private func toolbarIconButton(
-        systemImage: String,
-        helpText: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundColor(.primary)
-                .frame(width: 32, height: 28)
-                .background(Color.secondary.opacity(0.08))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .help(helpText)
-        .accessibilityLabel(helpText)
-    }
-    
     private func setupNotifications() {
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("ShowCapabilityWizard"),
