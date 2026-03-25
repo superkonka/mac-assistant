@@ -88,7 +88,7 @@ struct SkillsManagementView: View {
     }
     
     private var catalogView: some View {
-        List(skillCatalog.skills) { skill in
+        List(skillCatalog.skills, id: \.id) { skill in
             VStack(alignment: .leading) {
                 Text(skill.name)
                     .font(.headline)

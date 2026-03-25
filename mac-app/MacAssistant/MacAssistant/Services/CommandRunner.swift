@@ -3929,7 +3929,7 @@ class CommandRunner: ObservableObject {
             prepareRequestWithMemory(
                 text: text,
                 sessionID: taskSessionID ?? sessionKey,
-                systemPrompt: buildBaseSystemPrompt()
+                systemPrompt: buildUnifiedSystemPrompt()
             )
         }
         
@@ -4004,6 +4004,44 @@ class CommandRunner: ObservableObject {
                 }
             )
             
+            // MARK: - 解析Agent响应并处理工具调用
+            let agentResponse = AgentResponseParser.shared.parse(content)
+            
+            // 根据响应类型处理
+            let finalContent: String
+            switch agentResponse {
+            case .direct(let text):
+                // 直接对话，无需额外处理
+                finalContent = text
+                
+            case .toolCall(let tool, let parameters, let responseText):
+                // 工具调用：先显示友好提示，执行工具，再回流结果
+                finalContent = await handleToolCall(
+                    tool: tool,
+                    parameters: parameters,
+                    responseText: responseText,
+                    agent: agent,
+                    sessionKey: sessionKey,
+                    assistantMessageID: assistantMessageID,
+                    taskSessionID: taskSessionID,
+                    traceID: traceID
+                )
+                
+            case .createTask(let name, let description, let steps):
+                // 创建后台任务
+                finalContent = await handleCreateTask(
+                    name: name,
+                    description: description,
+                    steps: steps,
+                    responseText: "已创建后台任务：\(name)",
+                    assistantMessageID: assistantMessageID
+                )
+                
+            case .routeAgent(let targetAgent, let reason):
+                // Agent路由建议
+                finalContent = "💡 建议切换到 \(targetAgent)：\(reason)\n\n当前Agent可能不是处理此请求的最佳选择。"
+            }
+            
             // 更新 Trace：完成
             if let traceID = traceID {
                 await MainActor.run {
@@ -4017,13 +4055,13 @@ class CommandRunner: ObservableObject {
                 }
             }
 
-            if let surfacedError = gatewayReturnedError(content) {
+            if let surfacedError = gatewayReturnedError(finalContent) {
                 throw surfacedError
             }
 
-            let resolvedContent = content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let resolvedContent = finalContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "服务已返回，但没有拿到可显示的内容。"
-                : content
+                : finalContent
 
             await MainActor.run {
                 if let taskSessionID {
@@ -7488,17 +7526,143 @@ extension CommandRunner {
     
     // MARK: - Context Injection Helpers
     
-    /// 构建基础系统提示词
-    private func buildBaseSystemPrompt() -> String {
+    /// 构建统一Agent系统提示词（主会话 + Planner 融合）
+    @MainActor
+    private func buildUnifiedSystemPrompt() -> String {
+        // 获取可用 Skill 信息
+        let skills = SkillCatalog.shared.skills
+        
+        var skillsDescription = ""
+        if !skills.isEmpty {
+            skillsDescription = """
+            
+            ## 可用 Skills
+            你可以通过 `execute_skill` 工具调用以下 Skills：
+            
+            """
+            
+            // 按类别分组
+            let skillsByDomain = Dictionary(grouping: skills) { $0.capabilities.first?.domain ?? "other" }
+            
+            for (domain, domainSkills) in skillsByDomain.sorted(by: { $0.key < $1.key }) {
+                skillsDescription += "\n**\(domain.uppercased())**：\n"
+                for skill in domainSkills.prefix(5) { // 每个领域最多显示5个
+                    let params = skill.inputSchema.parameters
+                        .filter { skill.inputSchema.required.contains($0.name) }
+                        .map { "\($0.name): \($0.type.rawValue)" }
+                        .joined(separator: ", ")
+                    let paramsStr = params.isEmpty ? "" : " (参数: \(params))"
+                    skillsDescription += "- `\(skill.id)` - \(skill.name)\(paramsStr)\n"
+                }
+                if domainSkills.count > 5 {
+                    skillsDescription += "- ... 还有 \(domainSkills.count - 5) 个 Skills\n"
+                }
+            }
+            
+            skillsDescription += """
+            
+            **常用 Skill 示例**：
+            - 截图: `{"tool": "execute_skill", "parameters": {"skill_id": "system.screenshot"}}`
+            - 读取剪贴板: `{"tool": "execute_skill", "parameters": {"skill_id": "system.clipboard", "input": {"action": "read"}}}`
+            - 浏览器导航: `{"tool": "execute_skill", "parameters": {"skill_id": "browser.navigate", "input": {"url": "https://..."}}}`
+            """
+        }
+        
         return """
-        你是 MacAssistant，一个运行在 macOS 上的智能助手。
+        你是 MacAssistant，一个运行在 macOS 上的智能助手。你同时具备对话能力和任务规划执行能力。
+
+        ## 核心职责
+        1. **对话交互**：回答用户问题、分析代码、解释概念、提供建议
+        2. **意图分析**：理解用户真实需求，判断是否需要调用工具/服务/创建任务
+        3. **工具执行**：通过 Function Calling 调用 MacAssistant 内部服务完成用户请求
+        4. **任务管理**：创建后台任务，协调多步骤工作流
+
+        ## 工作流程（内部思考，不输出）
+        每次用户输入后，先进行意图分析：
+        1. 用户在问什么？是闲聊、提问、还是指令？
+        2. 是否需要调用工具/服务？（查天气、打开应用、管理服务）
+        3. 是否需要创建独立任务？（长时间运行的工作流）
+        4. 是否需要路由到其他Agent？（当前Agent能力不匹配）
+
+        ## 输出格式
+        你的回复可以是以下两种格式之一：
+
+        **格式A：直接对话**（默认）
+        正常自然语言回复用户。适用于：问答、解释、闲聊、简单确认。
+
+        **格式B：工具调用**（需要执行操作时）
+        当需要调用工具时，使用以下JSON格式：
+        ```json
+        {
+          "thought": "分析用户意图，说明为什么需要调用工具",
+          "response": "先给用户一个友好回应，说明正在处理",
+          "action": {
+            "type": "tool_call",
+            "tool": "工具名称",
+            "parameters": {"参数名": "参数值"}
+          }
+        }
+        ```
+
+        **格式C：任务创建**（长时间运行任务）
+        ```json
+        {
+          "thought": "分析这是一个需要长时间执行的任务",
+          "response": "告知用户已创建后台任务",
+          "action": {
+            "type": "create_task",
+            "task": {
+              "name": "任务名称",
+              "description": "任务描述",
+              "steps": ["步骤1", "步骤2"]
+            }
+          }
+        }
+        ```
+
+        **格式D：Agent路由**（需要切换Agent时）
+        ```json
+        {
+          "thought": "分析当前Agent不适合处理此请求",
+          "response": "说明原因，询问用户是否切换",
+          "action": {
+            "type": "route_agent",
+            "target_agent": "建议的Agent名称或ID",
+            "reason": "为什么需要切换"
+          }
+        }
+        ```
+
+        ## 可用工具
+        你可以调用以下工具（通过 format B）：
+        - `launch_app`: 启动应用，参数 {"bundle_id": "应用BundleID"}
+        - `manage_service`: 管理服务，参数 {"service_id": "服务ID", "action": "start|stop|restart|status"}
+        - `execute_skill`: 执行Skill，参数 {"skill_id": "SkillID", "input": {"参数名": "参数值"}}
+        - `search_memory`: 搜索历史记忆，参数 {"query": "搜索关键词"}
+        - `create_workflow`: 创建工作流，参数 {"name": "名称", "description": "描述"}
+        \(skillsDescription)
+
+        ## 重要规则
+        1. **不要过度规划**：简单问答直接回答，不要走工具调用
+        2. **用户询问"服务"**：指的是 MacAssistant 应用内部服务状态，不是系统级服务
+        3. **执行前先确认**：破坏性操作（删除、停止服务）先询问用户确认
+        4. **任务进度反馈**：创建后台任务后，告知用户如何查看进度
+        5. **失败优雅处理**：工具调用失败时，向用户解释原因并提供替代方案
+        6. **Skill 优于描述**：当用户请求可以用 Skill 完成时，直接调用 Skill 而不是描述如何操作
+
+        ## 输出示例
+
+        用户："帮我打开微信"
+        → 格式B：{"thought": "用户要打开微信应用", "response": "我来帮您打开微信", "action": {"type": "tool_call", "tool": "launch_app", "parameters": {"bundle_id": "com.tencent.xinWeChat"}}}
+
+        用户："今天天气怎么样"
+        → 格式A：直接回答（如果无法获取天气，诚实告知）
+
+        用户："帮我整理桌面上的所有PDF文件"
+        → 格式C：{"thought": "这是一个文件整理任务，可能需要几分钟", "response": "我来帮您整理桌面PDF文件，这需要一些时间。已创建后台任务。", "action": {"type": "create_task", "task": {"name": "整理桌面PDF", "description": "扫描桌面并整理所有PDF文件", "steps": ["扫描桌面文件", "识别PDF", "分类整理"]}}}
         
-        重要能力：
-        1. 你可以管理 MacAssistant 应用内部的服务（通过服务面板或命令）
-        2. 你有记忆能力，可以记住对话历史
-        3. 你可以帮助用户分析代码、文件、执行任务
-        
-        当用户询问"服务"时，通常指的是 MacAssistant 应用内部的服务状态，而不是系统级服务。
+        用户："帮我截图"
+        → 格式B：{"thought": "用户需要截图", "response": "我来帮您截图", "action": {"type": "tool_call", "tool": "execute_skill", "parameters": {"skill_id": "system.screenshot"}}}
         """
     }
     
@@ -7573,5 +7737,107 @@ extension CommandRunner {
         } else {
             return "你是 MacAssistant 智能助手。" + serviceContext
         }
+    }
+    
+    // MARK: - Agent工具调用处理
+    
+    /// 处理工具调用：执行工具并回流结果给Agent总结
+    private func handleToolCall(
+        tool: String,
+        parameters: [String: Any],
+        responseText: String,
+        agent: Agent,
+        sessionKey: String,
+        assistantMessageID: UUID,
+        taskSessionID: String?,
+        traceID: UUID?
+    ) async -> String {
+        // 1. 先给用户显示友好提示（Agent的response字段）
+        await MainActor.run {
+            if let taskSessionID {
+                self.updateTaskSessionMessage(
+                    sessionID: taskSessionID,
+                    messageID: assistantMessageID,
+                    content: responseText + "\n\n[正在执行...]"
+                )
+            } else {
+                self.updateAssistantMessage(id: assistantMessageID, content: responseText + "\n\n[正在执行...]")
+            }
+        }
+        
+        // 2. 执行工具
+        LogInfo("[CommandRunner] 执行工具: \(tool), 参数: \(parameters)")
+        let toolResult = await ToolExecutor.shared.execute(tool: tool, parameters: parameters)
+        
+        // 3. 构建工具执行结果描述
+        let toolResultDescription: String
+        if toolResult.success {
+            toolResultDescription = toolResult.output ?? "执行成功"
+        } else {
+            toolResultDescription = "执行失败: \(toolResult.error ?? "未知错误")"
+        }
+        
+        // 4. 将工具结果回流给Agent进行总结
+        let followUpPrompt = """
+        你之前调用了工具 "\(tool)"，执行结果如下：
+        
+        \(toolResultDescription)
+        
+        请基于这个结果，给用户一个友好的回复总结。
+        """
+        
+        do {
+            // 更新UI显示正在总结
+            await MainActor.run {
+                if let taskSessionID {
+                    self.updateTaskSessionMessage(
+                        sessionID: taskSessionID,
+                        messageID: assistantMessageID,
+                        content: responseText + "\n\n[执行完成，正在总结...]"
+                    )
+                } else {
+                    self.updateAssistantMessage(id: assistantMessageID, content: responseText + "\n\n[执行完成，正在总结...]")
+                }
+            }
+            
+            // 调用Agent总结结果
+            let systemPrompt = await MainActor.run {
+                buildUnifiedSystemPrompt()
+            }
+            let summary = try await runtimeAdapter.sendMessage(
+                agent: agent,
+                sessionKey: sessionKey + ":followup",
+                sessionLabel: "工具执行结果总结",
+                requestID: assistantMessageID.uuidString.lowercased() + ":followup",
+                text: followUpPrompt,
+                images: [],
+                systemPrompt: systemPrompt,
+                onAssistantText: nil
+            )
+            
+            // 返回原始响应 + 总结
+            return responseText + "\n\n" + summary
+            
+        } catch {
+            LogError("[CommandRunner] Agent总结失败: \(error)")
+            // 如果总结失败，直接返回工具结果
+            return responseText + "\n\n执行结果：\n" + toolResultDescription
+        }
+    }
+    
+    /// 处理创建任务（简化版 - 只返回提示）
+    private func handleCreateTask(
+        name: String,
+        description: String,
+        steps: [String],
+        responseText: String,
+        assistantMessageID: UUID
+    ) async -> String {
+        // 返回用户友好的消息，实际任务创建由Agent后续处理
+        LogInfo("[CommandRunner] Agent建议创建任务: \(name)")
+        
+        let stepsText = steps.isEmpty ? "" : "\n步骤：\n" + steps.map { "• \($0)" }.joined(separator: "\n")
+        
+        return responseText + "\n\n📋 建议创建的任务：\(name)\(stepsText)"
     }
 }

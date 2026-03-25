@@ -290,7 +290,7 @@ struct SimpleBrowserAgentView: View {
                             }
                         }
                     } else {
-                        Text("当前已有浏览器会话，但还没有拿到页面摘要。可以点“刷新识别”，或者在主会话里说“看看当前页面”。")
+                        Text("当前已有浏览器会话，但还没有拿到页面摘要。可以点“刷新识别”，或者在对话里说“看看当前页面”。")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                     }
@@ -346,7 +346,7 @@ struct SimpleBrowserAgentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("当前没有活动网页会话。")
                         .font(.system(size: 13, weight: .medium))
-                    Text("你可以在这里打开网址，或者直接在主会话输入“打开 https://example.com”。打开后，主会话就能继续识别页面并确认下一步。")
+                    Text("你可以在这里打开网址，或者直接在对话里输入“打开 https://example.com”。打开后，主对话就能继续识别页面并确认下一步。")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }

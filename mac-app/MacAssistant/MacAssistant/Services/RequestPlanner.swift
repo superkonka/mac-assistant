@@ -19,15 +19,12 @@ final class RequestPlanner {
     static let shared = RequestPlanner()
 
     private let ruleProvider: RequestPlannerProvider
-    private let intentAgentProvider: IntentAgentShadowPlannerProvider
     private let preferences = UserPreferenceStore.shared
 
     init(
-        primaryProvider: RequestPlannerProvider = RuleBasedRequestPlannerProvider.shared,
-        shadowProvider: IntentAgentShadowPlannerProvider = IntentAgentShadowPlannerProvider.shared
+        primaryProvider: RequestPlannerProvider = RuleBasedRequestPlannerProvider.shared
     ) {
         self.ruleProvider = primaryProvider
-        self.intentAgentProvider = shadowProvider
     }
 
     func plan(_ envelope: RequestEnvelope) async -> RequestPlan {
@@ -47,58 +44,22 @@ final class RequestPlanner {
             return preflightPlan.withPlannerID(ruleProvider.providerID)
         }
 
-        switch preferences.plannerPrimaryStrategy {
-        case .ruleBased:
-            let primaryPlan = await ruleProvider.plan(envelope).withPlannerID(ruleProvider.providerID)
+        // 统一使用规则-based规划（轻量级）
+        // Agent自己具备意图分析和工具调用能力，在对话中自主决策
+        let primaryPlan = await ruleProvider.plan(envelope).withPlannerID(ruleProvider.providerID)
+        
+        // 检查是否需要 Committee 会诊（复杂情况）
+        let committeeCheck = await PlannerCommitteeService.shared.shouldTriggerCommittee(for: primaryPlan)
+        if committeeCheck.shouldTrigger, let reason = committeeCheck.reason {
+            LogInfo("[RequestPlanner] 触发 Planner Committee，原因: \(reason.rawValue)")
             
-            // 检查是否需要 Committee 会诊
-            let committeeCheck = await PlannerCommitteeService.shared.shouldTriggerCommittee(for: primaryPlan)
-            if committeeCheck.shouldTrigger, let reason = committeeCheck.reason {
-                LogInfo("[RequestPlanner] 触发 Planner Committee，原因: \(reason.rawValue)")
-                
-                // 异步召集委员会（不阻塞主流程）
-                Task {
-                    await conveneCommitteeIfNeeded(for: primaryPlan, reason: reason, envelope: envelope)
-                }
+            // 异步召集委员会（不阻塞主流程）
+            Task {
+                await conveneCommitteeIfNeeded(for: primaryPlan, reason: reason, envelope: envelope)
             }
-
-            if preferences.plannerShadowEnabled {
-                let shadowProvider = self.intentAgentProvider
-                Task { [primaryPlan] in
-                    if let shadowPlan = await shadowProvider.planShadow(envelope)?.withPlannerID(shadowProvider.providerID) {
-                        self.logShadowComparison(primary: primaryPlan, shadow: shadowPlan)
-                    }
-                }
-            }
-
-            return primaryPlan
-
-        case .agentPrimary:
-            async let fallbackRule = ruleProvider.plan(envelope)
-            async let primaryCandidate = intentAgentProvider.planPrimary(envelope)
-
-            let fallbackPlan = await fallbackRule.withPlannerID(ruleProvider.providerID)
-
-            if let primaryPlan = await primaryCandidate?.withPlannerID(intentAgentProvider.primaryProviderID) {
-                // 检查是否需要 Committee 会诊
-                let committeeCheck = await PlannerCommitteeService.shared.shouldTriggerCommittee(for: primaryPlan)
-                if committeeCheck.shouldTrigger, let reason = committeeCheck.reason {
-                    LogInfo("[RequestPlanner] 触发 Planner Committee，原因: \(reason.rawValue)")
-                    
-                    Task {
-                        await conveneCommitteeIfNeeded(for: primaryPlan, reason: reason, envelope: envelope)
-                    }
-                }
-                
-                if preferences.plannerShadowEnabled {
-                    logShadowComparison(primary: primaryPlan, shadow: fallbackPlan.withPlannerID("rule-based-shadow"))
-                }
-                return primaryPlan
-            }
-
-            LogInfo("RequestPlanner primary agent fallback -> rule-based")
-            return fallbackPlan
         }
+
+        return primaryPlan
     }
     
     /// 召集委员会进行会诊

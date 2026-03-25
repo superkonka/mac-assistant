@@ -668,8 +668,8 @@ struct RoleAssignmentStep: View {
 
             Text(
                 isInitialSetup
-                ? "首次配置至少需要一个能承接主会话的 Agent。后台子任务、Planner、回退角色可以继续补充。"
-                : "一个 Agent 可以承担多个角色。主会话、Planner、子任务和回退会分开协作，不再互相抢入口。"
+                ? "首次配置至少需要一个 Planner 角色的 Agent（同时承担主对话）。子任务、回退角色可以后续补充。"
+                : "一个 Agent 可以承担多个角色。Planner 同时负责主对话和意图分析，子任务和回退会分开协作。"
             )
             .font(.caption)
             .foregroundColor(.secondary)
@@ -718,18 +718,19 @@ struct RoleAssignmentStep: View {
 
     private var roleHint: String {
         if viewModel.roleProfile.contains(.manualOnly) {
-            return "当前设置为仅手动：它不会参与自动路由，也不会抢走主会话。"
+            return "当前设置为仅手动：它不会参与自动路由，只在手动选择时使用。"
         }
 
-        if viewModel.roleProfile.contains(.primaryChat) && viewModel.roleProfile.contains(.subtaskWorker) {
-            return "当前这个 Agent 既能作为主会话，也能在后台承担独立子任务。"
+        // Planner 同时承担主会话职责
+        if viewModel.roleProfile.contains(.planner) && viewModel.roleProfile.contains(.subtaskWorker) {
+            return "当前这个 Agent 既能作为 Planner（主对话 + 意图分析），也能在后台承担独立子任务。"
         }
 
         if viewModel.roleProfile.contains(.planner) {
-            return "当前这个 Agent 也会进入 Planner 候选池，可用于意图分析和调度。"
+            return "当前这个 Agent 作为 Planner，负责主对话和意图分析调度。"
         }
 
-        return "建议至少给常用聊天 Agent 勾选“主会话”，给稳定 API Agent 勾选“Planner / 子任务 / 回退”。"
+        return "建议给主用 Agent 勾选\"Planner\"（主对话 + 意图分析），给稳定 API Agent 勾选\"子任务 / 回退\"。"
     }
 }
 

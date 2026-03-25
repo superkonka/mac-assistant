@@ -524,7 +524,8 @@ class AgentCreationSkill {
         case .webSearch:
             return AgentRoleProfile(roles: [.planner, .subtaskWorker, .fallback])
         default:
-            return AgentRoleProfile(roles: [.primaryChat, .fallback])
+            // Planner 同时承担主会话职责
+            return AgentRoleProfile(roles: [.planner, .fallback])
         }
     }
 }

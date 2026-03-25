@@ -21,53 +21,7 @@ protocol SkillExtension: Identifiable, Codable {
     func validate() -> ValidationResult
 }
 
-/// Skill 元数据
-struct SkillManifest: Codable, Equatable {
-    let id: String
-    let name: String
-    let description: String
-    let version: String
-    let author: String
-    let icon: String  // SF Symbol 名称
-    let category: SkillCategory
-    
-    /// 依赖的能力
-    let requiredCapabilities: [Capability]
-    
-    /// 执行配置
-    let executionMode: ExecutionMode
-    
-    /// 输入参数定义
-    let inputSchema: [ParameterDefinition]?
-    
-    /// 是否需要用户确认
-    let requiresConfirmation: Bool
-    
-    enum ExecutionMode: String, Codable {
-        case localScript      // 本地脚本执行
-        case remoteAPI        // 调用远程 API
-        case mcpTool          // MCP 工具
-        case agentDelegation  // 委托给 Agent
-        case builtin          // 内置实现
-    }
-}
-
-/// 参数定义
-struct ParameterDefinition: Codable {
-    let name: String
-    let type: ParameterType
-    let description: String
-    let required: Bool
-    let defaultValue: String?
-    
-    enum ParameterType: String, Codable {
-        case string
-        case number
-        case boolean
-        case file
-        case directory
-    }
-}
+// 注意：SkillManifest 定义已移至 Services/Skills/SkillCatalog.swift
 
 /// Skill 执行上下文
 struct SkillExecutionContext {
@@ -384,30 +338,8 @@ struct RemoteAPIResult: Codable {
     let output: String
 }
 
-// MARK: - 模拟依赖（实际项目中已存在）
-
-class SkillRegistry {
-    func install(_ package: SkillPackage) async throws {}
-    func uninstall(id: String) throws {}
-    func loadFromPath(_ path: String) throws -> SkillManifest { fatalError() }
-    func loadInstalled() -> [SkillManifest]? { nil }
-    func updateConfig(id: String, config: SkillConfig) throws {}
-    func setEnabled(id: String, enabled: Bool) throws {}
-}
-
-class SkillRepository {
-    func download(_ manifest: SkillManifest) async throws -> SkillPackage { fatalError() }
-    func search(query: String) async throws -> [SkillManifest] { [] }
-    func recommended() async throws -> [SkillManifest] { [] }
-}
-
-class MCPClient {
-    static let shared = MCPClient()
-    func callTool(server: MCPServerConfig, tool: String, input: String) async throws -> MCPResult {
-        fatalError()
-    }
-    func isServerAvailable(_ config: MCPServerConfig) -> Bool { true }
-}
+// MARK: - 使用实际项目中的依赖
+// SkillRegistry, SkillRepository, MCPClient 等已在其他模块定义
 
 struct MCPResult {
     let success: Bool

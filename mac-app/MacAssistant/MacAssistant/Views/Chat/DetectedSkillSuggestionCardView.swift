@@ -42,7 +42,7 @@ struct DetectedSkillSuggestionCardView: View {
 
             HStack(spacing: 6) {
                 suggestionTag("独立处理")
-                suggestionTag("不影响主会话")
+                suggestionTag("不影响主对话")
                 suggestionTag(suggestion.sourceLabel)
             }
         }

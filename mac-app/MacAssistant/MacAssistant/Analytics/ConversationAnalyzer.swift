@@ -350,7 +350,7 @@ class ConversationAnalyzer {
                 category: "确认提示",
                 title: "确认提示过于频繁",
                 description: "会话中出现 \(suggestions.count) 次确认提示",
-                suggestion: "过多的确认会打断用户流程。建议：1) 对高置信度意图直接执行 2) 添加"记住我的选择"选项 3) 减少不必要的检测",
+                suggestion: "过多的确认会打断用户流程。建议：1) 对高置信度意图直接执行 2) 添加记住我的选择选项 3) 减少不必要的检测",
                 relatedEvents: suggestions.map { $0.id }
             ))
         }

@@ -55,6 +55,75 @@ final class SkillAdapterRegistry: ObservableObject {
     }
 }
 
+// MARK: - SkillExecutionResult 便捷构造器
+
+extension SkillExecutionResult {
+    /// 成功结果
+    static func success(
+        output: String? = nil,
+        data: [String: Any]? = nil
+    ) -> SkillExecutionResult {
+        var outputDict: [String: String] = [:]
+        if let output = output {
+            outputDict["response"] = output
+        }
+        if let data = data {
+            for (key, value) in data {
+                outputDict[key] = String(describing: value)
+            }
+        }
+        
+        return SkillExecutionResult(
+            success: true,
+            output: outputDict.isEmpty ? nil : outputDict,
+            error: nil,
+            artifacts: nil,
+            followUpActions: nil
+        )
+    }
+    
+    /// 失败结果
+    static func failure(
+        error: String,
+        output: String? = nil
+    ) -> SkillExecutionResult {
+        var outputDict: [String: String] = [:]
+        if let output = output {
+            outputDict["response"] = output
+        }
+        
+        return SkillExecutionResult(
+            success: false,
+            output: outputDict.isEmpty ? nil : outputDict,
+            error: error,
+            artifacts: nil,
+            followUpActions: nil
+        )
+    }
+    
+    /// 带 artifact 的成功结果
+    static func successWithArtifact(
+        output: String,
+        artifactPath: String,
+        artifactType: Artifact.ArtifactType = .file,
+        artifactDescription: String = ""
+    ) -> SkillExecutionResult {
+        let artifact = Artifact(
+            type: artifactType,
+            path: artifactPath,
+            description: artifactDescription.isEmpty ? output : artifactDescription
+        )
+        
+        return SkillExecutionResult(
+            success: true,
+            output: ["response": output],
+            error: nil,
+            artifacts: [artifact],
+            followUpActions: nil
+        )
+    }
+}
+
 // MARK: - Health Severity
 enum HealthSeverity: String, Codable {
     case critical

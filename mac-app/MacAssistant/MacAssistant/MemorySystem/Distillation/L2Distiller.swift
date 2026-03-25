@@ -384,26 +384,63 @@ actor PatternRecognizer {
 }
 
 actor EmbeddingGenerator {
+    private let embeddingService: EmbeddingService
+    
+    init() {
+        self.embeddingService = EmbeddingServiceFactory.createDefault()
+    }
+    
     func generate(
         for concepts: [Concept],
         relations: [Relation],
         summary: String
     ) async -> EmbeddingVector {
-        // Mock 实现
-        // 实际应调用嵌入服务（OpenAI、本地模型等）
-        
+        // 构建文本表示
         let text = summary + " " + concepts.map(\.definition).joined(separator: " ")
         
-        // 生成随机向量作为占位（实际应为真实嵌入）
-        let dimensions = 1536
-        let vector = (0..<dimensions).map { _ in Float.random(in: -1...1) }
+        do {
+            // 使用真实的 Embedding 服务
+            let embedding = try await embeddingService.embed(text: text)
+            return embedding
+        } catch {
+            LogError("[EmbeddingGenerator] Failed to generate embedding: \(error)")
+            // 回退到本地确定性向量（基于文本哈希）
+            return generateDeterministicVector(from: text, dimensions: 384)
+        }
+    }
+    
+    /// 生成确定性向量（基于文本哈希，用于回退）
+    private func generateDeterministicVector(from text: String, dimensions: Int) -> EmbeddingVector {
+        var vector: [Float] = []
+        var hash = text.hash
+        
+        for _ in 0..<dimensions {
+            hash = hash &* 31 &+ 17
+            let value = Float(hash % 1000) / 1000.0 * 2.0 - 1.0
+            vector.append(value)
+        }
+        
+        // 归一化
+        let norm = sqrt(vector.map { $0 * $0 }.reduce(0, +))
+        let normalizedVector = vector.map { $0 / norm }
         
         return EmbeddingVector(
-            model: "mock-embedding",
+            model: "local-fallback",
             dimensions: dimensions,
-            vector: vector,
-            normalized: false
+            vector: normalizedVector,
+            normalized: true
         )
+    }
+}
+
+// MARK: - String Hash Extension
+private extension String {
+    var hash: Int {
+        var h = 0
+        for char in self.unicodeScalars {
+            h = h &* 31 &+ Int(char.value)
+        }
+        return h
     }
 }
 

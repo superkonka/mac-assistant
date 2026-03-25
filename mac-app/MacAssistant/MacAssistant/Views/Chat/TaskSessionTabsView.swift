@@ -319,7 +319,7 @@ struct TaskSessionInspectorPanel: View {
             ) {
                 TaskSessionDetailField(title: "任务 ID", value: session.id)
                 TaskSessionDetailField(title: "意图", value: session.intentName)
-                TaskSessionDetailField(title: "主会话 Agent", value: session.mainAgentName ?? "未记录")
+                TaskSessionDetailField(title: "主对话 Agent", value: session.mainAgentName ?? "未记录")
                 TaskSessionDetailField(title: "执行 Agent", value: session.delegateAgentName ?? "未记录")
                 TaskSessionDetailField(title: "执行 Agent ID", value: session.delegateAgentID ?? "未记录")
                 TaskSessionDetailField(title: "创建时间", value: formatted(session.createdAt))

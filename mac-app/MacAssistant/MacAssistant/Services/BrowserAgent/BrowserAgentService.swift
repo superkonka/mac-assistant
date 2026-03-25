@@ -89,8 +89,11 @@ enum BrowserAction: String, Codable, CaseIterable {
     case goForward = "goForward"
     case reload = "reload"
     case close = "close"
-    case saveState = "saveState"      // 保存会话状态
+    case saveState = "saveState"       // 保存会话状态
     case restoreState = "restoreState" // 恢复会话状态
+    case getText = "getText"           // 获取元素文本
+    case getTitle = "getTitle"         // 获取页面标题
+    case getURL = "getURL"             // 获取当前URL
     
     var displayName: String {
         switch self {
@@ -112,6 +115,9 @@ enum BrowserAction: String, Codable, CaseIterable {
         case .close: return "关闭"
         case .saveState: return "保存状态"
         case .restoreState: return "恢复状态"
+        case .getText: return "获取文本"
+        case .getTitle: return "获取标题"
+        case .getURL: return "获取URL"
         }
     }
 }
@@ -141,6 +147,8 @@ final class BrowserAgentService: ObservableObject {
     private let recentActionsLimit = 50
     private var currentSessionID: String?
     private var persistentContextDir: URL?
+    private var pendingResults: [String: BrowserActionResult] = [:]
+    private let resultTimeout: TimeInterval = 30.0
     
     struct BrowserActionRecord: Identifiable {
         let id = UUID()
@@ -623,7 +631,76 @@ final class BrowserAgentService: ObservableObject {
     }
     
     private func setupPlaywright() async throws {
-        // 检查 Playwright 安装
+        // 检查 Playwright 是否已安装
+        if await isPlaywrightInstalled() {
+            LogInfo("[BrowserAgent] Playwright 已安装")
+            return
+        }
+        
+        LogInfo("[BrowserAgent] 正在安装 Playwright...")
+        
+        // 使用 npm 安装 Playwright
+        let task = Process()
+        task.launchPath = "/usr/bin/env"
+        task.arguments = ["npm", "install", "-g", "playwright-core"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            
+            guard task.terminationStatus == 0 else {
+                let errorData = pipe.fileHandleForReading.readDataToEndOfFile()
+                let errorMessage = String(data: errorData, encoding: .utf8) ?? "未知错误"
+                throw BrowserAgentError.playwrightNotInstalled
+            }
+            
+            // 安装浏览器
+            try await installPlaywrightBrowsers()
+            
+            LogInfo("[BrowserAgent] Playwright 安装成功")
+        } catch {
+            LogError("[BrowserAgent] Playwright 安装失败: \(error)")
+            throw BrowserAgentError.playwrightNotInstalled
+        }
+    }
+    
+    private func isPlaywrightInstalled() async -> Bool {
+        let task = Process()
+        task.launchPath = "/usr/bin/env"
+        task.arguments = ["node", "-e", "require('playwright-core')"]
+        
+        do {
+            try task.run()
+            task.waitUntilExit()
+            return task.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+    
+    private func installPlaywrightBrowsers() async throws {
+        LogInfo("[BrowserAgent] 正在安装 Playwright 浏览器...")
+        
+        let task = Process()
+        task.launchPath = "/usr/bin/env"
+        task.arguments = ["npx", "playwright-core", "install", "chromium"]
+        
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = pipe
+        
+        try task.run()
+        task.waitUntilExit()
+        
+        guard task.terminationStatus == 0 else {
+            throw BrowserAgentError.playwrightNotInstalled
+        }
+        
+        LogInfo("[BrowserAgent] 浏览器安装成功")
     }
     
     private func startNodeServer(mode: BrowserMode) async throws {
@@ -672,18 +749,85 @@ final class BrowserAgentService: ObservableObject {
     }
     
     private func handleWebSocketMessage(_ message: URLSessionWebSocketTask.Message) {
-        // 处理消息
+        Task {
+            await self.processWebSocketMessage(message)
+        }
+    }
+    
+    private func processWebSocketMessage(_ message: URLSessionWebSocketTask.Message) async {
+        switch message {
+        case .string(let text):
+            guard let data = text.data(using: .utf8) else { return }
+            
+            do {
+                let response = try JSONDecoder().decode(BrowserActionResult.self, from: data)
+                
+                await MainActor.run {
+                    // 更新当前 URL 和标题
+                    if let url = response.data?["url"] {
+                        self.currentURL = url
+                    }
+                    if let title = response.data?["title"] {
+                        self.currentTitle = title
+                    }
+                    
+                    // 记录操作结果
+                    if let action = response.data?["action"] {
+                        self.recordAction(
+                            action: action,
+                            target: response.data?["target"] ?? "",
+                            result: response.success ? "成功" : "失败: \(response.message)",
+                            hasScreenshot: response.screenshot != nil,
+                            mode: self.currentMode
+                        )
+                    }
+                    
+                    // 通知等待的调用者
+                    self.pendingResults[response.id] = response
+                }
+                
+                LogDebug("[BrowserAgent] 收到响应: \(response.id), 成功: \(response.success)")
+            } catch {
+                LogError("[BrowserAgent] 解析消息失败: \(error)")
+            }
+            
+        case .data(let data):
+            // 处理二进制数据（如截图）
+            LogDebug("[BrowserAgent] 收到二进制数据: \(data.count) bytes")
+            
+        @unknown default:
+            break
+        }
     }
     
     private func sendActionToNode(_ request: BrowserActionRequest) async throws -> BrowserActionResult {
-        // 发送操作并等待响应
-        return BrowserActionResult(
-            success: true,
-            message: "操作已发送",
-            data: nil,
-            screenshot: nil,
-            timestamp: Date()
-        )
+        guard let websocketTask = websocketTask else {
+            throw BrowserAgentError.serviceNotRunning
+        }
+        
+        // 清空之前的结果
+        pendingResults.removeValue(forKey: request.id)
+        
+        // 发送请求
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(request)
+        let message = URLSessionWebSocketTask.Message.data(data)
+        
+        try await websocketTask.send(message)
+        LogDebug("[BrowserAgent] 发送请求: \(request.id), action: \(request.action)")
+        
+        // 等待响应（带超时）
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < resultTimeout {
+            if let result = pendingResults[request.id] {
+                pendingResults.removeValue(forKey: request.id)
+                return result
+            }
+            try await Task.sleep(nanoseconds: 100_000_000) // 100ms
+        }
+        
+        throw BrowserAgentError.timeout
     }
     
     private func recordAction(action: String, target: String, result: String, hasScreenshot: Bool, mode: BrowserMode) {
@@ -782,37 +926,49 @@ final class BrowserAgentService: ObservableObject {
         });
         
         async function handleAction(request) {
-            const { action, params } = request;
+            const { id, action, params } = request;
             try {
                 switch(action) {
                     case 'navigate':
                         await page.goto(params.url, { waitUntil: 'networkidle' });
-                        return { success: true, message: '导航成功', data: { url: page.url() }};
+                        return { id, success: true, message: '导航成功', data: { url: page.url(), title: await page.title(), action }};
                     case 'click':
                         await page.click(params.selector);
-                        return { success: true, message: '点击成功' };
+                        return { id, success: true, message: '点击成功', data: { action, target: params.selector }};
                     case 'fill':
                         await page.fill(params.selector, params.text);
-                        return { success: true, message: '填写成功' };
+                        return { id, success: true, message: '填写成功', data: { action, target: params.selector }};
                     case 'screenshot':
                         const buffer = await page.screenshot();
-                        return { success: true, message: '截图成功', screenshot: buffer.toString('base64') };
+                        return { id, success: true, message: '截图成功', screenshot: buffer.toString('base64'), data: { action }};
+                    case 'getText':
+                        const text = await page.textContent(params.selector);
+                        return { id, success: true, message: '获取文本成功', data: { action, text }};
+                    case 'evaluate':
+                        const result = await page.evaluate(params.script);
+                        return { id, success: true, message: '执行脚本成功', data: { action, result: JSON.stringify(result) }};
                     case 'saveState':
                         const cookies = await context.cookies();
                         const state = { cookies, url: page.url(), title: await page.title() };
-                        return { success: true, message: '状态已保存', data: { state: JSON.stringify(state) }};
+                        return { id, success: true, message: '状态已保存', data: { action, state: JSON.stringify(state) }};
                     case 'restoreState':
                         if (params.state) {
                             const state = JSON.parse(params.state);
                             await context.addCookies(state.cookies || []);
                             if (state.url) await page.goto(state.url);
                         }
-                        return { success: true, message: '状态已恢复' };
+                        return { id, success: true, message: '状态已恢复', data: { action }};
+                    case 'getTitle':
+                        const title = await page.title();
+                        return { id, success: true, message: '获取标题成功', data: { action, title }};
+                    case 'getURL':
+                        const currentUrl = page.url();
+                        return { id, success: true, message: '获取URL成功', data: { action, url: currentUrl }};
                     default:
-                        return { success: false, message: '未知操作' };
+                        return { id, success: false, message: '未知操作: ' + action };
                 }
             } catch (error) {
-                return { success: false, message: error.message };
+                return { id, success: false, message: error.message, data: { action } };
             }
         }
         
@@ -872,6 +1028,7 @@ struct BrowserActionRequest: Codable {
 }
 
 struct BrowserActionResult: Codable {
+    let id: String
     let success: Bool
     let message: String
     let data: [String: String]?

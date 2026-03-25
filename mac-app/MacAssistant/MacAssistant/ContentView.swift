@@ -112,7 +112,7 @@ struct ContentView: View {
         .padding(.vertical, 8)
         .background(Color(NSColor.controlBackgroundColor))
         .sheet(isPresented: $showingAgentList) {
-            AgentListView()
+            AgentDashboardView()
         }
         .sheet(isPresented: $showingWizard) {
             AgentConfigurationWizard(gap: currentGap) { newAgent in

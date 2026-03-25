@@ -2,8 +2,61 @@
 //  MemoryRecallCoordinator.swift
 //  MacAssistant
 //
+//  原生记忆召回协调器 - 使用本地向量存储和 Embedding 服务
+//
 
 import Foundation
+
+// MARK: - 简化版 Embedding 类型（避免循环依赖）
+
+/// 简化的嵌入向量
+private struct SimpleEmbeddingVector {
+    let vector: [Float]
+    let dimensions: Int
+    
+    init(vector: [Float]) {
+        self.vector = vector
+        self.dimensions = vector.count
+    }
+}
+
+/// 简化的 Embedding 服务协议
+private protocol SimpleEmbeddingService: Actor {
+    func embed(text: String) async throws -> SimpleEmbeddingVector
+}
+
+/// 本地 Embedding 服务实现
+private actor LocalSimpleEmbeddingService: SimpleEmbeddingService {
+    private let dimensions = 384
+    
+    func embed(text: String) async throws -> SimpleEmbeddingVector {
+        // 使用确定性哈希生成向量
+        var vector: [Float] = []
+        var hash = text.hash
+        
+        for _ in 0..<dimensions {
+            hash = hash &* 31 &+ 17
+            let value = Float(hash % 1000) / 1000.0 * 2.0 - 1.0
+            vector.append(value)
+        }
+        
+        // 归一化
+        let norm = sqrt(vector.map { $0 * $0 }.reduce(0, +))
+        let normalizedVector = vector.map { $0 / norm }
+        
+        return SimpleEmbeddingVector(vector: normalizedVector)
+    }
+}
+
+private extension String {
+    var hash: Int {
+        var h = 0
+        for char in self.unicodeScalars {
+            h = h &* 31 &+ Int(char.value)
+        }
+        return h
+    }
+}
 
 struct ConversationRecallTurn: Sendable {
     let role: String
@@ -17,52 +70,26 @@ struct MemoryRecallPrelude: Sendable {
     let forcedReindex: Bool
 }
 
+/// 原生记忆召回协调器 - 不依赖 OpenClaw
 actor MemoryRecallCoordinator {
     static let shared = MemoryRecallCoordinator()
 
-    private struct SearchPayload: Decodable {
-        let results: [SearchHit]
-    }
-
-    private struct SearchHit: Decodable {
-        let score: Double
-        let path: String
-        let startLine: Int
-        let endLine: Int
-        let snippet: String
-    }
-
-    private struct StatusEntry: Decodable {
-        let agentId: String
-        let status: StatusPayload
-        let scan: ScanPayload?
-    }
-
-    private struct StatusPayload: Decodable {
-        let files: Int?
-        let chunks: Int?
-        let dirty: Bool?
-        let sources: [String]?
-    }
-
-    private struct ScanPayload: Decodable {
-        let totalFiles: Int?
-    }
-
-    private struct CommandResult: Sendable {
-        let status: Int32
-        let output: String
-    }
-
-    private let agentID = "desktop"
-    private let minUsefulScore = 0.08
+    private let minUsefulScore = 0.3  // 余弦相似度阈值
     private let maxPreludeHits = 4
     private let reindexCooldown: TimeInterval = 15
 
     private var lastIndexAttemptAt = Date.distantPast
+    
+    // 依赖服务
+    private let embeddingService: any SimpleEmbeddingService
+    private let vectorStore: InMemoryVectorStore
+    
+    init() {
+        self.embeddingService = LocalSimpleEmbeddingService()
+        self.vectorStore = InMemoryVectorStore()
+    }
 
-    // 原生运行时不再需要 gateway runtime manager
-
+    /// 检查是否需要记忆召回，并返回相关上下文
     func recallPreludeIfNeeded(
         text: String,
         turns: [ConversationRecallTurn]
@@ -75,11 +102,13 @@ actor MemoryRecallCoordinator {
         let query = self.searchQuery(for: normalizedText, turns: turns)
 
         do {
+            // 执行向量搜索
             var hits = try await self.search(query: query)
             var forcedReindex = false
 
-            if hits.isEmpty, try await self.needsReindex() {
-                forcedReindex = try await self.forceReindexIfAllowed(reason: "prelude:\(normalizedText)")
+            // 如果没有结果，尝试刷新索引
+            if hits.isEmpty, await self.needsReindex() {
+                forcedReindex = await self.forceReindexIfAllowed(reason: "prelude:\(normalizedText)")
                 if forcedReindex {
                     hits = try await self.search(query: query)
                 }
@@ -114,20 +143,45 @@ actor MemoryRecallCoordinator {
         }
     }
 
+    /// 记录转录变更，触发重新索引
     func noteTranscriptMutation(reason: String) async {
+        guard await self.needsReindex() else {
+            return
+        }
+        _ = await self.forceReindexIfAllowed(reason: reason)
+    }
+
+    /// 添加对话历史到记忆存储
+    func addConversationMessage(_ message: ChatMessage) async {
+        let text = message.content
+        guard !text.isEmpty else { return }
+        
         do {
-            guard try await self.needsReindex() else {
-                return
-            }
-            _ = try await self.forceReindexIfAllowed(reason: reason)
-        } catch {
-            LogWarning(
-                "Memory transcript refresh skipped " +
-                "reason=\(reason) error=\(error.localizedDescription)"
+            // 生成嵌入向量
+            let embedding = try await embeddingService.embed(text: text)
+            
+            // 创建记忆条目
+            let entry = MemoryEntry(
+                id: message.id.uuidString,
+                text: text,
+                role: message.role.rawValue,
+                timestamp: message.timestamp,
+                metadata: [
+                    "agentId": message.agentId ?? "",
+                    "type": "conversation"
+                ]
             )
+            
+            // 存储到向量存储
+            await vectorStore.add(entry: entry, embedding: embedding)
+            
+            LogDebug("[MemoryRecall] Added message to vector store: \(String(text.prefix(50)))...")
+        } catch {
+            LogError("[MemoryRecall] Failed to add message: \(error)")
         }
     }
 
+    /// 检查文本是否与记忆敏感相关
     nonisolated static func isMemorySensitive(_ text: String) -> Bool {
         let normalized = text
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -155,6 +209,8 @@ actor MemoryRecallCoordinator {
             followUpQuestionSignals.contains(where: { normalized.contains($0) })
     }
 
+    // MARK: - Private Methods
+
     private func searchQuery(for text: String, turns: [ConversationRecallTurn]) -> String {
         let baseQuery = String(text.prefix(320))
         var parts = [baseQuery]
@@ -177,6 +233,30 @@ actor MemoryRecallCoordinator {
 
         parts.append(contentsOf: recentTurns.map { "上下文: \($0)" })
         return parts.joined(separator: "\n")
+    }
+
+    /// 执行向量搜索
+    private func search(query: String) async throws -> [SearchHit] {
+        // 生成查询向量
+        let queryEmbedding = try await embeddingService.embed(text: query)
+        
+        // 在向量存储中搜索
+        let results = await vectorStore.search(
+            queryEmbedding: queryEmbedding,
+            topK: 6,
+            threshold: minUsefulScore
+        )
+        
+        // 转换为 SearchHit
+        return results.map { result in
+            SearchHit(
+                score: Double(result.similarity),
+                path: "memory://\(result.entry.id)",
+                startLine: 0,
+                endLine: 0,
+                snippet: result.entry.text
+            )
+        }
     }
 
     private func composePreludeMessage(from hits: [SearchHit]) -> String {
@@ -229,95 +309,147 @@ actor MemoryRecallCoordinator {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func search(query: String) async throws -> [SearchHit] {
-        let output = try await self.runOpenClaw(arguments: [
-            "--profile", try await self.profileName(),
-            "memory", "search",
-            "--json",
-            "--agent", self.agentID,
-            "--max-results", "6",
-            "--query", query,
-        ])
-
-        guard output.status == 0 else {
-            throw NSError(
-                domain: "MemoryRecallCoordinator",
-                code: Int(output.status),
-                userInfo: [NSLocalizedDescriptionKey: output.output]
-            )
-        }
-
-        let data = Data(output.output.utf8)
-        return try JSONDecoder().decode(SearchPayload.self, from: data).results
+    private func needsReindex() async -> Bool {
+        // 检查是否需要重新索引
+        // 简化：基于时间和存储大小判断
+        let entryCount = await vectorStore.count()
+        return entryCount > 0 && Date().timeIntervalSince(lastIndexAttemptAt) > reindexCooldown
     }
 
-    private func loadStatus() async throws -> [StatusEntry] {
-        let output = try await self.runOpenClaw(arguments: [
-            "--profile", try await self.profileName(),
-            "memory", "status",
-            "--json",
-            "--agent", self.agentID,
-        ])
-
-        guard output.status == 0 else {
-            throw NSError(
-                domain: "MemoryRecallCoordinator",
-                code: Int(output.status),
-                userInfo: [NSLocalizedDescriptionKey: output.output]
-            )
-        }
-
-        let data = Data(output.output.utf8)
-        if let entries = try? JSONDecoder().decode([StatusEntry].self, from: data) {
-            return entries
-        }
-        return [try JSONDecoder().decode(StatusEntry.self, from: data)]
-    }
-
-    private func needsReindex() async throws -> Bool {
-        guard let entry = try await self.loadStatus().first(where: { $0.agentId == self.agentID }) else {
-            return false
-        }
-
-        let files = entry.status.files ?? 0
-        let chunks = entry.status.chunks ?? 0
-        let totalFiles = entry.scan?.totalFiles ?? 0
-        return entry.status.dirty == true || (totalFiles > 0 && (files == 0 || chunks == 0))
-    }
-
-    private func forceReindexIfAllowed(reason: String) async throws -> Bool {
+    private func forceReindexIfAllowed(reason: String) async -> Bool {
         let now = Date()
         guard now.timeIntervalSince(self.lastIndexAttemptAt) >= self.reindexCooldown else {
             return false
         }
 
         self.lastIndexAttemptAt = now
-        let output = try await self.runOpenClaw(arguments: [
-            "--profile", try await self.profileName(),
-            "memory", "index",
-            "--agent", self.agentID,
-            "--force",
-        ])
-
-        if output.status != 0 {
-            throw NSError(
-                domain: "MemoryRecallCoordinator",
-                code: Int(output.status),
-                userInfo: [NSLocalizedDescriptionKey: output.output]
-            )
-        }
-
+        
+        // 执行重新索引（优化向量存储）
+        await vectorStore.optimize()
+        
         LogInfo("Memory index refresh completed reason=\(reason)")
         return true
     }
+}
 
-    private func runOpenClaw(arguments: [String]) async throws -> CommandResult {
-        // 原生运行时不再使用 OpenClaw
-        throw NSError(domain: "MemoryRecallCoordinator", code: 2, userInfo: [NSLocalizedDescriptionKey: "原生运行时不支持此操作"])
+// MARK: - Supporting Types
+
+private struct SearchHit {
+    let score: Double
+    let path: String
+    let startLine: Int
+    let endLine: Int
+    let snippet: String
+}
+
+/// 记忆条目
+private struct MemoryEntry: Identifiable {
+    let id: String
+    let text: String
+    let role: String
+    let timestamp: Date
+    let metadata: [String: String]
+}
+
+/// 向量搜索结果
+private struct VectorSearchResult {
+    let entry: MemoryEntry
+    let similarity: Float
+}
+
+/// 内存向量存储
+private actor InMemoryVectorStore {
+    private var entries: [String: MemoryEntry] = [:]
+    private var embeddings: [String: SimpleEmbeddingVector] = [:]
+    
+    /// 添加条目
+    func add(entry: MemoryEntry, embedding: SimpleEmbeddingVector) {
+        entries[entry.id] = entry
+        embeddings[entry.id] = embedding
     }
+    
+    /// 搜索相似条目
+    func search(queryEmbedding: SimpleEmbeddingVector, topK: Int, threshold: Double) -> [VectorSearchResult] {
+        var results: [VectorSearchResult] = []
+        
+        for (id, entry) in entries {
+            guard let embedding = embeddings[id] else { continue }
+            
+            // 计算余弦相似度
+            let similarity = cosineSimilarity(queryEmbedding.vector, embedding.vector)
+            
+            if similarity >= Float(threshold) {
+                results.append(VectorSearchResult(entry: entry, similarity: similarity))
+            }
+        }
+        
+        // 按相似度排序并限制数量
+        return results
+            .sorted { $0.similarity > $1.similarity }
+            .prefix(topK)
+            .map { $0 }
+    }
+    
+    /// 获取条目数量
+    func count() -> Int {
+        entries.count
+    }
+    
+    /// 优化存储
+    func optimize() {
+        // 清理过期条目（简化实现）
+        let cutoffDate = Date().addingTimeInterval(-7 * 24 * 60 * 60)  // 7天前
+        let expiredIds = entries
+            .filter { $0.value.timestamp < cutoffDate }
+            .map { $0.key }
+        
+        for id in expiredIds {
+            entries.removeValue(forKey: id)
+            embeddings.removeValue(forKey: id)
+        }
+        
+        LogInfo("[VectorStore] Optimized: removed \(expiredIds.count) expired entries, remaining \(entries.count)")
+    }
+    
+    /// 计算余弦相似度
+    private func cosineSimilarity(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        
+        var dotProduct: Float = 0
+        var normA: Float = 0
+        var normB: Float = 0
+        
+        for i in 0..<a.count {
+            dotProduct += a[i] * b[i]
+            normA += a[i] * a[i]
+            normB += b[i] * b[i]
+        }
+        
+        guard normA > 0 && normB > 0 else { return 0 }
+        return dotProduct / (sqrt(normA) * sqrt(normB))
+    }
+}
 
-    private func profileName() async throws -> String {
-        // 原生运行时返回默认 profile
-        return "native"
+// MARK: - UserPreferenceStore Extension
+
+extension UserPreferenceStore {
+    var useCustomEmbedding: Bool {
+        get { UserDefaults.standard.bool(forKey: "useCustomEmbedding") }
+        set { UserDefaults.standard.set(newValue, forKey: "useCustomEmbedding") }
+    }
+    
+    var embeddingAPIKey: String? {
+        get { UserDefaults.standard.string(forKey: "embeddingAPIKey") }
+        set { UserDefaults.standard.set(newValue, forKey: "embeddingAPIKey") }
+    }
+    
+    var embeddingModel: String {
+        get { UserDefaults.standard.string(forKey: "embeddingModel") ?? "text-embedding-3-small" }
+        set { UserDefaults.standard.set(newValue, forKey: "embeddingModel") }
+    }
+    
+    var embeddingBaseURL: String {
+        get { UserDefaults.standard.string(forKey: "embeddingBaseURL") ?? "https://api.openai.com/v1" }
+        set { UserDefaults.standard.set(newValue, forKey: "embeddingBaseURL") }
     }
 }

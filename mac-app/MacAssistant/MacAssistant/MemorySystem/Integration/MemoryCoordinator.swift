@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenClawKit
 
 /// 统一记忆协调器 - 三层记忆系统的中央控制器
 actor MemoryCoordinator: MemoryCoordinating {

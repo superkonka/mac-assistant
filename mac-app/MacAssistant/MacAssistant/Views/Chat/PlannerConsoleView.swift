@@ -129,7 +129,7 @@ struct PlannerConsoleView: View {
                 title: "Dispatcher",
                 icon: "arrow.triangle.branch",
                 status: "已启用",
-                detail: "负责决定主会话或 side task，不再内置 URL 研究分流。"
+                detail: "负责决定主对话或 side task，不再内置 URL 研究分流。"
             )
             moduleRow(
                 title: "Local System Guard",

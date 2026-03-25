@@ -465,7 +465,6 @@ enum Capability: String, CaseIterable, Codable {
 }
 
 enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
-    case primaryChat
     case planner
     case subtaskWorker
     case fallback
@@ -475,8 +474,6 @@ enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
 
     var displayName: String {
         switch self {
-        case .primaryChat:
-            return "主会话"
         case .planner:
             return "Planner"
         case .subtaskWorker:
@@ -490,10 +487,8 @@ enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
 
     var summary: String {
         switch self {
-        case .primaryChat:
-            return "可作为主对话 Agent，承接主会话回答。"
         case .planner:
-            return "可作为秘书层 / Planner，负责意图分析与调度。"
+            return "主会话 + Planner：承接主对话并负责意图分析与调度。"
         case .subtaskWorker:
             return "可作为独立 side task worker，不打断主会话。"
         case .fallback:
@@ -505,8 +500,6 @@ enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
 
     var icon: String {
         switch self {
-        case .primaryChat:
-            return "text.bubble"
         case .planner:
             return "point.topleft.down.curvedto.point.bottomright.up"
         case .subtaskWorker:
@@ -515,6 +508,15 @@ enum AgentRole: String, CaseIterable, Codable, Identifiable, Hashable {
             return "arrow.trianglehead.clockwise"
         case .manualOnly:
             return "hand.raised"
+        }
+    }
+    
+    var color: Color {
+        switch self {
+        case .planner: return .blue
+        case .subtaskWorker: return .green
+        case .fallback: return .purple
+        case .manualOnly: return .gray
         }
     }
 }
@@ -559,12 +561,12 @@ struct AgentRoleProfile: Codable, Hashable {
     ) -> AgentRoleProfile {
         var roles: Set<AgentRole> = [.fallback]
 
+        // Planner 同时承担主会话职责
         if isFirstAgent || provider == .ollama || capabilities.contains(.codeAnalysis) {
-            roles.insert(.primaryChat)
+            roles.insert(.planner)
         }
 
         if provider != .ollama {
-            roles.insert(.planner)
             roles.insert(.subtaskWorker)
         }
 

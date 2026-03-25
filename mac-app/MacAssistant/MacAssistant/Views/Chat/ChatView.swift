@@ -69,7 +69,7 @@ struct ChatView: View {
             refreshTaskSessionsOnForeground()
         }
         .sheet(isPresented: $showAgentList) {
-            AgentListView()
+            AgentDashboardView()
         }
         .sheet(isPresented: $showWizard) {
             AgentConfigurationWizard(
@@ -89,7 +89,7 @@ struct ChatView: View {
                         content: """
                         ✅ Agent 创建成功！
                         
-                        \(agent.displayName) 已就绪，\(adoptedAsCurrent ? "已加入主会话并自动切换。" : "已加入角色池，不会打断当前主会话。")
+                        \(agent.displayName) 已就绪，\(adoptedAsCurrent ? "已设为当前对话 Agent。" : "已加入角色池，不会打断当前对话。")
                         现在可以重新发送您的请求了。
                         """,
                         timestamp: Date()

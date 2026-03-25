@@ -268,6 +268,8 @@ final class SkillCatalog: ObservableObject {
     // MARK: - 内置 Skill
     
     private func registerBuiltInSkills() {
+        // MARK: Browser Skills
+        
         // Browser Navigate
         register(SkillManifest(
             id: "browser.navigate",
@@ -309,6 +311,8 @@ final class SkillCatalog: ObservableObject {
             tags: ["browser", "screenshot"]
         ))
         
+        // MARK: System Skills
+        
         // System Screenshot
         register(SkillManifest(
             id: "system.screenshot",
@@ -318,7 +322,11 @@ final class SkillCatalog: ObservableObject {
                 SkillCapability(domain: "system", action: "screenshot", resource: nil)
             ],
             inputSchema: SkillInputSchema(
-                parameters: [],
+                parameters: [
+                    .init(name: "filename", type: .string, description: "文件名", defaultValue: nil, enumValues: nil),
+                    .init(name: "path", type: .string, description: "保存路径", defaultValue: nil, enumValues: nil),
+                    .init(name: "interactive", type: .boolean, description: "是否交互式截图（选区）", defaultValue: "false", enumValues: nil)
+                ],
                 required: []
             ),
             outputSchema: SkillOutputSchema(type: .object, description: "截图结果", properties: [
@@ -327,6 +335,99 @@ final class SkillCatalog: ObservableObject {
             executorType: .local,
             tags: ["system", "screenshot"]
         ))
+        
+        // System Clipboard
+        register(SkillManifest(
+            id: "system.clipboard",
+            name: "剪贴板操作",
+            description: "读取或写入剪贴板内容",
+            capabilities: [
+                SkillCapability(domain: "system", action: "clipboard", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "action", type: .string, description: "操作类型: read/write/clear", defaultValue: "read", enumValues: ["read", "write", "clear"]),
+                    .init(name: "content", type: .string, description: "要写入的内容（write时使用）", defaultValue: nil, enumValues: nil)
+                ],
+                required: []
+            ),
+            outputSchema: SkillOutputSchema(type: .object, description: "操作结果", properties: [
+                "content": .init(type: "string", description: "剪贴板内容"),
+                "action": .init(type: "string", description: "执行的操作")
+            ]),
+            executorType: .local,
+            tags: ["system", "clipboard"]
+        ))
+        
+        // System Notification
+        register(SkillManifest(
+            id: "system.notification",
+            name: "系统通知",
+            description: "发送 macOS 系统通知",
+            capabilities: [
+                SkillCapability(domain: "system", action: "notify", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "title", type: .string, description: "通知标题", defaultValue: nil, enumValues: nil),
+                    .init(name: "message", type: .string, description: "通知内容", defaultValue: nil, enumValues: nil),
+                    .init(name: "sound", type: .string, description: "提示音", defaultValue: "default", enumValues: ["default", "Glass", "Basso", "Hero", "Ping", "Pop", "Submarine"])
+                ],
+                required: ["title"]
+            ),
+            outputSchema: SkillOutputSchema(type: .void, description: "无返回值", properties: nil),
+            executorType: .local,
+            tags: ["system", "notification"]
+        ))
+        
+        // System Volume
+        register(SkillManifest(
+            id: "system.volume",
+            name: "音量控制",
+            description: "控制系统音量",
+            capabilities: [
+                SkillCapability(domain: "system", action: "volume", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "level", type: .number, description: "音量级别 (0-100)", defaultValue: nil, enumValues: nil),
+                    .init(name: "action", type: .string, description: "操作: mute/unmute/up/down", defaultValue: nil, enumValues: ["mute", "unmute", "up", "down"])
+                ],
+                required: []
+            ),
+            outputSchema: SkillOutputSchema(type: .object, description: "操作结果", properties: [
+                "level": .init(type: "number", description: "当前音量"),
+                "muted": .init(type: "boolean", description: "是否静音")
+            ]),
+            executorType: .local,
+            tags: ["system", "audio"]
+        ))
+        
+        // System Search
+        register(SkillManifest(
+            id: "system.search",
+            name: "文件搜索",
+            description: "在系统中搜索文件",
+            capabilities: [
+                SkillCapability(domain: "system", action: "search", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "query", type: .string, description: "搜索关键词", defaultValue: nil, enumValues: nil),
+                    .init(name: "path", type: .string, description: "搜索路径", defaultValue: ".", enumValues: nil),
+                    .init(name: "limit", type: .number, description: "结果数量限制", defaultValue: "20", enumValues: nil)
+                ],
+                required: ["query"]
+            ),
+            outputSchema: SkillOutputSchema(type: .object, description: "搜索结果", properties: [
+                "files": .init(type: "array", description: "匹配的文件列表")
+            ]),
+            executorType: .local,
+            executorConfig: ["command": "find {{path}} -name '*{{query}}*' 2>/dev/null | head -{{limit}}"],
+            tags: ["system", "search", "files"]
+        ))
+        
+        // MARK: Communication Skills
         
         // WhatsApp Send
         register(SkillManifest(
@@ -349,6 +450,54 @@ final class SkillCatalog: ObservableObject {
             ]),
             executorType: .browser,
             tags: ["communication", "whatsapp"]
+        ))
+        
+        // MARK: Development Skills
+        
+        // Git Status
+        register(SkillManifest(
+            id: "git.status",
+            name: "Git 状态检查",
+            description: "检查 Git 仓库状态",
+            capabilities: [
+                SkillCapability(domain: "development", action: "git_status", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "path", type: .string, description: "仓库路径", defaultValue: ".", enumValues: nil)
+                ],
+                required: []
+            ),
+            outputSchema: SkillOutputSchema(type: .object, description: "Git 状态", properties: [
+                "branch": .init(type: "string", description: "当前分支"),
+                "changes": .init(type: "array", description: "变更文件")
+            ]),
+            executorType: .local,
+            executorConfig: ["command": "cd {{path}} && git status"],
+            tags: ["development", "git"]
+        ))
+        
+        // Port Check
+        register(SkillManifest(
+            id: "dev.port_check",
+            name: "端口检查",
+            description: "检查端口占用情况",
+            capabilities: [
+                SkillCapability(domain: "development", action: "port_check", resource: nil)
+            ],
+            inputSchema: SkillInputSchema(
+                parameters: [
+                    .init(name: "port", type: .number, description: "端口号", defaultValue: nil, enumValues: nil)
+                ],
+                required: ["port"]
+            ),
+            outputSchema: SkillOutputSchema(type: .object, description: "端口信息", properties: [
+                "in_use": .init(type: "boolean", description: "是否被占用"),
+                "process": .init(type: "string", description: "占用进程")
+            ]),
+            executorType: .local,
+            executorConfig: ["command": "lsof -i :{{port}}"],
+            tags: ["development", "network"]
         ))
         
         LogInfo("[SkillCatalog] 已注册 \(skills.count) 个内置 Skill")

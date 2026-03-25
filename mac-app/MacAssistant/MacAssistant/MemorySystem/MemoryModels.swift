@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenClawKit
 
 // MARK: - Memory Layer Enumeration
 

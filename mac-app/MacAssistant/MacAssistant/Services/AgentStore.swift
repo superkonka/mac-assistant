@@ -62,7 +62,7 @@ class AgentStore: ObservableObject {
             capabilities: capabilities,
             isFirstAgent: isFirstAgent
         )
-        let shouldBecomeDefault = resolvedRoleProfile.contains(.primaryChat) && isFirstAgent
+        let shouldBecomeDefault = resolvedRoleProfile.contains(.planner) && isFirstAgent
         
         // 2. 创建 Agent 对象
         let agent = Agent(
@@ -159,7 +159,7 @@ class AgentStore: ObservableObject {
         }
         currentAgent = agent
         var profile = roleProfile(for: agent)
-        profile.set(.primaryChat, enabled: true)
+        profile.set(.planner, enabled: true)
         roleProfilesByAgentID[agent.id] = profile
         saveRoleProfiles()
         saveAgents()
@@ -277,12 +277,14 @@ class AgentStore: ObservableObject {
         })
     }
 
-    func primaryChatAgents(usableOnly: Bool) -> [Agent] {
-        agents(for: .primaryChat, usableOnly: usableOnly)
-    }
-
+    /// Planner 同时承担主会话职责
     func plannerAgents(usableOnly: Bool) -> [Agent] {
         agents(for: .planner, usableOnly: usableOnly)
+    }
+    
+    /// 主会话 Agent 现在等同于 Planner
+    func primaryChatAgents(usableOnly: Bool) -> [Agent] {
+        plannerAgents(usableOnly: usableOnly)
     }
 
     func subtaskWorkerAgents(usableOnly: Bool) -> [Agent] {
@@ -382,7 +384,8 @@ class AgentStore: ObservableObject {
         if currentAgent == nil {
             return !assignedRoles.contains(.manualOnly)
         }
-        return assignedRoles.contains(.primaryChat)
+        // Planner 同时承担主会话职责
+        return assignedRoles.contains(.planner)
     }
 
     func markTemporarilyUnavailable(_ agent: Agent) {
@@ -1123,8 +1126,9 @@ class AgentStore: ObservableObject {
 
     private func normalizeRoleProfile(_ profile: AgentRoleProfile, for agent: Agent) -> AgentRoleProfile {
         var normalized = profile
+        // 默认 Agent 自动设置为 Planner（Planner 同时承担主会话职责）
         if agent.isDefault {
-            normalized.set(.primaryChat, enabled: true)
+            normalized.set(.planner, enabled: true)
         }
         if normalized.roles.isEmpty {
             normalized = AgentRoleProfile.suggested(

@@ -32,7 +32,7 @@ struct SkillIntentSettingsView: View {
 
     private var summaryCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("猜测到的 Skill 不再直接插入主会话")
+            Text("猜测到的 Skill 不再直接插入主对话")
                 .font(.system(size: 15, weight: .semibold))
 
             Text("开启后，系统会把猜测到的翻译、总结这类能力拆成独立任务卡处理。你可以选择每次都问、自动执行，或者不再建议。")

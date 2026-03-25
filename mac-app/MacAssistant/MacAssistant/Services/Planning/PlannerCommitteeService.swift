@@ -484,27 +484,97 @@ final class PlannerCommitteeService: ObservableObject {
     }
     
     private func callLLM(provider: LLMProvider, model: String, prompt: String) async throws -> String {
-        // 实际实现会调用对应的 LLM API
-        // 这里使用模拟响应
-        return simulateLLMResponse(provider: provider, prompt: prompt)
+        // 查找匹配的 Agent
+        let agentStore = AgentStore.shared
+        let availableAgents = agentStore.usableAgents
+        
+        // 尝试找到匹配的 Agent
+        let matchingAgent = availableAgents.first { agent in
+            matchesProvider(agent.provider, provider) && agent.model.contains(model.split(separator: "-").first ?? "")
+        } ?? availableAgents.first { matchesProvider($0.provider, provider) }
+        ?? availableAgents.first
+        
+        guard let agent = matchingAgent else {
+            LogWarning("[PlannerCommittee] 未找到可用的 Agent，使用模拟响应")
+            return simulateLLMResponse(provider: provider, prompt: prompt)
+        }
+        
+        do {
+            // 使用运行时适配器发送请求
+            let adapter = NativeConversationRuntimeAdapter.shared
+            let response = try await adapter.sendMessage(
+                agent: agent,
+                sessionKey: "committee:\(UUID().uuidString)",
+                sessionLabel: "Committee Decision - \(provider.rawValue)",
+                requestID: UUID().uuidString,
+                text: prompt,
+                images: [],
+                systemPrompt: "你是 Planner Committee 的专家委员。请基于你的专业领域提供决策意见。必须以 JSON 格式回复。",
+                onAssistantText: nil
+            )
+            
+            // 提取 JSON（响应可能包含 markdown 代码块）
+            return extractJSON(from: response) ?? simulateLLMResponse(provider: provider, prompt: prompt)
+        } catch {
+            LogError("[PlannerCommittee] LLM 调用失败: \(error)")
+            return simulateLLMResponse(provider: provider, prompt: prompt)
+        }
+    }
+    
+    private func matchesProvider(_ agentProvider: ProviderType, _ committeeProvider: LLMProvider) -> Bool {
+        switch (agentProvider, committeeProvider) {
+        case (.openai, .openAI),
+             (.anthropic, .anthropic),
+             (.deepseek, .deepseek),
+             (.doubao, .local),
+             (.zhipu, .local),
+             (.moonshot, .kimi),
+             (.minimax, .local),
+             (.ollama, .local):
+            return true
+        default:
+            return false
+        }
+    }
+    
+    private func extractJSON(from text: String) -> String? {
+        // 尝试提取 ```json 代码块
+        if let jsonStart = text.range(of: "```json"),
+           let jsonEnd = text.range(of: "```", range: jsonStart.upperBound..<text.endIndex) {
+            return String(text[jsonStart.upperBound..<jsonEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // 尝试提取 ``` 代码块
+        if let jsonStart = text.range(of: "```"),
+           let jsonEnd = text.range(of: "```", range: jsonStart.upperBound..<text.endIndex) {
+            return String(text[jsonStart.upperBound..<jsonEnd.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
+        // 尝试找第一个 { 和最后一个 }
+        if let start = text.firstIndex(of: "{"),
+           let end = text.lastIndex(of: "}") {
+            return String(text[start...end])
+        }
+        
+        return nil
     }
     
     private func simulateLLMResponse(provider: LLMProvider, prompt: String) -> String {
-        // 模拟 LLM 响应
+        // 模拟 LLM 响应（当没有可用 Agent 时）
         return """
         {
             "decision": "proceed",
-            "confidence": 0.85,
-            "reasoning": "经过分析，当前操作风险可控，建议继续执行",
+            "confidence": 0.75,
+            "reasoning": "模拟响应：系统未配置可用的 \(provider.rawValue) Agent，使用默认建议",
             "suggestedActions": [
                 {
                     "type": "continueWorkflow",
-                    "description": "继续执行当前工作流",
-                    "priority": "high",
-                    "estimatedOutcome": "预期成功完成任务"
+                    "description": "继续执行（ Committee 模拟模式）",
+                    "priority": "medium",
+                    "estimatedOutcome": "建议配置更多 Agent 以启用真实会诊"
                 }
             ],
-            "concerns": [],
+            "concerns": [{"severity": "low", "category": "配置", "description": "使用的是模拟响应而非真实 LLM", "mitigation": "配置更多 Agent"}],
             "alternatives": []
         }
         """

@@ -308,10 +308,35 @@ actor EmbeddingServiceFactory {
     
     /// 创建默认的嵌入服务
     static func createDefault() -> EmbeddingService {
-        // 优先使用 OpenAI，如果配置了 API Key
-        if let apiKey = ProcessInfo().environment["OPENAI_API_KEY"],
+        let preferences = UserPreferenceStore.shared
+        
+        // 优先使用用户配置的 Embedding Provider
+        if preferences.useCustomEmbedding,
+           let apiKey = preferences.embeddingAPIKey,
            !apiKey.isEmpty {
-            return OpenAIEmbeddingService(apiKey: apiKey)
+            return OpenAIEmbeddingService(
+                apiKey: apiKey,
+                model: preferences.embeddingModel,
+                baseURL: preferences.embeddingBaseURL
+            )
+        }
+        
+        // 尝试使用当前 Agent 的配置（如果支持 Embedding）
+        if let agent = preferences.agents.first(where: { $0.id == preferences.currentAgentID }),
+           let apiKey = agent.apiKey,
+           !apiKey.isEmpty {
+            // 根据 Agent provider 类型创建对应的 Embedding 服务
+            switch agent.provider {
+            case .openAI, .deepseek, .doubao, .zhipu, .moonshot, .miniMax:
+                // 这些 provider 都支持 OpenAI 兼容的 Embedding API
+                return OpenAIEmbeddingService(
+                    apiKey: apiKey,
+                    model: "text-embedding-3-small",
+                    baseURL: agent.baseURL
+                )
+            default:
+                break
+            }
         }
         
         // 否则使用本地服务

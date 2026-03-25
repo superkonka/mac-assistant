@@ -81,7 +81,8 @@ class WizardViewModel: ObservableObject {
             return !agentName.isEmpty && !model.isEmpty
         case .assignRoles:
             if AgentStore.shared.needsInitialSetup {
-                return roleProfile.contains(.primaryChat)
+                // Planner 同时承担主会话职责
+                return roleProfile.contains(.planner)
             }
             return !roleProfile.roles.isEmpty
         case .complete:

@@ -130,7 +130,7 @@ struct ConversationAnalyzerView: View {
                 }
             } else {
                 Spacer()
-                Text("点击"分析"生成报告")
+                Text("点击分析生成报告")
                     .foregroundColor(.secondary)
                     .frame(maxWidth: .infinity, alignment: .center)
                 Spacer()

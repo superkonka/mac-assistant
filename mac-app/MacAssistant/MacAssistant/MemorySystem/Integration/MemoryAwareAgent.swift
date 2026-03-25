@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import OpenClawKit
 
 /// 记忆感知 Agent 协议
 /// 记忆感知 Agent 协议（使用 OpenClawKit.Agent）
