@@ -24,6 +24,8 @@ struct ChatView: View {
     @State private var showClawDoctor: Bool = false
     @State private var showDiskMonitor: Bool = false
     @State private var showBrowserAgent: Bool = false
+    @State private var showTaskPanel: Bool = false
+    @State private var showServicePanel: Bool = false
     @State private var selectedTaskSessionID: String? = nil
     @State private var currentGap: CapabilityGap? = nil
     @State private var hasAutoPresentedInitialSetup = false
@@ -113,6 +115,14 @@ struct ChatView: View {
             SimpleBrowserAgentView()
                 .frame(minWidth: 760, minHeight: 560)
         }
+        .sheet(isPresented: $showTaskPanel) {
+            UnifiedTaskPanelView(onClose: { showTaskPanel = false })
+                .frame(width: 440, height: 500)
+        }
+        .sheet(isPresented: $showServicePanel) {
+            ServiceManagerView()
+                .frame(minWidth: 500, minHeight: 450)
+        }
     }
     
     // MARK: - 子视图
@@ -150,7 +160,12 @@ struct ChatView: View {
             }
             
             // ===== 右侧：四个入口 =====
-            SmartToolbar()
+            SmartToolbar(
+                onTaskTap: { showTaskPanel = true },
+                onServiceTap: { showServicePanel = true },
+                onDiskTap: { showDiskMonitor = true },
+                onSkillsTap: { showSkills = true }
+            )
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

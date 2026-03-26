@@ -180,18 +180,21 @@ final class SmartToolbarState: ObservableObject {
     }
     
     private func checkDiskState() {
-        // 简化的磁盘检查
+        // 磁盘只关心是否健康，不显示具体GB数
         do {
             let fileURL = URL(fileURLWithPath: NSHomeDirectory())
             let values = try fileURL.resourceValues(forKeys: [.volumeAvailableCapacityKey])
             if let capacity = values.volumeAvailableCapacity {
                 let gb = Double(capacity) / 1_000_000_000
                 if gb < 5 {
-                    diskState = .error(count: Int(gb))
+                    // <5GB 显示错误状态（带警告）
+                    diskState = .warning(count: 0)
                 } else if gb < 20 {
-                    diskState = .warning(count: Int(gb))
+                    // <20GB 显示警告状态
+                    diskState = .warning(count: 0)
                 } else {
-                    diskState = .active(count: Int(gb))
+                    // 正常状态，不显示徽章
+                    diskState = .idle
                 }
             }
         } catch {
@@ -200,9 +203,9 @@ final class SmartToolbarState: ObservableObject {
     }
     
     private func updateSkillsState() {
-        // 技能入口总是显示可用技能数量
-        let skillCount = SkillCatalog.shared.skills.count
-        skillsState = .active(count: skillCount)
+        // 技能入口保持简单，不显示数字徽章
+        // 只有在新技能可用时才显示提示
+        skillsState = .idle
     }
     
     // MARK: - AI 通知处理
@@ -274,41 +277,39 @@ final class SmartToolbarState: ObservableObject {
 struct SmartToolbar: View {
     @StateObject private var state = SmartToolbarState.shared
     
+    // 操作回调
+    var onTaskTap: () -> Void
+    var onServiceTap: () -> Void
+    var onDiskTap: () -> Void
+    var onSkillsTap: () -> Void
+    
     var body: some View {
         HStack(spacing: 8) {
-            Spacer()
-            
-            // 四个入口靠右排列
+            // 四个入口
             EntryButton(
                 type: .task,
-                state: state.taskState
-            ) {
-                // 任务面板操作
-            }
+                state: state.taskState,
+                action: onTaskTap
+            )
             
             EntryButton(
                 type: .service,
-                state: state.serviceState
-            ) {
-                // 服务面板操作
-            }
+                state: state.serviceState,
+                action: onServiceTap
+            )
             
             EntryButton(
                 type: .disk,
-                state: state.diskState
-            ) {
-                // 磁盘面板操作
-            }
+                state: state.diskState,
+                action: onDiskTap
+            )
             
             EntryButton(
                 type: .skills,
-                state: state.skillsState
-            ) {
-                // 技能面板操作
-            }
+                state: state.skillsState,
+                action: onSkillsTap
+            )
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
     }
 }
 
@@ -323,35 +324,37 @@ struct EntryButton: View {
     @State private var rotationAngle: Double = 0
     
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 5) {
+        Button(action: {
+            print("[SmartToolbar] 点击: \(type.rawValue)")
+            action()
+        }) {
+            HStack(spacing: 4) {
                 // 图标
-                ZStack {
-                    Image(systemName: iconName)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(foregroundColor)
-                        .rotationEffect(.degrees(state.isChecking ? rotationAngle : 0))
-                        .animation(
-                            state.isChecking 
-                                ? .linear(duration: 2).repeatForever(autoreverses: false)
-                                : .default,
-                            value: rotationAngle
-                        )
-                        .onAppear {
-                            if state.isChecking {
-                                rotationAngle = 360
-                            }
+                Image(systemName: iconName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(foregroundColor)
+                    .rotationEffect(.degrees(state.isChecking ? rotationAngle : 0))
+                    .animation(
+                        state.isChecking 
+                            ? .linear(duration: 2).repeatForever(autoreverses: false)
+                            : .default,
+                        value: rotationAngle
+                    )
+                    .onAppear {
+                        if state.isChecking {
+                            rotationAngle = 360
                         }
-                        .onChange(of: state.isChecking) { isChecking in
-                            rotationAngle = isChecking ? 360 : 0
-                        }
-                }
-                .frame(width: 16, height: 16)
+                    }
+                    .onChange(of: state.isChecking) { isChecking in
+                        rotationAngle = isChecking ? 360 : 0
+                    }
+                    .frame(width: 14, height: 14)
                 
                 // 标签
                 Text(type.rawValue)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10, weight: .semibold))
                     .lineLimit(1)
+                    .minimumScaleFactor(0.8)
                 
                 // 徽章或脉冲
                 if state.isChecking {
@@ -361,10 +364,10 @@ struct EntryButton: View {
                 }
             }
             .foregroundColor(foregroundColor)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
             .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(backgroundColor)
                     .shadow(
                         color: shadowColor.opacity(isHovered ? 0.2 : 0.1),
@@ -374,7 +377,7 @@ struct EntryButton: View {
                     )
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(borderColor.opacity(0.3), lineWidth: 1)
             )
             .scaleEffect(isHovered ? 1.02 : 1.0)
@@ -453,17 +456,24 @@ struct EntryButton: View {
     }
     
     private var helpText: String {
+        let name = type.rawValue
         switch state {
         case .idle:
-            return "\(type.rawValue) - 无活动"
+            return name
         case .checking:
-            return "\(type.rawValue) - 检查中..."
+            return name + " - 检查中..."
         case .active(let count):
-            return "\(type.rawValue) - \(count) 个活动"
-        case .warning(let count):
-            return "\(type.rawValue) - \(count) 个警告"
+            if count > 0 {
+                return name + " - " + String(count) + " 个活动"
+            }
+            return name
+        case .warning:
+            return name + " - 需要关注"
         case .error(let count):
-            return "\(type.rawValue) - \(count) 个错误"
+            if count > 0 {
+                return name + " - " + String(count) + " 个错误"
+            }
+            return name + " - 异常"
         }
     }
 }
@@ -475,7 +485,7 @@ struct SmartBadge: View {
     let state: EntryState
     
     var body: some View {
-        Text("\(min(count, 99))")
+        Text(String(min(count, 99)))
             .font(.system(size: 10, weight: .bold))
             .foregroundColor(foregroundColor)
             .padding(.horizontal, 4)
@@ -562,7 +572,12 @@ struct ChatTopBar: View {
             Spacer()
             
             // 右侧：四个入口
-            SmartToolbar()
+            SmartToolbar(
+                onTaskTap: {},
+                onServiceTap: {},
+                onDiskTap: {},
+                onSkillsTap: {}
+            )
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -577,9 +592,14 @@ struct ChatTopBar: View {
 
 #Preview("SmartToolbar") {
     VStack(spacing: 20) {
-        SmartToolbar()
-            .padding()
-            .background(Color(NSColor.controlBackgroundColor))
+        SmartToolbar(
+            onTaskTap: {},
+            onServiceTap: {},
+            onDiskTap: {},
+            onSkillsTap: {}
+        )
+        .padding()
+        .background(Color(NSColor.controlBackgroundColor))
         
         // 不同状态展示
         HStack(spacing: 12) {

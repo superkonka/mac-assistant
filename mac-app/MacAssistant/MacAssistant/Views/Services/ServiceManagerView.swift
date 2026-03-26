@@ -9,9 +9,12 @@ import SwiftUI
 
 struct ServiceManagerView: View {
     @StateObject private var serviceManager = ServiceManager.shared
+    @StateObject private var discoveryManager = ServiceDiscoveryManager.shared
     @State private var searchText = ""
     @State private var selectedCategory: ServiceCategory? = nil
     @State private var showingAddService = false
+    @State private var showingPendingServices = false
+    @State private var showingAddRemote = false
     
     var filteredServices: [ServiceStateSnapshot] {
         serviceManager.services.filter { service in
@@ -32,6 +35,44 @@ struct ServiceManagerView: View {
                 
                 Spacer()
                 
+                // 待确认服务按钮
+                if !discoveryManager.pendingServices.isEmpty {
+                    Button(action: { showingPendingServices = true }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bell.badge.fill")
+                                .font(.system(size: 11))
+                            Text("\(discoveryManager.pendingServices.count)")
+                                .font(.system(size: 11, weight: .bold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.orange)
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                    .help("有待确认的服务")
+                }
+                
+                // 磁盘扫描按钮
+                Button(action: scanDisk) {
+                    Image(systemName: discoveryManager.isScanningDisk ? "arrow.triangle.2.circlepath" : "folder.badge.plus")
+                        .font(.system(size: 12))
+                        .rotationEffect(.degrees(discoveryManager.isScanningDisk ? 360 : 0))
+                        .animation(discoveryManager.isScanningDisk ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: discoveryManager.isScanningDisk)
+                }
+                .buttonStyle(.plain)
+                .help(discoveryManager.isScanningDisk ? "扫描中..." : "扫描本地项目")
+                .disabled(discoveryManager.isScanningDisk)
+                
+                // 添加远程按钮
+                Button(action: { showingAddRemote = true }) {
+                    Image(systemName: "globe")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(.plain)
+                .help("添加远程服务")
+                
                 Button(action: refreshAll) {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12))
@@ -42,6 +83,21 @@ struct ServiceManagerView: View {
             .padding(.horizontal)
             .padding(.top, 12)
             .padding(.bottom, 8)
+            
+            // 扫描进度
+            if discoveryManager.isScanningDisk {
+                HStack {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.7)
+                    Text(discoveryManager.scanProgress)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+            }
             
             // 搜索栏
             searchBar
@@ -62,6 +118,18 @@ struct ServiceManagerView: View {
             Task {
                 await serviceManager.checkAllServices()
             }
+        }
+        .sheet(isPresented: $showingPendingServices) {
+            PendingServicesView()
+        }
+        .sheet(isPresented: $showingAddRemote) {
+            AddRemoteServiceView()
+        }
+    }
+    
+    private func scanDisk() {
+        Task {
+            await discoveryManager.scanDiskForProjects()
         }
     }
     
